@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "id": "spring-maintenance",
+  "name": "Spring Boot 维护规范",
+  "version": "0.1.0",
+  "description": "为 Spring Boot + Maven 仓库提供受控的维护检查清单。",
+  "skills_root": "skills",
+  "ui": {
+    "category": "java",
+    "icon": "wrench"
+  }
+}

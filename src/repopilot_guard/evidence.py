@@ -28,7 +28,8 @@ class EvidenceStore:
 
     def __init__(self, output_root: Path, task_id: str) -> None:
         self.run_directory = output_root / task_id
-        self.run_directory.mkdir(parents=True, exist_ok=False)
+        # worktree 与证据都属于同一个任务产物目录，恢复任务时只追加事件。
+        self.run_directory.mkdir(parents=True, exist_ok=True)
         self.events_path = self.run_directory / "events.jsonl"
         self.report_path = self.run_directory / "report.md"
 
