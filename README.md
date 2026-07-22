@@ -1,363 +1,556 @@
 # RepoPilot
 
-RepoPilot 是一款本地优先、可扩展、可审计的编程助手。产品体验对标 Codex/Grok Build：它可以理解已有项目、检索代码与研发资料、调用受控工具、提出并执行修改、运行验证，并通过 Skills、MCP 和 RAG 持续扩展能力。Java/Spring Boot + Maven 是第一条深度工程 Profile，而不是最终语言边界。
+> 本地优先、安全可控、可审计、可评测的 Coding Agent。
 
-## MVP 闭环（阶段五至八）
+RepoPilot 面向已有代码仓库的维护场景：用户选择一个本地项目并描述 Bug、需求或研发问题，Agent 在明确的工作区和权限边界内检索代码、调用工具、生成修改计划、申请审批、执行补丁、运行 Maven 验证，最终给出可追溯的 Diff、测试证据和任务报告。
 
-第一版已将产品模式收敛为两种：`安全隔离修复 = Worktree + safe`，`完全本机控制 = Local + full`。Agent 固定经过研究、计划审批、执行审批、结构化补丁、固定 Maven Recipe、Diff/证据/报告；只有真实 Diff 与 Maven 成功证据同时存在才会判定 `PASSED`。
+项目的产品体验参考 [OpenAI Codex](https://openai.com/codex/) 与 [xAI grok-build](https://github.com/xai-org/grok-build) 的项目工作区、Agent 工作流和工具扩展思路，但 RepoPilot **不是对上述项目的源码二次开发**。当前代码从零实现，重点探索 Java/Spring Boot 仓库维护中的安全边界、证据闭环、RAG、Skills、MCP 和本地桌面交互。
 
-本机后端：`uv run repopilot-guard api serve`。桌面壳位于 `desktop/`，其开发窗口会优先复用已存在的本机 API；未发现 API 时，会从仓库根目录通过 `uv run repopilot-guard api serve` 启动仅监听回环地址的后端，并在窗口退出时回收自己启动的进程。前端不能绕过 Python `PolicyGuard`。
+当前版本：`0.1.0 / Pre-Alpha`。第一版 MVP 的后端闭环已经跑通，正在进行桌面端打包和完整评测验收，尚不建议用于生产仓库。
 
-评测目录 [evaluation/tasks.json](evaluation/tasks.json) 包含 15 个可重放任务定义，覆盖 Java 修改、RAG、敏感路径、路径逃逸、提示注入、审批拒绝、Maven 失败与断点恢复。`evaluate prepare` 可为每项生成独立 Java/Maven Git 基线与 JSON/CSV 清单，`evaluate validate-baseline` 会在独立 clone 中复现修复前的 Maven 失败；两者都不会伪造模型或修复成功结果。
+## 目录
 
-## 推荐模型配置
+- [产品定位](#产品定位)
+- [当前进度](#当前进度)
+- [系统架构](#系统架构)
+- [Agent 工作流](#agent-工作流)
+- [安全与权限](#安全与权限)
+- [上下文、RAG 与记忆](#上下文rag-与记忆)
+- [Skills、MCP 与插件](#skillsmcp-与插件)
+- [技术栈](#技术栈)
+- [快速开始](#快速开始)
+- [桌面端](#桌面端)
+- [评测体系](#评测体系)
+- [项目结构](#项目结构)
+- [最终规划](#最终规划)
+- [已知限制](#已知限制)
 
-默认本机配置已拆分为两个 OpenAI-compatible 服务：DeepSeek `deepseek-v4-pro` 负责 Agent 对话、工具调用与补丁计划；阿里云百炼 `text-embedding-v4` 以 `1024` 维负责代码和文档 RAG。请仅在本机 `.env` 中填写 `REPOPILOT_CHAT_API_KEY` 与 `REPOPILOT_EMBEDDING_API_KEY`，不要提交该文件。DeepSeek 官方文档给出了 `https://api.deepseek.com` 和 `deepseek-v4-pro`；百炼官方文档给出了兼容端点和 `text-embedding-v4` 的 1024 维调用方式。
+## 产品定位
 
-首版深度支持 Java/Spring Boot + Maven。上传资料和文档生成均服务于代码任务、需求分析、设计、接口、测试和变更说明。
+RepoPilot 不是一个只会返回代码片段的聊天机器人，也不把“模型说修好了”视为成功。它要完成的是一条可以复查的工程链路：
 
-### 运行遥测与成本估算
+```text
+选择本地项目
+  -> 冻结任务权限与 Git 基线
+  -> 检索代码、文档、项目规则和 Skills
+  -> 受控调用只读工具研究问题
+  -> 生成带证据引用的修改计划
+  -> 用户批准计划与执行动作
+  -> 原子应用结构化补丁
+  -> 运行白名单 Maven Recipe
+  -> 审查真实 Diff 和测试结果
+  -> 输出 PASSED / FAILED / BLOCKED / UNVERIFIED 报告
+```
 
-每个任务都会产生受控的 `telemetry.json`：记录 LangGraph 节点耗时，以及模型供应商明确回传的输入、输出和总 Token。桌面端的“本次运行用量”面板、任务报告和 `GET /api/tasks/{thread_id}/telemetry` 返回同一份汇总；它们不包含提示词、完整代码、模型原文或密钥。
+### 目标用户
 
-若希望显示本地成本估算，可在未提交的 `.env` 中同时配置以下三个值。单价按每 100 万 Token 计；任一单价缺失、币种不同或供应商未回传用量时，RepoPilot 会明确显示“不可估算”，不会伪造 `0` 成本。
+- 需要维护 Java/Spring Boot 项目的个人开发者和小型研发团队；
+- 希望把 AI 接入代码修复流程，但关心权限、误修改和结果可信度的用户；
+- 需要结合需求文档、接口说明和项目知识完成代码任务的开发者；
+- 希望学习 LangChain、LangGraph、RAG、Tool Calling、MCP 与 Agent 工程化的学习者。
 
-~~~dotenv
-REPOPILOT_CHAT_INPUT_PRICE_PER_MILLION=
-REPOPILOT_CHAT_OUTPUT_PRICE_PER_MILLION=
-REPOPILOT_CHAT_PRICE_CURRENCY=CNY
-~~~
+### 首版范围
 
-若要启用任务级预算门禁，再配置以下任一上限。预算由启动后端的环境变量读取，在任务创建时冻结进 SQLite checkpoint；桌面端、任务描述、Skill、MCP 返回内容和模型都只能查看，不能上调或关闭。模型每次调用后都会校验：超过上限即 `BLOCKED`；已配置预算却没有供应商用量或可靠成本时，同样停止继续调用，避免无声超支。
-
-~~~dotenv
-REPOPILOT_TASK_MAX_TOTAL_TOKENS=120000
-REPOPILOT_TASK_MAX_ESTIMATED_COST=3.00
-~~~
-
-## 真实 Demo 前置检查
-
-首次演示前先运行只读诊断。只有 Chat、Embedding、Qdrant 和 SQLite 均为 `READY`，Agent 才会进入 RAG、研究与计划阶段：
-
-~~~powershell
-docker compose up -d qdrant
-uv run repopilot-guard doctor
-~~~
-
-安全隔离修复要求目标目录是具有至少一个提交的 Git 仓库，因为它需要创建 detached worktree、冻结基线并在完成后生成可信 Diff。建议使用项目副本或专用演示分支准备基线，不要让 RepoPilot 自动初始化、提交或清理你的工作目录：
-
-~~~powershell
-git -C D:\code\demo-spring-app status
-git -C D:\code\demo-spring-app rev-parse HEAD
-~~~
-
-非 Git 项目仅能在经过二次确认的完全本机控制模式下执行只读研究；它无法创建 Worktree，也无法提供 Git Diff 证据，因此不能作为完整修复通过 `PASSED` 验收。桌面端会提前提示并禁用该项目的安全隔离修复入口。
-
-## 产品交互
-
-首次使用时，用户通过系统文件夹选择器添加本地项目；项目根目录、显示名称和最近使用时间会保存在本地 SQLite。之后直接从侧边栏项目列表选择，不需要反复输入目录。创建任务时，桌面端只提供两种清晰模式：
-
-| 产品模式 | 运行时组合 | 含义 |
-|---|---|---|
-| 安全隔离修复 | `Worktree + safe` | 默认推荐。Agent 在隔离 Git worktree 中工作，风险动作需要审批。 |
-| 完全本机控制 | `Local + full` | 用户二次确认后启用。Agent 在当前本地项目中执行已实现的高风险工具，并完整审计。 |
-
-默认模式是安全隔离修复：
-
-~~~
-用户当前项目
-        |
-        v
-创建 detached worktree
-        |
-        v
-Agent 在隔离目录读代码、改代码、跑测试
-        |
-        v
-用户查看 diff，选择继续在 worktree、创建分支或交接回 Local
-~~~
-
-Worktree 不是自动创建的新分支。它是同一 Git 仓库的第二个工作目录，默认处于 detached HEAD；用户需要时再显式创建分支。Local 更接近 Codex 的直接修改体验，适合用户愿意让 Agent 在当前项目目录操作的场景。
-
-## 核心能力
-
-- 本地 Coding Agent：代码理解、Bug 修复、小型需求实现、工程文档草稿；
-- 双模式工作区：安全隔离修复默认隔离和审批；完全本机控制由用户按任务强确认，并执行已实现的高风险工具；
-- 代码与文档 RAG：按项目、提交、路径和来源过滤检索；在已过滤候选集内融合向量、关键词和路径信号稳定重排，结果携带引用与评分依据；
-- Context Broker：按总字符预算组合项目规则、RAG、Skill 目录/选中正文与能力快照，并把来源和内容哈希冻结在任务 checkpoint；
-- Skills：按项目/用户/内置作用域发现标准 `SKILL.md`，目录阶段只披露名称、描述和路径，显式或确定性匹配选中后才加载正文；
-- MCP：基于官方 Python SDK 连接 STDIO/Streamable HTTP 服务；任务只能绑定项目配置中已发现、`read_only` 且经用户批准的工具，并在每次调用前复验配置和输入 Schema；
-- Capability Plane：内置工具、Skill 与 MCP 工具进入同一能力目录，再由任务权限、审批和 `PolicyGuard` 决定是否执行；
-- LangGraph 工作流：任务可暂停、审批、恢复；服务端 Trace ID 贯穿任务索引、SSE 事件和桌面审阅，所有节点和工具事件可追踪；模型 Token/成本上限会随任务冻结并 fail-closed；
-- 真实工程证据：diff、Maven 测试、来源、权限授予和工具调用共同决定最终结论。
-
-## 架构
-
-~~~
-Tauri Desktop + React / CLI
-        |
-任务模式：安全隔离修复 / 完全本机控制
-        |
-FastAPI + SSE
-        |
-Task Service + LangGraph Coding Workflow
-        |
-Context Broker：RAG / 会话摘要 / 项目规则
-        |
-Capability Plane：Built-in Tools / Skills / MCP
-        |
-Trust Gateway：权限快照 / 审批 / PolicyGuard / 审计
-        |
-Workspace Manager + Git + Maven + Qdrant + SQLite + Evidence
-~~~
+- 第一条深度工程 Profile：Java / Spring Boot / Maven；
+- 可索引代码与文档：`.java`、`.xml`、`.md`、`.txt`；
+- 本地项目注册、Git Worktree、代码检索、结构化补丁、Maven 验证；
+- OpenAI-compatible Chat 与 Embedding Provider；
+- FastAPI + SSE 本机服务、React 页面和 Tauri 桌面壳；
+- Skills、MCP、插件包和 Context Broker 的首个可运行版本。
 
 ## 当前进度
 
-已实现并通过自动测试：
+### 阶段总览
 
-- LangChain/LangGraph/Qdrant、SQLite checkpoint、项目注册、Git 基线/Worktree、safe/full 权限与受控只读工具；
-- Java/XML/MD/TXT RAG、仅写已验证事实的项目长期记忆、受限研究循环、结构化计划、计划重写反馈与计划/执行两级审批；
-- 结构化补丁、固定 Maven Recipe、Git Diff、FastAPI/SSE、持久任务/产物清单、不可变产物版本历史和 React 本机审阅界面；
-- 标准 `SKILL.md` 渐进发现、作用域覆盖、内容篡改检测，以及 MCP TOML 配置、真实 STDIO/Streamable HTTP Transport、工具发现、受控调用、限长输出和熔断；
-- 15 条评测任务定义、独立 Git fixture/端到端执行器、修改范围校验与持续增长的 `unittest` 回归集。
+| 阶段 | 目标 | 当前状态 |
+|---|---|---|
+| 阶段一 | LangChain/LangGraph、Provider、Qdrant、SQLite checkpoint 基础设施 | 已完成 |
+| 阶段二 | Git 基线、隔离 Worktree、受控仓库工具、双权限模式 | 已完成 |
+| 阶段三 | 项目注册、工作区选择、Java/文档 RAG | 已完成 |
+| 阶段四 | 可暂停恢复的只读研究 Agent、工具循环、证据化计划 | 已完成 |
+| 阶段五 | 两级审批、结构化补丁、Maven Recipe、Diff 与结果判定 | MVP 已完成 |
+| 阶段六 | FastAPI、SSE、React 审阅界面、Tauri 桌面壳 | Web 预览可用；原生安装包待验收 |
+| 阶段七 | 15 个可重放 Java/Maven 评测任务 | 任务集已建立；5 项真实 Agent 闭环通过 |
+| 阶段八 | Demo、文档、安装交付和面试材料 | 进行中 |
 
-已真实联调：
+### 已经实现
 
-- 使用 OpenAI-compatible Chat/Embedding、Qdrant 和真实 Spring Cloud 项目，完成上下文索引、受控研究、SSE 事件推送和计划审批暂停；
-- 代码理解任务不会修改项目文件，也不会将计划误报为修复成功；
-- J01 已完成真实 Java 闭环：修复前 2 个 JUnit 测试中 1 个失败，Agent 经两级审批后只修改 `OrderController.java`，隔离 Worktree 中 Maven 测试通过，源仓库保持不变；
-- J02 已完成增强版真实闭环：修复前跨租户与空租户测试失败，Agent 只修改 `OrderService.java`，修复后 4 个测试全部通过且源 fixture 保持不变；
-- J03、J04、J06 已完成真实 Java 闭环：分别修复 Mapper 分页 SQL、DTO `@NotBlank` 校验和错误 Java release，三项均只修改契约允许路径并按声明的 Maven Recipe 成功验证；
-- J01、J02、J03、J04、J06 已完成真实 Maven 修复前基线验证，五项均按任务契约失败且源 fixture 的 HEAD/Git 状态保持不变；
-- 计划和补丁 JSON 支持一次受限契约纠错，Embedding 支持瞬时错误重试，审计只记录脱敏字段与异常类型。
-- MCP 已用真实本地 STDIO 与 Streamable HTTP 测试 Server 验证 initialize、tools/list、tools/call、ping、超时和关闭；安全模式默认不连接，桌面端探测后可显式勾选具体工具，Graph 只绑定该任务冻结的 `read_only` 工具，并在调用前复验配置与 Schema。
-- Context Broker 已接入 `RETRIEVE -> ANALYZE`：项目 `AGENTS.md`、项目 Skill、RAG 片段和只读工具清单按预算组合；Skill 篡改、超预算和禁用模型调用均不会被静默放过。
+- 两种固定产品模式：`安全隔离修复 = Worktree + safe`、`完全本机控制 = Local + full`；
+- 项目注册、Git 状态诊断、基线快照、detached Worktree 创建与任务绑定；
+- `list_files`、`search_code`、`read_file`、`inspect_build`、`retrieve_context` 等受控工具；
+- Java/XML/Markdown/TXT 的增量索引、项目与提交隔离检索、来源引用；
+- LangGraph 节点编排、SQLite checkpoint、任务暂停/恢复、计划重写和两级审批；
+- 目标路径 + 旧文本 + 新文本形式的结构化补丁，并在写入前完成整批校验；
+- `compile`、`test`、`targeted_test` 三种 Maven 白名单 Recipe；
+- Git Diff、Surefire 摘要、Evidence 事件、任务产物和最终状态判定；
+- FastAPI 本机接口、SSE 事件流、React 任务审阅页面和 Tauri 工程；
+- Skills 渐进加载、MCP STDIO/Streamable HTTP、插件完整性校验和统一能力目录；
+- Token/成本遥测、任务预算门禁、协作式取消和敏感信息脱敏；
+- 165 项 Python 自动化测试和前端生产构建验证。
 
-仍需补强：
+### 已完成的真实闭环
 
-- 继续完成 J05、J07 与安全/失败场景的真实 Agent 评测，并为 J05、J07 和 S/V 场景补齐对应行为或策略基线；
-- 已实现协作式取消：API 会向当前图执行器发送任务级取消信号，节点边界会停止后续副作用，RepoPilot 自己启动的 Maven 子进程会被终止并以 `MAVEN_CANCELLED` 留痕；模型服务本身仍取决于其 SDK/HTTP 调用是否支持主动中断；
-- 为事件物理归档和产物版本历史补齐可配置的保留/压缩策略；
-- 为 MCP 补 OAuth、任务生命周期持久连接池、服务级并发限制与大输出 Artifact 化；当前任务使用短连接和冻结 Schema，不会在后台长期保留高权限会话；
-- 为 Context Broker 补会话摘要、真正的 BM25/符号索引和模型重排，并继续建设插件包、Hooks、多语言 Profile 与受控子 Agent；
-- 任意 Shell、网络、commit/push 只有在对应工具、权限和审计边界完成后才会开放。
+评测任务 `J01`、`J02`、`J03`、`J04`、`J06` 已使用真实 Java/Maven fixture 完成 Agent 修复：修复前测试或编译失败，Agent 经过计划审批和执行审批后只修改允许文件，隔离 Worktree 中 Maven 验证通过，源 fixture 的 HEAD 与 Git 状态保持不变。
 
-## 当前本地运行
+这 5 项分别覆盖 Controller 空白参数、Service 租户隔离、Mapper 分页 SQL、DTO 参数校验和错误 Java release。其余 10 项场景仍需完成真实模型评测，因此当前不能宣称 15 项全部通过。
 
-~~~powershell
+### 正在完善
+
+- Windows Tauri sidecar、安装包、启动与卸载验收；
+- 其余 Java 行为任务以及敏感路径、路径逃逸、提示注入、审批拒绝等安全评测；
+- SSE 事件归档、产物保留与压缩策略；
+- 模型请求主动中断、MCP 连接治理和更稳定的长任务恢复；
+- 更简洁的桌面任务交互、Diff 审阅和错误诊断体验。
+
+## 系统架构
+
+RepoPilot 使用“界面层、任务层、Agent 编排层、上下文层、能力层、信任层、基础设施层”的分层设计。模型负责分析和生成结构化决策，但不能直接控制权限、跳转节点或执行任意系统命令。
+
+```mermaid
+flowchart TB
+    UI["Tauri + React / CLI"] --> API["FastAPI + SSE"]
+    API --> TASK["Task Service<br/>项目、任务、审批、产物"]
+    TASK --> GRAPH["LangGraph Coding Workflow"]
+
+    GRAPH --> CONTEXT["Context Broker"]
+    CONTEXT --> RAG["RAG / 项目规则 / 会话上下文"]
+    CONTEXT --> SKILLS["Skills / 项目知识"]
+
+    GRAPH --> CAP["Capability Plane"]
+    CAP --> BUILTIN["内置仓库、Git、补丁、Maven 工具"]
+    CAP --> MCP["MCP Tools"]
+    CAP --> PLUGIN["Plugins"]
+
+    GRAPH --> TRUST["Trust Gateway"]
+    TRUST --> MODE["TaskMode + PermissionSnapshot"]
+    TRUST --> POLICY["PolicyGuard + 两级审批"]
+    TRUST --> AUDIT["Evidence + Artifact"]
+
+    GRAPH --> INFRA["Local Infrastructure"]
+    INFRA --> SQLITE["SQLite：任务、checkpoint、事件"]
+    INFRA --> QDRANT["Qdrant：代码/文档向量"]
+    INFRA --> GIT["Git Worktree + Diff"]
+    INFRA --> MAVEN["Maven Verification"]
+```
+
+### 各层职责
+
+| 层 | 职责 |
+|---|---|
+| Tauri / React / CLI | 项目选择、任务输入、审批、事件、Diff 和报告展示 |
+| FastAPI / SSE | 仅监听本机回环地址，提供任务接口和实时事件流 |
+| Task Service | 管理项目、任务生命周期、租约、取消、产物与状态查询 |
+| LangGraph | 固定 Agent 流程、节点路由、暂停、审批和恢复 |
+| Context Broker | 在预算内组装 RAG、项目规则、Skills 和能力快照 |
+| Capability Plane | 统一描述内置工具、MCP 工具和插件能力 |
+| Trust Gateway | 在模型之外执行权限判断、路径保护、审批和审计 |
+| SQLite / Qdrant / Git | 分别保存状态、语义上下文和可验证代码基线 |
+
+## Agent 工作流
+
+当前执行图固定为：
+
+```mermaid
+flowchart LR
+    A["INTAKE"] --> B["WORKSPACE"]
+    B --> C["PREFLIGHT"]
+    C --> D["INGEST"]
+    D --> E["RETRIEVE"]
+    E --> F["ANALYZE"]
+    F --> G["RESEARCH_TOOLS"]
+    G --> F
+    F --> H["PLAN"]
+    H --> I["PLAN_APPROVAL"]
+    I --> J["EXECUTION_APPROVAL"]
+    J --> K["PATCH"]
+    K --> L["VERIFY"]
+    L --> M["REVIEW"]
+    M --> N["REPORT"]
+```
+
+- `INTAKE`：校验任务描述、项目、模式和权限快照；
+- `WORKSPACE`：绑定 Local 或创建 detached Worktree，并冻结 Git 基线；
+- `PREFLIGHT`：检查配置、Provider、Qdrant、Git 和 Maven 条件；
+- `INGEST / RETRIEVE`：索引当前代码并按 `project_id + repo_commit` 检索上下文；
+- `ANALYZE / RESEARCH_TOOLS`：模型在轮次和工具次数上限内调用只读工具；
+- `PLAN`：生成带来源、候选文件、风险和验证建议的结构化计划；
+- `PLAN_APPROVAL`：用户确认方案，或给出反馈要求重写；
+- `EXECUTION_APPROVAL`：展示目标文件、补丁摘要和 Maven Recipe 后再次确认；
+- `PATCH`：通过原子结构化替换写入，不执行任意 patch shell；
+- `VERIFY`：只运行注册的 Maven Recipe，并保存退出码和 Surefire 摘要；
+- `REVIEW / REPORT`：结合真实 Diff、验证结果与安全证据生成结论。
+
+模型不能从提示词中升级权限，也不能直接跳过审批进入 `PATCH` 或把任务标记为 `PASSED`。
+
+### 结果语义
+
+| 状态 | 含义 |
+|---|---|
+| `PASSED` | 存在真实代码 Diff，且声明的 Maven 验证成功 |
+| `FAILED` | 补丁、测试或行为验证明确失败 |
+| `BLOCKED` | 权限、审批、配置、依赖或环境阻止任务继续 |
+| `UNVERIFIED` | 已有分析或改动，但缺少足够的真实验证证据 |
+
+## 安全与权限
+
+### 两种产品模式
+
+| 产品模式 | 固定运行时映射 | 适用场景 |
+|---|---|---|
+| 安全隔离修复 | `Worktree + safe` | 默认推荐。代码修改和 Maven 验证发生在隔离工作目录中 |
+| 完全本机控制 | `Local + full` | 用户按任务二次确认后，允许已实现的高风险工具操作当前项目 |
+
+`full` 不是“绕过所有代码检查”，也不表示当前版本已经开放任意 Shell、联网、删除或 `git push`。它只放行已经注册、具备参数模型、超时、输出限制和审计规则的能力。
+
+### 图外强制边界
+
+`PolicyGuard` 是 RepoPilot 自己实现的安全策略组件，不是 LangChain 或 Java 依赖。它在 LangGraph 和模型之外执行：
+
+- 工作区根目录与路径逃逸检查；
+- `.env`、`.git`、证书、密钥和生产配置等敏感路径保护；
+- 工具白名单、参数模型、Maven Recipe 和输出大小限制；
+- safe/full 权限判定、完全权限确认和风险事件记录；
+- 每次工具调用、审批、拒绝、补丁和验证的 Evidence 留痕。
+
+即使检索到的代码、文档或 Skill 中包含“忽略规则”“执行命令”等提示注入文本，它们也只能作为不可信上下文，不能修改上述边界。
+
+## 上下文、RAG 与记忆
+
+RepoPilot 不会把整个仓库无差别塞进模型上下文，而是按任务动态选择信息：
+
+```text
+用户任务 + 当前会话状态
+  + 项目规则（例如 AGENTS.md）
+  + Qdrant 检索到的代码/文档片段
+  + 被选中的 Skill 正文
+  + 已批准能力和工具摘要
+  -> Context Broker 预算裁剪与来源冻结
+  -> 模型上下文
+```
+
+### Qdrant 保存什么
+
+- `coding_context`：Java、XML、Markdown、TXT 切块后的向量和来源元数据；
+- `project_memory`：经过验证、允许长期复用的项目事实，不写入未经验证的模型猜测。
+
+每个代码或文档片段携带 `project_id`、`repo_commit`、路径、行号、来源类型、内容哈希和验证标记。检索强制按项目与提交过滤，避免不同仓库或不同版本相互污染。
+
+### SQLite 保存什么
+
+- 本地项目注册信息和最近使用记录；
+- 任务状态、权限快照、审批、事件和产物索引；
+- LangGraph checkpoint，用于按 `thread_id` 暂停和恢复；
+- 任务遥测、模型用量和预算快照。
+
+SQLite 保存的是结构化状态，不负责向量相似度检索；Qdrant 保存的是可语义搜索的代码/文档片段，不负责 Agent 流程恢复。模型真正看到的上下文由 Context Broker 在每次调用前临时组装。
+
+## Skills、MCP 与插件
+
+### Skills
+
+RepoPilot 支持项目级、用户级和内置 `SKILL.md`。目录阶段只读取名称、描述和路径；只有显式选择或确定性匹配的 Skill 才加载正文，从而减少上下文浪费和提示注入面。
+
+### MCP
+
+当前支持基于官方 Python SDK 的 STDIO 与 Streamable HTTP MCP Transport。工具必须先发现，再由用户为当前任务明确批准；运行时会复验配置哈希、工具 Schema、权限、超时和输出限制。安全模式默认不会连接 MCP 服务。
+
+### 插件
+
+插件包通过 `repopilot-plugin.json` 声明 Skills、MCP 配置引用和 UI 元数据。安装时计算目录完整性哈希；插件内容变化后必须重新审查。插件不能自动执行脚本、联网或获得额外权限。
+
+## 技术栈
+
+| 领域 | 技术 |
+|---|---|
+| Agent 编排 | LangChain、LangGraph、Structured Tool Calling |
+| 模型接入 | `langchain-openai`，OpenAI-compatible Chat / Embedding |
+| 状态与恢复 | SQLite、LangGraph SQLite Checkpointer |
+| 代码与文档 RAG | Qdrant、`langchain-qdrant`、确定性文本切分 |
+| 本地 API | FastAPI、Uvicorn、SSE |
+| 桌面端 | Tauri 2、React 19、TypeScript、Vite |
+| 工程执行 | Git Worktree、结构化补丁、Maven Recipe |
+| 扩展能力 | Skills、MCP Python SDK、插件包 |
+| Python 工程 | Python 3.12、uv、Pydantic Settings、unittest |
+
+## 快速开始
+
+### 1. 环境要求
+
+基础开发环境：
+
+- Python `3.12`；
+- [uv](https://docs.astral.sh/uv/)；
+- Git；
+- Docker Engine 或 Docker Desktop，用于启动本地 Qdrant；
+- JDK 和 Maven，用于验证 Java 任务。
+
+只有开发原生桌面窗口或安装包时，才额外需要 Node.js、Rust、Windows C++ Build Tools 和 Windows SDK。运行 CLI 或浏览器预览不要求安装 Rust。
+
+### 2. 安装依赖
+
+```powershell
+git clone git@github.com:JX05120LLL/RepoPilot.git
+cd RepoPilot
 uv sync --python 3.12
-uv run python -m unittest discover -s tests -t . -v
-~~~
+```
 
-## CLI 快速开始
+### 3. 配置模型
 
-当原生桌面端尚未打包时，推荐通过 `task` 完成日常 Coding Agent 流程。`task` 只提供两种产品模式，并输出脱敏的任务摘要、审批状态和下一步命令；底层 `agent`、`workspace`、`index` 等命令继续保留给调试、评测和高级排障。
+```powershell
+Copy-Item .env.example .env
+```
 
-### 安装 CLI
+在本机 `.env` 中填写：
 
-开发者可以在仓库内直接使用 `uv run`。需要将 CLI 交给其他本机用户试用时，使用 Python 3.12 和 `uv` 安装隔离工具环境；安装不会写入模型 Key，仍需在运行前配置 `.env` 或等价环境变量：
+```dotenv
+REPOPILOT_CHAT_BASE_URL=
+REPOPILOT_CHAT_API_KEY=
+REPOPILOT_CHAT_MODEL=
 
-~~~powershell
-uv tool install .
-repopilot-guard --help
-~~~
+REPOPILOT_EMBEDDING_BASE_URL=
+REPOPILOT_EMBEDDING_API_KEY=
+REPOPILOT_EMBEDDING_MODEL=
+REPOPILOT_EMBEDDING_DIMENSIONS=
 
-首次使用可以先运行 `welcome`。它只读取 RepoPilot 的本地项目登记和 Git/Maven 预检，不调用模型、不创建 worktree、不索引代码，也不会修改任何项目文件。输出中的 `next_action.command` 会依据最近使用的项目给出下一条推荐命令；完全本机控制仍要求你手动审阅风险并显式确认：
+REPOPILOT_QDRANT_URL=http://127.0.0.1:6333
+REPOPILOT_STATE_DB_PATH=.repopilot/state.sqlite
+```
 
-~~~powershell
-uv run repopilot-guard welcome
-~~~
+Chat 与 Embedding 可以来自不同的 OpenAI-compatible 服务。模型名称和 Embedding 维度必须与供应商实际开通的模型一致。`.env` 已加入 `.gitignore`，不要将 API Key 写进 README、代码或提交记录。
 
-发布前可构建 wheel 与源码包，再从 wheel 安装验证：
+### 4. 启动 Qdrant
 
-~~~powershell
-uv build
-uv tool install .\dist\repopilot_guard-0.1.0-py3-none-any.whl
-~~~
+```powershell
+docker compose up -d qdrant
+uv run repopilot-guard bootstrap-qdrant
+uv run repopilot-guard doctor
+```
 
-先注册本地 Git 项目。项目路径只在本机 SQLite 中保存，注册本身不会扫描、索引或修改代码：
+Compose 将 Qdrant 绑定到 `127.0.0.1:6333` 并使用命名卷保存数据，不对局域网开放。Docker Desktop 只是 Windows 上运行 Docker Compose 的常用方式，RepoPilot 本身并不依赖 Docker Desktop 品牌产品。
 
-~~~powershell
+### 5. 注册并诊断项目
+
+```powershell
 uv run repopilot-guard project add --path D:\code\sample-spring-app --name "订单服务"
 uv run repopilot-guard project list
-~~~
-
-注册后先执行项目诊断。它只读取项目结构和 Git 状态，不创建 worktree、不索引代码、不调用模型；输出会明确区分“可安全隔离修复”“只能完全本机控制研究”以及 Java/Maven Profile 是否就绪：
-
-~~~powershell
 uv run repopilot-guard project doctor --project-id project-xxxx
-~~~
+```
 
-以默认的“安全隔离修复”启动任务。RepoPilot 会在 detached worktree 中研究代码，生成计划后暂停；终端输出中的 `next_action.command` 可直接复制执行：
+项目注册只保存本地路径，不会自动索引或修改代码。安全隔离修复要求项目是至少包含一个提交的 Git 仓库；非 Git 目录目前只能在完全本机控制模式下进行受限研究，不能生成可信 Git Diff。
 
-~~~powershell
-uv run repopilot-guard task start --project-id project-xxxx --task "订单查询缺少租户权限过滤，请定位根因并提出修复计划" --thread-id order-permission-001
-uv run repopilot-guard task list
+### 6. 启动任务
+
+默认使用安全隔离修复：
+
+```powershell
+uv run repopilot-guard task start `
+  --project-id project-xxxx `
+  --task "订单查询缺少租户权限过滤，请定位并修复" `
+  --thread-id order-permission-001
+```
+
+查看任务、事件和产物：
+
+```powershell
 uv run repopilot-guard task status --thread-id order-permission-001
 uv run repopilot-guard task events --thread-id order-permission-001 --after-sequence 0
-uv run repopilot-guard task decide --thread-id order-permission-001 --decision approve
-~~~
-
-`task list` 只显示任务 ID、项目 ID、模式、状态、判定和时间，不输出仓库或产物绝对路径。`task events` 读取 SQLite 中已经脱敏的证据，并返回可用于增量轮询的 `next_sequence`；重复执行时将该值传给 `--after-sequence` 即可只读取新事件。终态任务可归档但不会删除任何证据：
-
-`task status` 会优先读取 LangGraph checkpoint，返回计划、工作区、验证和下一步操作；若 Chat、Embedding 等无关配置格式错误，或 checkpoint 暂时不可读取，则退回本机 SQLite 任务索引并返回 `TASK_STATUS_INDEX_ONLY`。回退结果只包含已持久化状态，不会猜测计划、验证证据或审批类型，也不会输出仓库绝对路径。
-
-~~~powershell
-uv run repopilot-guard task archive --thread-id order-permission-001
-uv run repopilot-guard task list --include-archived
-~~~
-
-任务暂停或结束后，可以从 SQLite 登记的受控产物中审阅计划、真实 Diff、Maven 验证和报告。CLI 不接受任意文件路径；读取前会校验产物的 SHA-256，篡改或超出大小限制会明确 `BLOCKED`：
-
-~~~powershell
 uv run repopilot-guard task artifacts --thread-id order-permission-001
-uv run repopilot-guard task artifact --thread-id order-permission-001 --kind plan_markdown
-uv run repopilot-guard task artifact --thread-id order-permission-001 --kind git_diff
-uv run repopilot-guard task artifact --thread-id order-permission-001 --kind verification
-~~~
+```
 
-需要让 Agent 参考需求、接口或研发说明时，显式导入 MD/TXT 文档。RepoPilot 会把副本保存到本机状态目录后再索引，不修改项目目录，也不会在命令输出、RAG Payload 或 Agent 上下文中泄露最初选择的绝对路径：
+审批或要求重写计划：
 
-~~~powershell
-uv run repopilot-guard document add --project-id project-xxxx --file D:\docs\order-requirements.md
-uv run repopilot-guard document list --project-id project-xxxx
-~~~
+```powershell
+uv run repopilot-guard task decide --thread-id order-permission-001 --decision approve
+uv run repopilot-guard task decide --thread-id order-permission-001 --decision revise --comment "先检查 Service 层，不要修改 Controller"
+```
 
-若计划方向不对，不要批准后再修改。可以要求 Agent 基于反馈重新生成计划：
+完全本机控制固定映射为 `Local + full`，必须按任务确认：
 
-~~~powershell
-uv run repopilot-guard task decide --thread-id order-permission-001 --decision revise --comment "先检查 Service 层的租户边界，不要修改 Controller。"
-~~~
+```powershell
+uv run repopilot-guard task start `
+  --project-id project-xxxx `
+  --task "修复当前本地项目中的订单权限问题" `
+  --task-mode full-local `
+  --confirm-full-access "我已了解完全权限风险"
+```
 
-完全本机控制必须按任务明确确认。它固定映射为 `Local + full`，并且不会继承给下一次任务：
+## 桌面端
 
-~~~powershell
-uv run repopilot-guard task start --project-id project-xxxx --task "修复本地订单权限问题" --task-mode full-local --confirm-full-access "我已了解完全权限风险"
-~~~
+### 浏览器预览
 
-为干净源仓库创建默认保留的隔离 worktree：
-
-~~~powershell
-uv run repopilot-guard workspace prepare --repo D:\code\sample-spring-app --task "分析订单权限问题"
-~~~
-
-注册项目后，可以用项目 ID 创建 Local 或 Worktree 任务，无需重复输入目录：
-
-~~~powershell
-uv run repopilot-guard project add --path D:\code\sample-spring-app
-uv run repopilot-guard workspace prepare --project-id project-xxxx --task "分析订单权限问题" --mode worktree --include-uncommitted-changes
-uv run repopilot-guard index project --project-id project-xxxx
-uv run repopilot-guard search context --project-id project-xxxx --repo-commit <提交哈希> --query "订单权限"
-~~~
-
-配置模型与 Qdrant 后，可运行只读 Agent。它会生成计划并在确认处暂停，不会修改代码：
-
-~~~powershell
-uv run repopilot-guard agent plan --repo D:\code\sample-spring-app --task "订单查询缺少店铺权限" --thread-id order-permission-001
-uv run repopilot-guard agent resume --thread-id order-permission-001 --approved true
-~~~
-
-若项目已通过桌面端或 `mcp probe` 确认工具，可在安全模式显式授权具体 capability；未提供该参数时不会连接 MCP：
-
-~~~powershell
-uv run repopilot-guard agent plan --repo D:\code\sample-spring-app --task "根据研发文档分析订单权限" --approve-mcp-tool mcp__docs__search
-~~~
-
-完全本机控制必须明确确认，且仅对当前任务有效：
-
-~~~powershell
-uv run repopilot-guard workspace prepare --repo D:\code\sample-spring-app --task "分析订单权限问题" --mode local --permission full --confirm-full-access "我已了解完全权限风险"
-~~~
-
-发现项目和用户 Skills。`list` 不读取正文进入目录，`inspect` 才加载选中的 Skill；Skill 中的脚本不会被这两个命令执行：
-
-~~~powershell
-uv run repopilot-guard skill list --repo D:\code\sample-spring-app
-uv run repopilot-guard skill inspect --repo D:\code\sample-spring-app --name java-maven-maintenance
-~~~
-
-只读校验 MCP 配置与任务权限。该命令不会启动 STDIO 进程或连接远程服务：
-
-~~~powershell
-uv run repopilot-guard mcp validate --config D:\code\sample-spring-app\.repopilot\mcp.toml
-~~~
-
-STDIO MCP 配置中使用裸命令 `python`、`python3`、`python.exe` 或 `python3.exe` 时，RepoPilot 会固定使用自身当前的 Python 运行时，避免 Windows 的 `PATH` 拾取不兼容解释器。需要指定其它环境时，请在 MCP 配置中填写明确的相对路径或绝对路径；RepoPilot 不会改写带路径的命令。
-
-真实探测 MCP 会完成握手、工具发现与 Ping，然后主动关闭；真实调用还会执行 JSON Schema、权限、超时和输出上限检查：
-
-~~~powershell
-uv run repopilot-guard mcp probe --config .\examples\mcp.local-echo.toml --server local-echo --workspace-root D:\code\RepoPilot --permission full --confirm-full-access "我已了解完全权限风险"
-uv run repopilot-guard mcp call --config .\examples\mcp.local-echo.toml --server local-echo --workspace-root D:\code\RepoPilot --permission full --confirm-full-access "我已了解完全权限风险" --tool mcp__local-echo__echo --arguments-file .\examples\mcp.echo.arguments.json
-~~~
-
-项目桌面端也可读取项目内 `.repopilot/mcp.toml` 并进行单次探测。探测结果中的工具可勾选为“授权给下一次任务”；后端仍会重新发现工具并验证配置/Schema 哈希，不接受前端提供的工具定义。该入口和任务调用当前均采用短连接，不会在后台长期保留高权限 MCP 会话。
-
-当任务进入研究阶段后，桌面端会显示“本次研究上下文”面板。它只展示冻结的来源、Skill 名称、已绑定工具、字符预算和快照指纹，便于审阅 RAG/Skill 的实际边界；完整代码、Skill 正文和模型提示不会通过该接口返回。
-
-本地插件包使用 `repopilot-plugin.json`，可以声明 Skill 目录、MCP 配置引用和 UI 元数据。安装会计算整个插件目录的 SHA-256 清单；内容变化后不会继续作为 Agent 上下文来源，必须由用户审查后显式重新安装。插件不会执行脚本、不会自动连接 MCP，也不会新增权限通道：
-
-~~~powershell
-uv run repopilot-guard plugin install --source .\examples\plugins\spring-maintenance
-uv run repopilot-guard plugin list
-uv run repopilot-guard plugin disable --plugin-id spring-maintenance
-uv run repopilot-guard plugin audit --plugin-id spring-maintenance
-~~~
-
-插件启用且完整性通过时，其 Skill 才会进入 Agent 的候选目录，并继续受上下文预算、项目优先级、`PolicyGuard` 和任务权限约束。插件包含的 MCP 配置目前仅作为可审阅元数据；后续会增加任务级显式绑定，不能自动联网或启动进程。
-
-## 桌面端测试
-
-React 页面已可以生产构建。当前可先使用以下一键脚本测试与桌面端完全相同的本机前端和 FastAPI：
+当前最稳定的 UI 测试方式是一键启动 FastAPI 与 Vite：
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\start-desktop-preview.ps1
 ```
 
-脚本会启动仅监听 `127.0.0.1:8765` 的 Python API，并在浏览器打开 `http://127.0.0.1:1420`。关闭 Vite 终端后，脚本会同时终止 API。调试原生窗口时，Tauri 会自动复用或启动 API：
+浏览器访问：`http://127.0.0.1:1420`。后端仅监听 `127.0.0.1:8765`。
+
+### Tauri 开发窗口
 
 ```powershell
 cd .\desktop
+npm.cmd install
 npm.cmd run tauri:dev
 ```
 
-当前稳定入口是 CLI wheel 与浏览器预览，原生 `.exe` 进入打包验收阶段。正式安装包必须同时具备 Windows C++ Build Tools、Windows SDK 和 Python Agent sidecar，不能只打出 Tauri WebView 外壳。`desktop doctor` 会从 PATH 以及 Visual Studio/Windows SDK 标准安装目录发现 `link.exe`、`rc.exe`、`mt.exe`；诊断通过只代表具备构建条件，最终仍要以真实 Tauri 构建、安装、启动和进程回收测试为准。`REPOPILOT_BACKEND_EXECUTABLE` 仅用于开发或受控部署时替换默认后端启动命令；目标程序必须支持 `api serve --host 127.0.0.1 --port 8765` 参数。开发环境不需要设置该变量，Tauri 默认使用 `uv`。
+Tauri 会优先复用已运行的本机 API；没有 API 时，开发模式会尝试通过 `uv run repopilot-guard api serve` 启动后端。
 
-生成 sidecar 不会安装系统软件，也不会把 `.env`、模型密钥、Qdrant 数据或用户项目写入安装包：
+### 原生安装包状态
+
+Tauri 工程、图标、后端 sidecar 构建脚本和环境诊断已经存在，但 Windows `.exe` 安装包仍处于最终验收阶段。正式交付必须验证 sidecar 打包、应用数据目录、首次启动、进程回收和卸载，不能只打包 WebView 外壳。
 
 ```powershell
-.\scripts\build-desktop-backend-sidecar.ps1
 uv run repopilot-guard desktop doctor
+.\scripts\build-desktop-backend-sidecar.ps1
 cd .\desktop
 npm.cmd run tauri:build
 ```
 
-构建脚本会通过 `uv` 临时使用 PyInstaller，在 `desktop/src-tauri/binaries/repopilot-guard.exe` 生成后端可执行文件。该文件被 `.gitignore` 排除，便于本机或 CI 按目标平台重新构建；`desktop doctor` 只有在该文件和 Tauri 资源配置同时存在时才会报告 sidecar 就绪。
+## 评测体系
 
-安装后的桌面端不会依赖仓库工作目录。它在系统应用数据目录中读取 `.env` 并保存 `state.sqlite`；可通过以下只读命令查看当前系统对应的准确路径。命令不会创建目录、读取配置或显示密钥：
+`evaluation/tasks.json` 定义 15 个可重放 Java/Maven 维护场景，覆盖：
+
+- Controller、Service、Mapper、DTO、配置和测试修改；
+- 文档 RAG 与代码来源引用；
+- dirty 仓库、敏感路径、路径逃逸和提示注入；
+- 计划拒绝、执行拒绝、Maven 失败和 checkpoint 恢复。
+
+评测不使用模型自评，而是检查真实 Diff、允许修改范围、Maven 退出码、Surefire 结果、权限事件以及源仓库是否保持不变。
 
 ```powershell
-uv run repopilot-guard desktop paths
+uv run repopilot-guard evaluate prepare --output D:\repopilot-evaluation\run-001
+
+uv run repopilot-guard evaluate validate-baseline `
+  --fixtures D:\repopilot-evaluation\run-001 `
+  --output D:\repopilot-evaluation\baseline-001 `
+  --all
+
+uv run repopilot-guard evaluate run `
+  --fixtures D:\repopilot-evaluation\run-001 `
+  --output D:\repopilot-evaluation\result-j01 `
+  --task-id J01 `
+  --approval auto
 ```
 
-开发模式仍从 RepoPilot 仓库根目录读取现有 `.env`，因此浏览器预览和 `tauri:dev` 的配置方式保持兼容。
+`--approval auto` 仅适用于独立评测 fixture，不会放宽 `PolicyGuard`，也不应对真实项目使用。完整说明见 [evaluation/README.md](evaluation/README.md)。
 
-先执行只读诊断，区分浏览器预览和原生安装包所缺的环境项。它不会启动服务、执行 Cargo 或安装组件：
+### 开发验证
 
 ```powershell
-uv run repopilot-guard desktop doctor
+uv run python -m unittest discover -s tests -t . -v
+git diff --check
+
+cd .\desktop
+npm.cmd run build
 ```
 
-## 文档
+## 项目结构
+
+```text
+RepoPilot/
+├─ src/repopilot_guard/       Python 核心、Agent、策略、RAG、API 与 CLI
+├─ desktop/                   React + Tauri 桌面端
+├─ tests/                     unittest 单元与集成测试
+├─ evaluation/                15 项评测任务定义和说明
+├─ examples/                  Skills、MCP 和插件示例
+├─ scripts/                   桌面预览与 sidecar 构建脚本
+├─ docs/                      架构、阶段学习实验和设计文档
+├─ compose.yaml               本地 Qdrant 服务
+├─ pyproject.toml             Python 项目与依赖配置
+├─ RepoPilot-PRD.md           产品需求文档
+└─ 开发计划.md                分阶段开发计划
+```
+
+核心模块：
+
+| 模块 | 作用 |
+|---|---|
+| `graph.py` | LangGraph Coding Workflow、节点与路由 |
+| `policy.py` / `permissions.py` | 路径、权限和任务模式裁决 |
+| `workspace.py` | Local/Worktree、Git 基线和未提交改动处理 |
+| `context.py` / `context_broker.py` | 索引、检索和模型上下文组装 |
+| `repository_tools.py` / `tool_runtime.py` | 受控仓库工具和统一运行时 |
+| `execution.py` / `recipes.py` | 结构化补丁和 Maven 验证 |
+| `skills.py` / `mcp_runtime.py` / `plugins.py` | 扩展能力与信任边界 |
+| `task_store.py` / `evidence.py` | 持久任务、事件、产物和审计证据 |
+| `api.py` / `cli.py` | FastAPI/SSE 与命令行入口 |
+
+## 最终规划
+
+RepoPilot 的最终目标不是简单增加更多模型按钮，而是演进为一款可在真实研发流程中受控使用的本地编程助手。后续按“先完成可信单 Agent，再扩展平台能力”的顺序推进。
+
+### P0：完成第一版可交付闭环
+
+- 完成全部 15 项真实评测并生成 JSON、CSV 和中文报告；
+- 完成 Windows sidecar 与 Tauri 安装包验收；
+- 完善任务取消、异常恢复、事件归档和产物保留策略；
+- 固化 4 个稳定 Demo：代码理解、Bug 修复、文档辅助、安全拦截；
+- 补齐启动文档、演示视频、架构图和面试讲解材料。
+
+### P1：提升代码理解与日常使用体验
+
+- 增加符号索引、调用关系、真正的 BM25/混合检索和可选模型重排；
+- 增加会话摘要、上下文压缩、跨任务已验证项目记忆；
+- 完善 Diff 分块审阅、单文件接受/拒绝、Worktree 生命周期和冲突处理；
+- 增加 Gradle、Python 等工程 Profile，但复用同一权限、证据和评测框架；
+- 支持 PDF/DOCX 研发资料解析，并保持来源、版本和权限隔离。
+
+### P2：建设可治理的能力生态
+
+- 完善 Skills 发现、版本、依赖和测试规范；
+- 为 MCP 增加 OAuth、服务级并发限制、持久连接池和大输出 Artifact 化；
+- 增加受控 Hooks、插件签名、兼容性检查和本地插件管理界面；
+- 在明确审批、沙箱和审计后，逐步开放受控 Shell、网络、commit/push；
+- 探索 Planner、Researcher、Coder、Reviewer 等受控子 Agent 协作，而不是让多个模型共享无限权限。
+
+### P3：企业级治理与交付
+
+- 从本地 SQLite/Qdrant 抽象出 PostgreSQL、对象存储和远程向量服务适配层；
+- 增加组织策略、RBAC、项目级工具白名单、密钥托管和审计导出；
+- 接入 OpenTelemetry、模型网关、调用限额、成本中心和质量看板；
+- 对接 GitHub/GitLab、CI/CD、Issue/PR 与代码审查流程；
+- 支持本地、容器和远程沙箱执行后端，并保持同一任务协议和证据模型。
+
+### 目标架构
+
+```mermaid
+flowchart TB
+    CLIENT["Desktop / Web / IDE / CLI"] --> GATEWAY["Local or Team Gateway"]
+    GATEWAY --> ORCH["Agent Orchestrator"]
+    ORCH --> CTX["Context Platform<br/>RAG / Memory / Symbol Index"]
+    ORCH --> CAPS["Capability Platform<br/>Tools / Skills / MCP / Plugins"]
+    ORCH --> EXEC["Execution Backends<br/>Local / Worktree / Container / Remote Sandbox"]
+    ORCH --> GOV["Governance<br/>Policy / Approval / Secrets / Budget / Audit"]
+    ORCH --> EVAL["Evaluation & Observability<br/>Replay / Trace / Quality / Cost"]
+```
+
+无论未来接入多少语言、模型、工具和执行环境，以下原则保持不变：权限不由模型授予，写入必须可审查，成功必须有外部证据，失败不能伪装成成功。
+
+## 已知限制
+
+- 当前是学习与简历项目，不是经过生产安全认证的企业软件；
+- Java/Spring Boot/Maven 支持最完整，其他语言尚未形成稳定 Profile；
+- 安全隔离修复依赖 Git 仓库和有效提交；
+- Qdrant 需要作为独立本地服务启动；
+- 原生桌面安装包尚未完成最终交付验收；
+- 15 项评测中当前只有 5 项完成真实 Agent `PASSED`；
+- 任意 Shell、任意联网、删除、自动 commit/push 尚未作为模型工具开放；
+- Provider 的工具调用、结构化输出、usage 返回和中断能力取决于实际模型服务；
+- API 当前面向本机回环地址，不包含多用户认证和远程部署能力。
+
+## 相关文档
 
 - [产品需求文档](RepoPilot-PRD.md)
 - [分阶段开发计划](开发计划.md)
 - [v2 最小闭环优化设计](docs/RepoPilot-v2-最小闭环优化设计.md)
 - [企业级编程助手平台架构](docs/企业级编程助手平台架构.md)
 - [插件包规范与学习实验](docs/插件包规范与学习实验.md)
-- [阶段二学习实验](docs/阶段二-隔离工作区与权限模式.md)
-- [阶段三学习实验](docs/阶段三-项目注册与RAG.md)
-- [阶段四学习实验](docs/阶段四-LangGraph只读研究工作流.md)
+- [阶段二：隔离工作区与权限模式](docs/阶段二-隔离工作区与权限模式.md)
+- [阶段三：项目注册与 RAG](docs/阶段三-项目注册与RAG.md)
+- [阶段四：LangGraph 只读研究工作流](docs/阶段四-LangGraph只读研究工作流.md)
 
-所有面向用户的文档、报告、UI 文案和代码注释使用中文。
+## License
+
+项目当前在 `pyproject.toml` 中声明为 MIT License。
