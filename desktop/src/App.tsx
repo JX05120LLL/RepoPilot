@@ -30,6 +30,7 @@ const API_UNAVAILABLE_MESSAGE = "本机 API 尚未启动或无法访问。";
 const EVIDENCE_STREAM_ERROR =
   "证据流连接中断，请检查本机 API。任务状态会继续尝试轮询。";
 type Mode = "safe-isolated" | "full-local";
+type Operation = "change" | "research";
 type WorkspaceView = "task" | "context" | "review";
 type Project = {
   project_id: string;
@@ -45,6 +46,8 @@ type Task = {
   display_title?: string | null;
   project_id?: string | null;
   task_mode?: string;
+  task_operation?: Operation;
+  task_description?: string;
   created_at?: string;
   updated_at?: string;
   status: string;
@@ -52,6 +55,10 @@ type Task = {
   verdict?: string | null;
   archived_at?: string | null;
   interrupts?: Interrupt[];
+  state?: {
+    task_operation?: string;
+    task_description?: string;
+  };
 };
 type Artifact = {
   kind: string;
@@ -231,6 +238,11 @@ function compactTaskLabel(item: Task): string {
   return "未命名任务 · " + identifier.slice(-8);
 }
 
+function resolvedTaskOperation(item: Task): Operation {
+  const value = item.task_operation ?? item.state?.task_operation;
+  return value === "research" ? "research" : "change";
+}
+
 export function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState("");
@@ -238,6 +250,7 @@ export function App() {
   const [projectName, setProjectName] = useState("");
   const [description, setDescription] = useState("");
   const [mode, setMode] = useState<Mode>("safe-isolated");
+  const [operation, setOperation] = useState<Operation>("change");
   const [activeView, setActiveView] = useState<WorkspaceView>("task");
   const [confirmed, setConfirmed] = useState(false);
   const [task, setTask] = useState<Task | null>(null);
@@ -796,6 +809,7 @@ export function App() {
           project_id: projectId,
           description,
           task_mode: mode,
+          operation,
           confirmation: confirmed ? "我已了解完全权限风险" : null,
           approved_mcp_tools: approvedMcpTools,
         }),
@@ -909,6 +923,7 @@ export function App() {
     setTelemetry(null);
     setDescription("");
     setMode("safe-isolated");
+    setOperation("change");
     setConfirmed(false);
     setRevisionComment("");
     setRequestError("");
@@ -929,6 +944,7 @@ export function App() {
         setMode(merged.task_mode);
         setConfirmed(merged.task_mode === "full-local");
       }
+      setOperation(resolvedTaskOperation(merged));
       setActiveView("task");
     } catch (error) {
       setRequestError(
@@ -966,7 +982,20 @@ export function App() {
       ? "ready"
       : "degraded";
   const visibleEvents = events.slice(-14);
+  const activeTaskOperation = task ? resolvedTaskOperation(task) : operation;
+  const activeTaskMode: Mode =
+    task?.task_mode === "full-local" ? "full-local" : "safe-isolated";
+  const displayedTaskDescription =
+    task?.task_description ??
+    task?.state?.task_description ??
+    (task ? task.display_title : description.trim());
+  const researchPlanApproval = Boolean(
+    task?.pending_approval &&
+      activeTaskOperation === "research" &&
+      interrupt?.type === "PLAN_APPROVAL_REQUIRED",
+  );
   const canStart =
+    !task &&
     Boolean(projectId && description.trim()) &&
     runtimeHealth.status === "READY" &&
     !(safeModeBlockedByProject && mode === "safe-isolated") &&
@@ -1173,7 +1202,7 @@ export function App() {
                 {!task && (
                   <div className="new-task-state">
                     <p className="new-task-kicker">当前工作区</p>
-                    <h2>准备开始一个代码任务</h2>
+                    <h2>{operation === "research" ? "研究当前代码库" : "准备开始代码任务"}</h2>
                     <p>
                       {currentProject
                         ? currentProject.display_name + "  ·  " + projectStatusLabel
@@ -1187,9 +1216,12 @@ export function App() {
                     <article className="task-request">
                       <header>
                         <strong>任务</strong>
-                        <span>{mode === "safe-isolated" ? "安全隔离修复" : "完全本机控制"}</span>
+                        <div className="task-metadata">
+                          <span>{activeTaskOperation === "research" ? "仅研究" : "修改代码"}</span>
+                          <span>{activeTaskMode === "safe-isolated" ? "安全隔离修复" : "完全本机控制"}</span>
+                        </div>
                       </header>
-                      <p>{description.trim() || task.display_title || "继续任务 " + compactTaskLabel(task)}</p>
+                      <p>{displayedTaskDescription || "继续任务 " + compactTaskLabel(task)}</p>
                     </article>
                     <article className="execution-record">
                       <div className="agent-response">
@@ -1246,7 +1278,9 @@ export function App() {
                       <WarningCircle size={20} weight="fill" />
                       <div>
                         <strong>
-                          {interrupt?.type === "EXECUTION_APPROVAL_REQUIRED"
+                          {researchPlanApproval
+                            ? "研究结论等待确认"
+                            : interrupt?.type === "EXECUTION_APPROVAL_REQUIRED"
                             ? "执行前需要你的批准"
                             : "修改计划等待审阅"}
                         </strong>
@@ -1263,7 +1297,8 @@ export function App() {
                         </button>
                       )}
                       <button className="primary-button" type="button" onClick={() => void approve("approve")}>
-                        <CheckCircle size={16} weight="bold" />批准继续
+                        <CheckCircle size={16} weight="bold" />
+                        {researchPlanApproval ? "确认并生成报告" : "批准继续"}
                       </button>
                       <button className="danger-button" type="button" onClick={() => void approve("reject")}>
                         <XCircle size={16} />拒绝
@@ -1321,20 +1356,54 @@ export function App() {
                       void start();
                     }
                   }}
-                  placeholder={taskIsRunning ? "当前任务正在运行" : "描述要完成的代码工作"}
+                  placeholder={
+                    task
+                      ? taskIsRunning
+                        ? "当前任务正在运行"
+                        : "任务已结束，请新建任务后继续"
+                      : operation === "research"
+                        ? "描述要理解、定位或评估的代码问题"
+                        : "描述要完成的代码改动"
+                  }
                   aria-label="代码任务描述"
-                  disabled={taskIsRunning}
+                  disabled={Boolean(task)}
                 />
                 <div className="composer-toolbar">
                   <div className="composer-tools">
-                    <button className="icon-button" type="button" title="添加 MD 或 TXT 研发文档" onClick={() => void chooseDocument()} disabled={!projectId || taskIsRunning}>
+                    <button className="icon-button" type="button" title="添加 MD 或 TXT 研发文档" onClick={() => void chooseDocument()} disabled={!projectId || Boolean(task)}>
                       <Paperclip size={19} />
                     </button>
+                    <div className="operation-control" role="group" aria-label="任务类型">
+                      <button
+                        className={operation === "change" ? "active" : ""}
+                        type="button"
+                        disabled={Boolean(task)}
+                        onClick={() => setOperation("change")}
+                        aria-label="修改代码"
+                        aria-pressed={operation === "change"}
+                        title="生成计划，经审批后修改代码并运行验证"
+                      >
+                        <FileCode size={15} />
+                        <span>修改代码</span>
+                      </button>
+                      <button
+                        className={operation === "research" ? "active" : ""}
+                        type="button"
+                        disabled={Boolean(task)}
+                        onClick={() => setOperation("research")}
+                        aria-label="仅研究"
+                        aria-pressed={operation === "research"}
+                        title="只研究代码并输出证据化计划，不写入文件"
+                      >
+                        <ListMagnifyingGlass size={15} />
+                        <span>仅研究</span>
+                      </button>
+                    </div>
                     <label className={"permission-control mode-" + mode}>
                       {mode === "safe-isolated" ? <ShieldCheck size={17} /> : <WarningCircle size={17} />}
                       <select
                         value={mode}
-                        disabled={taskIsRunning}
+                        disabled={Boolean(task)}
                         aria-label="任务权限模式"
                         onChange={(event) => {
                           const nextMode = event.target.value as Mode;
@@ -1349,6 +1418,11 @@ export function App() {
                     {task && !taskIsRunning && !task.archived_at && (
                       <button className="text-action" type="button" onClick={() => void archiveTask()}>
                         <Archive size={16} />归档
+                      </button>
+                    )}
+                    {task && !taskIsRunning && (
+                      <button className="text-action" type="button" onClick={beginNewTask}>
+                        <Plus size={16} />新建
                       </button>
                     )}
                     {taskIsRunning && (

@@ -1165,6 +1165,7 @@ def _run_task(args: argparse.Namespace) -> int:
                     repository=request.repository,
                     output_root=request.output_root,
                     task_mode=TaskMode(args.task_mode).value,
+                    task_operation=request.operation.value,
                     permission_mode=permission.mode.value,
                     workspace_mode=request.workspace_selection.mode.value,
                     display_title=request.description,
@@ -1274,6 +1275,7 @@ def _project_cli_task_result(store: TaskStore, result: object, request: TaskRequ
         projected_state.setdefault("output_root", str(request.output_root))
         projected_state.setdefault("project_id", request.project_id)
         projected_state.setdefault("workspace_mode", request.workspace_selection.mode.value)
+        projected_state.setdefault("task_operation", request.operation.value)
     elif not projected_state.get("repository") or not projected_state.get("output_root"):
         # 旧 checkpoint 若没有路径元数据，不能猜测并写入当前目录。
         return
@@ -1365,6 +1367,8 @@ def _run_task_status(args: argparse.Namespace) -> int:
     checkpoint_store: SqliteCheckpointStore | None = None
     try:
         indexed = task_store.get(args.thread_id)
+        if _task_index_is_authoritative(indexed):
+            return _print_json_result(_indexed_task_status(indexed), 2)
         try:
             settings = AppSettings()
             checkpoint_store = SqliteCheckpointStore(state_path)
@@ -1419,6 +1423,7 @@ def _indexed_task_status(task: StoredTask) -> dict[str, object]:
         "display_title": task.display_title,
         "project_id": task.project_id,
         "task_mode": task.task_mode,
+        "task_operation": task.task_operation,
         "pending_approval": task.pending_approval,
         "verdict": task.verdict,
         "error_summary": task.error_summary,
@@ -1446,6 +1451,7 @@ def _stored_task_summary(task: StoredTask) -> dict[str, object]:
         "display_title": task.display_title,
         "project_id": task.project_id,
         "task_mode": task.task_mode,
+        "task_operation": task.task_operation,
         "status": task.status,
         "pending_approval": task.pending_approval,
         "verdict": task.verdict,
@@ -1506,6 +1512,7 @@ def _task_summary(result: object) -> dict[str, object]:
         "status": raw.get("status"),
         "thread_id": raw.get("thread_id"),
         "task_id": raw.get("task_id"),
+        "task_operation": state.get("task_operation", TaskOperation.CHANGE.value),
         "verdict": raw.get("verdict"),
         "pending_approval": raw.get("pending_approval", False),
         "interrupts": raw.get("interrupts", []),
@@ -1520,6 +1527,16 @@ def _task_summary(result: object) -> dict[str, object]:
         "evidence": {"event_count": len(event_types), "recent_event_types": event_types[-12:]},
         "next_action": _task_next_action(raw, state),
     }
+
+
+def _task_index_is_authoritative(task: StoredTask) -> bool:
+    """任务服务确认的终止/失败事实不能被旧 checkpoint 覆盖。"""
+
+    return bool(
+        task.cancellation_requested_at
+        or task.error_summary == "TASK_LEASE_EXPIRED"
+        or (task.error_summary or "").startswith("TASK_RUNTIME_FAILED:")
+    )
 
 
 def _task_plan_summary(plan: object) -> dict[str, object] | None:

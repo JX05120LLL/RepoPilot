@@ -274,6 +274,32 @@ class CliProductTests(unittest.TestCase):
             self.assertEqual("TASK_RUNTIME_FAILED: RuntimeError", stored.error_summary)
             self.assertIsNone(stored.lease_expires_at)
 
+            status_output = StringIO()
+            with (
+                patch("repopilot_guard.cli.AppSettings") as settings,
+                patch("repopilot_guard.cli.SqliteCheckpointStore") as checkpoint_store,
+                patch("sys.stdout", status_output),
+            ):
+                status_exit_code = main(
+                    [
+                        "task",
+                        "status",
+                        "--thread-id",
+                        "thread-runtime-failure",
+                        "--state-db",
+                        str(state_path),
+                    ]
+                )
+
+            status_payload = json.loads(status_output.getvalue())
+            self.assertEqual(2, status_exit_code)
+            self.assertEqual("TASK_STATUS_INDEX_ONLY", status_payload["code"])
+            self.assertEqual("BLOCKED", status_payload["status"])
+            self.assertEqual("TASK_RUNTIME_FAILED: RuntimeError", status_payload["error_summary"])
+            self.assertEqual("change", status_payload["task_operation"])
+            settings.assert_not_called()
+            checkpoint_store.assert_not_called()
+
     def test_task_start_rejects_duplicate_thread_id_without_running_graph(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -593,6 +619,7 @@ class CliProductTests(unittest.TestCase):
                     repository=repository,
                     output_root=output_root,
                     task_mode="safe-isolated",
+                    task_operation="research",
                     permission_mode="safe",
                     workspace_mode="worktree",
                 )
@@ -619,6 +646,7 @@ class CliProductTests(unittest.TestCase):
             self.assertEqual(0, exit_code)
             self.assertEqual("TASK_LIST_READY", listed["code"])
             self.assertEqual(1, listed["count"])
+            self.assertEqual("research", listed["tasks"][0]["task_operation"])
             self.assertNotIn(str(repository), encoded_list)
             self.assertNotIn(str(output_root), encoded_list)
 

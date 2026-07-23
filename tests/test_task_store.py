@@ -89,6 +89,122 @@ class TaskStoreTests(unittest.TestCase):
             finally:
                 reopened.close()
 
+    def test_task_operation_persists_and_invalid_checkpoint_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            database_path = root / "state.sqlite"
+            store = TaskStore(database_path)
+            try:
+                task = store.create(
+                    thread_id="thread-research",
+                    task_id="task-research",
+                    project_id="project-1",
+                    repository=root / "repo",
+                    output_root=root / "runs",
+                    task_mode="safe-isolated",
+                    task_operation="research",
+                    permission_mode="safe",
+                    workspace_mode="worktree",
+                )
+                self.assertEqual("research", task.task_operation)
+                self.assertEqual("research", task.to_dict()["task_operation"])
+                self.assertEqual("research", store.events_after(task.thread_id, 0)[0].payload["task_operation"])
+                with self.assertRaisesRegex(ValueError, "TASK_OPERATION_INVALID"):
+                    store.sync_graph_result(
+                        {
+                            "thread_id": task.thread_id,
+                            "status": "WAITING_APPROVAL",
+                            "state": {"task_operation": "unknown", "tool_events": []},
+                        }
+                    )
+            finally:
+                store.close()
+
+            reopened = TaskStore(database_path)
+            try:
+                self.assertEqual("research", reopened.get("thread-research").task_operation)
+                self.assertEqual("research", reopened.list()[0].task_operation)
+            finally:
+                reopened.close()
+
+    def test_legacy_task_table_migrates_operation_without_losing_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database_path = Path(temporary_directory) / "legacy.sqlite"
+            connection = sqlite3.connect(database_path)
+            try:
+                connection.executescript(
+                    """
+                    CREATE TABLE tasks (
+                        thread_id TEXT PRIMARY KEY,
+                        trace_id TEXT NOT NULL,
+                        task_id TEXT NOT NULL UNIQUE,
+                        display_title TEXT,
+                        project_id TEXT,
+                        repository TEXT NOT NULL,
+                        output_root TEXT NOT NULL,
+                        task_mode TEXT NOT NULL,
+                        permission_mode TEXT NOT NULL,
+                        workspace_mode TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        pending_approval INTEGER NOT NULL,
+                        verdict TEXT,
+                        error_summary TEXT,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        heartbeat_at TEXT NOT NULL,
+                        lease_expires_at TEXT,
+                        cancellation_requested_at TEXT,
+                        cancellation_reason TEXT,
+                        archived_at TEXT
+                    );
+                    """
+                )
+                timestamp = "2026-01-01T00:00:00+00:00"
+                connection.execute(
+                    """
+                    INSERT INTO tasks(
+                        thread_id, trace_id, task_id, display_title, project_id, repository, output_root,
+                        task_mode, permission_mode, workspace_mode, status, pending_approval,
+                        created_at, updated_at, heartbeat_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "legacy-thread",
+                        "trace-legacy",
+                        "legacy-task",
+                        "旧任务",
+                        "project-1",
+                        str(Path(temporary_directory) / "repo"),
+                        str(Path(temporary_directory) / "runs"),
+                        "safe-isolated",
+                        "safe",
+                        "worktree",
+                        "BLOCKED",
+                        0,
+                        timestamp,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            migrated = TaskStore(database_path)
+            try:
+                task = migrated.get("legacy-thread")
+                self.assertEqual("change", task.task_operation)
+                self.assertEqual("旧任务", task.display_title)
+            finally:
+                migrated.close()
+
+            connection = sqlite3.connect(database_path)
+            try:
+                columns = {row[1] for row in connection.execute("PRAGMA table_info(tasks)")}
+                self.assertIn("task_operation", columns)
+            finally:
+                connection.close()
+
     def test_task_display_title_is_bounded_and_redacts_inline_credentials(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -271,6 +272,7 @@ def create_app(
                 repository=repository,
                 output_root=request.output_root,
                 task_mode=body.task_mode.value,
+                task_operation=body.operation.value,
                 permission_mode=grant.mode.value,
                 workspace_mode=request.workspace_selection.mode.value,
                 display_title=body.description,
@@ -300,7 +302,11 @@ def create_app(
                     heartbeat.join(timeout=1)
 
             Thread(target=run_in_background, name=f"repopilot-{request.task_id}", daemon=True).start()
-            return _task_snapshot(runner, store, thread_id)
+            snapshot = _task_snapshot(runner, store, thread_id)
+            # 后台图写入首个 checkpoint 前，也要让客户端拿到稳定的任务语义。
+            snapshot.setdefault("task_operation", body.operation.value)
+            snapshot.setdefault("task_description", body.description)
+            return snapshot
         except ValueError as error:
             raise HTTPException(400, str(error)) from error
 
@@ -574,11 +580,26 @@ def _task_snapshot(
 
     task_store.reap_expired_leases()
     persisted = task_store.get(thread_id)
+    runtime_failed = (persisted.error_summary or "").startswith("TASK_RUNTIME_FAILED")
     if persisted.lease_expires_at or persisted.cancellation_requested_at or persisted.error_summary == "TASK_LEASE_EXPIRED":
         return persisted.to_dict()
+    if runtime_failed:
+        snapshot = persisted.to_dict()
+        try:
+            state = runner.get(thread_id).state
+            snapshot["task_operation"] = state.get("task_operation", persisted.task_operation)
+            snapshot["task_description"] = state.get("task_description", persisted.display_title or "")
+        except (KeyError, ValueError, sqlite3.Error):
+            snapshot["task_operation"] = persisted.task_operation
+            snapshot["task_description"] = persisted.display_title or ""
+        return snapshot
     try:
         result = runner.get(thread_id).to_dict()
         indexed = task_store.sync_graph_result(result, execution_finished=False)
+        state = result.get("state")
+        if isinstance(state, dict):
+            result["task_operation"] = state.get("task_operation", TaskOperation.CHANGE.value)
+            result["task_description"] = state.get("task_description", indexed.display_title or "")
         result.update(
             {
                 "trace_id": indexed.trace_id,

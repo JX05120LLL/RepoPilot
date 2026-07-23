@@ -19,6 +19,7 @@ _INLINE_SECRET = re.compile(
     r"(?i)\b(api[_-]?key|token|password|secret|authorization)\b\s*[:=]\s*([^\s,;]+)"
 )
 _TASK_TITLE_MAX_LENGTH = 80
+_TASK_OPERATIONS = frozenset({"change", "research"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +34,7 @@ class StoredTask:
     repository: str
     output_root: str
     task_mode: str
+    task_operation: str
     permission_mode: str
     workspace_mode: str
     status: str
@@ -57,6 +59,7 @@ class StoredTask:
             "repository": self.repository,
             "output_root": self.output_root,
             "task_mode": self.task_mode,
+            "task_operation": self.task_operation,
             "permission_mode": self.permission_mode,
             "workspace_mode": self.workspace_mode,
             "status": self.status,
@@ -172,11 +175,14 @@ class TaskStore:
         task_mode: str,
         permission_mode: str,
         workspace_mode: str,
+        task_operation: str = "change",
         trace_id: str | None = None,
         display_title: str | None = None,
     ) -> StoredTask:
         if not _is_safe_task_id(task_id):
             raise ValueError("INVALID_TASK_ID")
+        if task_operation not in _TASK_OPERATIONS:
+            raise ValueError("TASK_OPERATION_INVALID")
         now = self._now()
         resolved_trace_id = trace_id or self._new_trace_id()
         with self._lock:
@@ -185,9 +191,9 @@ class TaskStore:
                     """
                     INSERT INTO tasks(
                         thread_id, trace_id, task_id, display_title, project_id, repository, output_root, task_mode,
-                        permission_mode, workspace_mode, status, pending_approval, verdict,
+                        task_operation, permission_mode, workspace_mode, status, pending_approval, verdict,
                         error_summary, created_at, updated_at, heartbeat_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING', 0, NULL, NULL, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING', 0, NULL, NULL, ?, ?, ?)
                     """,
                     (
                         thread_id,
@@ -198,6 +204,7 @@ class TaskStore:
                         str(repository),
                         str(output_root),
                         task_mode,
+                        task_operation,
                         permission_mode,
                         workspace_mode,
                         now,
@@ -207,7 +214,11 @@ class TaskStore:
                 )
             except sqlite3.IntegrityError as error:
                 raise ValueError("THREAD_ID_ALREADY_EXISTS") from error
-            self._append_event_locked(thread_id, "TASK_CREATED", {"status": "RUNNING", "task_id": task_id})
+            self._append_event_locked(
+                thread_id,
+                "TASK_CREATED",
+                {"status": "RUNNING", "task_id": task_id, "task_operation": task_operation},
+            )
             self._connection.commit()
             return self._get_locked(thread_id)
 
@@ -398,6 +409,9 @@ class TaskStore:
             error_summary = None
         tool_events = graph_state.get("tool_events")
         events = tool_events if isinstance(tool_events, list) else []
+        graph_task_operation = graph_state.get("task_operation")
+        if graph_task_operation is not None and graph_task_operation not in _TASK_OPERATIONS:
+            raise ValueError("TASK_OPERATION_INVALID")
 
         with self._lock:
             try:
@@ -414,14 +428,21 @@ class TaskStore:
                     repository=Path(str(graph_state.get("repository") or "")),
                     output_root=Path(str(graph_state.get("output_root") or "")),
                     task_mode=task_mode,
+                    task_operation=str(graph_task_operation or "change"),
                     permission_mode=permission_mode,
                     workspace_mode=workspace_mode,
                 )
             now = self._now()
+            task_operation = str(graph_task_operation or previous.task_operation)
             if previous.cancellation_requested_at or previous.error_summary in {"TASK_LEASE_EXPIRED"} or (
                 previous.error_summary is not None and previous.error_summary.startswith("TASK_RUNTIME_FAILED:")
             ):
                 # 取消、租约回收和运行时故障是任务服务的强事实，旧 checkpoint 不得覆盖为等待审批或成功。
+                if task_operation != previous.task_operation:
+                    self._connection.execute(
+                        "UPDATE tasks SET task_operation = ? WHERE thread_id = ?",
+                        (task_operation, thread_id),
+                    )
                 for index, event in enumerate(events):
                     if isinstance(event, dict):
                         self._append_event_locked(thread_id, str(event.get("type", "EVIDENCE")), event, source_index=index)
@@ -431,11 +452,11 @@ class TaskStore:
             self._connection.execute(
                 """
                 UPDATE tasks
-                SET status = ?, pending_approval = ?, verdict = ?, error_summary = ?,
+                SET task_operation = ?, status = ?, pending_approval = ?, verdict = ?, error_summary = ?,
                     updated_at = ?, heartbeat_at = ?, lease_expires_at = ?
                 WHERE thread_id = ?
                 """,
-                (status, int(pending_approval), verdict, error_summary, now, now, None if execution_finished else previous.lease_expires_at, thread_id),
+                (task_operation, status, int(pending_approval), verdict, error_summary, now, now, None if execution_finished else previous.lease_expires_at, thread_id),
             )
             if (
                 previous.status != status
@@ -774,6 +795,7 @@ class TaskStore:
                     repository TEXT NOT NULL,
                     output_root TEXT NOT NULL,
                     task_mode TEXT NOT NULL,
+                    task_operation TEXT NOT NULL DEFAULT 'change' CHECK(task_operation IN ('change', 'research')),
                     permission_mode TEXT NOT NULL,
                     workspace_mode TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -836,6 +858,7 @@ class TaskStore:
             self._ensure_column_locked("tasks", "archived_at", "TEXT")
             self._ensure_column_locked("tasks", "trace_id", "TEXT")
             self._ensure_column_locked("tasks", "display_title", "TEXT")
+            self._ensure_column_locked("tasks", "task_operation", "TEXT NOT NULL DEFAULT 'change'")
             self._backfill_trace_ids_locked()
             self._connection.commit()
 
@@ -858,6 +881,8 @@ class TaskStore:
 
     @staticmethod
     def _task_from_row(row: sqlite3.Row) -> StoredTask:
+        if row["task_operation"] not in _TASK_OPERATIONS:
+            raise ValueError("TASK_OPERATION_INVALID")
         return StoredTask(
             thread_id=row["thread_id"],
             trace_id=row["trace_id"],
@@ -867,6 +892,7 @@ class TaskStore:
             repository=row["repository"],
             output_root=row["output_root"],
             task_mode=row["task_mode"],
+            task_operation=row["task_operation"],
             permission_mode=row["permission_mode"],
             workspace_mode=row["workspace_mode"],
             status=row["status"],

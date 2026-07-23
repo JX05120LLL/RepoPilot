@@ -605,6 +605,7 @@ textarea::placeholder {
 .task-request header {
   display: flex;
   align-items: center;
+  justify-content: space-between;
   gap: 10px;
 }
 
@@ -613,8 +614,18 @@ textarea::placeholder {
   font-weight: 660;
 }
 
-.task-request header span {
+.task-metadata {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.task-metadata span {
+  padding: 3px 6px;
   color: var(--muted);
+  background: var(--surface-subtle);
+  border: 1px solid var(--line);
+  border-radius: 4px;
   font-size: 11px;
 }
 
@@ -939,6 +950,41 @@ textarea::placeholder {
   align-items: center;
   gap: 5px;
   min-width: 0;
+}
+
+.operation-control {
+  display: inline-flex;
+  align-items: center;
+  height: 30px;
+  padding: 2px;
+  background: #f1f3f4;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+
+.operation-control button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 7px;
+  color: #676d76;
+  background: transparent;
+  border: 0;
+  border-radius: 5px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.operation-control button:hover:not(:disabled) {
+  color: var(--ink);
+}
+
+.operation-control button.active {
+  color: #25282d;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgba(34, 40, 49, 0.12);
 }
 
 .permission-control {
@@ -1707,6 +1753,10 @@ textarea::placeholder {
 
   .text-action {
     padding-inline: 4px;
+  }
+
+  .task-metadata span:last-child {
+    display: none;
   }
 
   .utility-header {

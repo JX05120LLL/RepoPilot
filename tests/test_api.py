@@ -51,6 +51,8 @@ class FakeRunner:
         # 模拟真实模型调用耗时，验证 HTTP 会先返回 RUNNING 而不是阻塞到图完成。
         time.sleep(self.delay)
         self.requests.append(request)
+        self.result.state["task_operation"] = request.operation.value
+        self.result.state["task_description"] = request.description
         self.ran = True
         return self.result
 
@@ -68,6 +70,18 @@ class FakeRunner:
 
     def request_cancellation(self, thread_id: str, reason: str | None = None) -> None:
         self.cancellation_requests.append((thread_id, reason))
+
+
+class CheckpointThenFailingRunner(FakeRunner):
+    """模拟 checkpoint 停在 PATCH 后，后台进程又发生未处理异常。"""
+
+    def run(self, request: object, thread_id: str | None, permission: object) -> object:
+        self.ran = True
+        self.result.status = "PATCH"
+        self.result.state["status"] = "PATCH"
+        self.result.state["task_operation"] = request.operation.value
+        self.result.state["task_description"] = request.description
+        raise RuntimeError("不得返回给客户端的内部错误")
 
 
 class FakeApiMcpSession:
@@ -360,13 +374,29 @@ class ApiTests(unittest.TestCase):
                         headers={"Origin": "http://tauri.localhost", "Access-Control-Request-Method": "GET"},
                     )
                     self.assertEqual("http://tauri.localhost", tauri_preflight.headers["access-control-allow-origin"])
-                    task = client.post("/api/tasks", json={"project_id": project.project_id, "description": "分析问题", "task_mode": "safe-isolated", "thread_id": "thread-1", "approved_mcp_tools": ["mcp__docs__search"]})
+                    task = client.post(
+                        "/api/tasks",
+                        json={
+                            "project_id": project.project_id,
+                            "description": "分析问题",
+                            "task_mode": "safe-isolated",
+                            "operation": "research",
+                            "thread_id": "thread-1",
+                            "approved_mcp_tools": ["mcp__docs__search"],
+                        },
+                    )
                     self.assertEqual(200, task.status_code)
                     self.assertEqual("RUNNING", task.json()["status"])
                     self.assertEqual("分析问题", task.json()["display_title"])
+                    self.assertEqual("research", task.json()["task_operation"])
+                    self.assertEqual("分析问题", task.json()["task_description"])
                     self.assertTrue(task.json()["trace_id"].startswith("trace-"))
                     time.sleep(0.15)
                     self.assertEqual(("mcp__docs__search",), runner.requests[0].approved_mcp_tools)
+                    self.assertEqual("research", runner.requests[0].operation.value)
+                    detail = client.get("/api/tasks/thread-1").json()
+                    self.assertEqual("research", detail["task_operation"])
+                    self.assertEqual("分析问题", detail["task_description"])
                     listed_tasks = client.get("/api/tasks").json()["tasks"]
                     self.assertEqual(1, len(listed_tasks))
                     self.assertEqual("分析问题", listed_tasks[0]["display_title"])
@@ -423,5 +453,40 @@ class ApiTests(unittest.TestCase):
                     events = client.get("/api/tasks/thread-1/events")
                     self.assertIn("TASK_CANCELLED", events.text)
                     self.assertIn("TASK_ARCHIVED", events.text)
+            finally:
+                registry.close()
+
+    def test_runtime_failure_overrides_stale_graph_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repository = root / "repo"
+            repository.mkdir()
+            registry = ProjectRegistry(root / "state.sqlite")
+            project = registry.add(repository, "失败恢复项目")
+            try:
+                runner = CheckpointThenFailingRunner()
+                with TestClient(create_app(runner, registry, root / "runs")) as client:
+                    created = client.post(
+                        "/api/tasks",
+                        json={
+                            "project_id": project.project_id,
+                            "description": "验证运行时失败状态",
+                            "thread_id": "thread-1",
+                        },
+                    )
+                    self.assertEqual(200, created.status_code)
+
+                    deadline = time.monotonic() + 2
+                    snapshot = client.get("/api/tasks/thread-1").json()
+                    while snapshot["status"] != "BLOCKED" and time.monotonic() < deadline:
+                        time.sleep(0.02)
+                        snapshot = client.get("/api/tasks/thread-1").json()
+
+                    self.assertEqual("BLOCKED", snapshot["status"])
+                    self.assertEqual("BLOCKED", snapshot["verdict"])
+                    self.assertEqual("TASK_RUNTIME_FAILED: RuntimeError", snapshot["error_summary"])
+                    self.assertEqual("change", snapshot["task_operation"])
+                    self.assertEqual("验证运行时失败状态", snapshot["task_description"])
+                    self.assertNotIn("不得返回给客户端的内部错误", json.dumps(snapshot, ensure_ascii=False))
             finally:
                 registry.close()
