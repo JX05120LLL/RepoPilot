@@ -179,9 +179,11 @@ type ProjectModeReadiness = {
   code: string;
   message: string;
   dirty_entry_count?: number;
+  allowed_operations?: Operation[];
 };
 type ProjectDiagnosis = {
   recommended_task_mode: Mode;
+  recommended_task_operation?: Operation;
   task_modes: {
     safe_isolated: ProjectModeReadiness;
     full_local: ProjectModeReadiness;
@@ -214,6 +216,12 @@ const eventLabels: Record<string, string> = {
   PLAN_GENERATED: "已生成修改计划",
   RESEARCH_LIMIT_REACHED: "研究轮次已达上限",
   EVIDENCE: "记录执行证据",
+  TASK_RUNTIME_FAILED: "任务运行失败",
+  TASK_METADATA_RECOVERED: "已恢复任务信息",
+  TASK_EXECUTION_STARTED: "任务开始执行",
+  TASK_STATE: "任务状态已更新",
+  PLAN_APPROVED: "修改计划已批准",
+  EXECUTION_APPROVED: "执行操作已批准",
 };
 
 function eventSummary(event: TimelineEvent): string {
@@ -426,6 +434,18 @@ export function App() {
       setRequestError(error instanceof Error ? error.message : "无法读取项目诊断"),
     );
   }, [projectId]);
+
+  useEffect(() => {
+    if (task || !projectDiagnosis) return;
+    const recommendedOperation =
+      projectDiagnosis.recommended_task_operation ??
+      (projectDiagnosis.task_modes.full_local.code === "FULL_LOCAL_RESEARCH_ONLY"
+        ? "research"
+        : "change");
+    setMode(projectDiagnosis.recommended_task_mode);
+    setOperation(recommendedOperation);
+    setConfirmed(false);
+  }, [projectDiagnosis, task?.thread_id]);
 
   useEffect(() => {
     if (!task) return;
@@ -793,6 +813,10 @@ export function App() {
       );
       return;
     }
+    if (!operationAllowed) {
+      setRequestError(taskAdmissionMessage);
+      return;
+    }
     setEvents([]);
     setArtifacts([]);
     setArtifactVersions([]);
@@ -815,7 +839,14 @@ export function App() {
         }),
       });
       const payload = await response.json();
-      if (!response.ok) throw new Error(payload.detail ?? "任务创建失败");
+      if (!response.ok) {
+        const detail = payload.detail;
+        throw new Error(
+          typeof detail === "string"
+            ? detail
+            : (detail?.message ?? "任务创建失败"),
+        );
+      }
       setTask(payload as Task);
       setActiveView("task");
       await loadTasks();
@@ -956,6 +987,27 @@ export function App() {
   const interrupt = task?.interrupts?.[0];
   const currentProject = projects.find((item) => item.project_id === projectId);
   const safeModeReadiness = projectDiagnosis?.task_modes.safe_isolated;
+  const selectedModeReadiness =
+    mode === "safe-isolated"
+      ? projectDiagnosis?.task_modes.safe_isolated
+      : projectDiagnosis?.task_modes.full_local;
+  const allowedOperations: Operation[] =
+    selectedModeReadiness?.allowed_operations ??
+    (currentProject
+      ? mode === "safe-isolated"
+        ? currentProject.is_git_repository
+          ? ["change", "research"]
+          : []
+        : currentProject.is_git_repository
+          ? ["change", "research"]
+          : ["research"]
+      : []);
+  const operationAllowed = allowedOperations.includes(operation);
+  const taskAdmissionMessage = operationAllowed
+    ? ""
+    : mode === "full-local" && operation === "change"
+      ? "当前项目不是 Git 仓库，无法生成可信基线和 Diff；请使用仅研究，或先初始化 Git 并创建提交。"
+      : (selectedModeReadiness?.message ?? "当前项目不支持所选任务类型。");
   const safeModeBlockedByProject = Boolean(
     currentProject && (safeModeReadiness ? safeModeReadiness.status !== "READY" : !currentProject.is_git_repository),
   );
@@ -998,6 +1050,7 @@ export function App() {
     !task &&
     Boolean(projectId && description.trim()) &&
     runtimeHealth.status === "READY" &&
+    operationAllowed &&
     !(safeModeBlockedByProject && mode === "safe-isolated") &&
     !(mode === "full-local" && !confirmed);
 
@@ -1313,6 +1366,7 @@ export function App() {
               <div className="composer">
                 {(requestError ||
                   (apiReady && runtimeHealth.status !== "READY") ||
+                  (!task && Boolean(currentProject) && !operationAllowed) ||
                   (mode === "safe-isolated" && safeModeBlockedByProject)) && (
                   <div className="composer-error">
                     <WarningCircle size={16} />
@@ -1326,7 +1380,9 @@ export function App() {
                               runtimeHealth.code +
                               "）"
                             : "本机 Agent API 版本需要更新"
-                          : safeModeWarningMessage)}
+                          : !operationAllowed
+                            ? taskAdmissionMessage
+                            : safeModeWarningMessage)}
                     </span>
                   </div>
                 )}
@@ -1377,7 +1433,7 @@ export function App() {
                       <button
                         className={operation === "change" ? "active" : ""}
                         type="button"
-                        disabled={Boolean(task)}
+                        disabled={Boolean(task) || !allowedOperations.includes("change")}
                         onClick={() => setOperation("change")}
                         aria-label="修改代码"
                         aria-pressed={operation === "change"}
@@ -1389,7 +1445,7 @@ export function App() {
                       <button
                         className={operation === "research" ? "active" : ""}
                         type="button"
-                        disabled={Boolean(task)}
+                        disabled={Boolean(task) || !allowedOperations.includes("research")}
                         onClick={() => setOperation("research")}
                         aria-label="仅研究"
                         aria-pressed={operation === "research"}
@@ -1407,11 +1463,26 @@ export function App() {
                         aria-label="任务权限模式"
                         onChange={(event) => {
                           const nextMode = event.target.value as Mode;
+                          const readiness =
+                            nextMode === "safe-isolated"
+                              ? projectDiagnosis?.task_modes.safe_isolated
+                              : projectDiagnosis?.task_modes.full_local;
+                          const nextAllowed = readiness?.allowed_operations;
                           setMode(nextMode);
+                          if (nextAllowed?.length && !nextAllowed.includes(operation)) {
+                            setOperation(nextAllowed[0]);
+                          }
                           if (nextMode === "safe-isolated") setConfirmed(false);
                         }}
                       >
-                        <option value="safe-isolated">安全隔离</option>
+                        <option
+                          value="safe-isolated"
+                          disabled={Boolean(
+                            safeModeReadiness && safeModeReadiness.status !== "READY",
+                          )}
+                        >
+                          安全隔离
+                        </option>
                         <option value="full-local">完全本机</option>
                       </select>
                     </label>

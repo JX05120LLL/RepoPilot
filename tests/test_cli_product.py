@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 import time
 import unittest
@@ -23,8 +24,24 @@ from repopilot_guard.cli import (
 from repopilot_guard.config import ComponentCheck
 from repopilot_guard.context import ManagedDocumentStore
 from repopilot_guard.models import TaskBudget
+from repopilot_guard.permissions import FULL_ACCESS_CONFIRMATION
 from repopilot_guard.project_registry import ProjectRegistry
 from repopilot_guard.task_store import TaskStore
+
+
+def _initialize_git_repository(repository: Path) -> None:
+    """为 CLI 任务测试创建真实 Git 基线。"""
+
+    commands = (
+        ("init", "-b", "main"),
+        ("config", "user.name", "RepoPilot Test"),
+        ("config", "user.email", "test@example.invalid"),
+    )
+    for arguments in commands:
+        subprocess.run(["git", *arguments], cwd=repository, check=True, capture_output=True)
+    (repository / "README.md").write_text("# fixture\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repository, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "fixture"], cwd=repository, check=True, capture_output=True)
 
 
 class _Result:
@@ -110,6 +127,31 @@ class CliProductTests(unittest.TestCase):
         self.assertIn(project.project_id, payload["next_action"]["command"])
         self.assertNotIn(str(repository), json.dumps(payload, ensure_ascii=False))
 
+    def test_welcome_recommends_full_local_research_for_non_git_project(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "state.sqlite"
+            repository = root / "plain-project"
+            repository.mkdir()
+            registry = ProjectRegistry(state_path)
+            project = registry.add(repository, "普通目录")
+            registry.close()
+            output = StringIO()
+            with patch("sys.stdout", output):
+                exit_code = main(["welcome", "--state-db", str(state_path)])
+
+        payload = json.loads(output.getvalue())
+        command = payload["next_action"]["command"]
+        self.assertEqual(0, exit_code)
+        self.assertEqual("START_FULL_LOCAL_RESEARCH", payload["next_action"]["type"])
+        self.assertEqual("research", payload["selected_project"]["recommended_task_operation"])
+        self.assertEqual(["research"], payload["selected_project"]["full_local"]["allowed_operations"])
+        self.assertIn(project.project_id, command)
+        self.assertIn("--operation research", command)
+        self.assertIn("--task-mode full-local", command)
+        self.assertIn(FULL_ACCESS_CONFIRMATION, command)
+        self.assertNotIn(str(repository), json.dumps(payload, ensure_ascii=False))
+
     def test_cli_prints_package_version_without_loading_runtime_configuration(self) -> None:
         output = StringIO()
         with patch("sys.stdout", output), self.assertRaises(SystemExit) as exit_context:
@@ -154,6 +196,7 @@ class CliProductTests(unittest.TestCase):
             state_path = root / "state.sqlite"
             repository = root / "repository"
             repository.mkdir()
+            _initialize_git_repository(repository)
             checkpoint = SimpleNamespace(checkpointer=object(), close=Mock())
             runner = Mock()
             runner.run.side_effect = lambda _request, thread_id, _permission: _Result(thread_id=thread_id)
@@ -206,6 +249,7 @@ class CliProductTests(unittest.TestCase):
             state_path = root / "state.sqlite"
             repository = root / "repository"
             repository.mkdir()
+            _initialize_git_repository(repository)
             checkpoint = SimpleNamespace(checkpointer=object(), close=Mock())
             settings = SimpleNamespace(task_budget=lambda: TaskBudget())
             observed: dict[str, object] = {}
@@ -244,6 +288,7 @@ class CliProductTests(unittest.TestCase):
             state_path = root / "state.sqlite"
             repository = root / "repository"
             repository.mkdir()
+            _initialize_git_repository(repository)
             checkpoint = SimpleNamespace(checkpointer=object(), close=Mock())
             settings = SimpleNamespace(task_budget=lambda: TaskBudget())
             runner = Mock()
@@ -306,6 +351,7 @@ class CliProductTests(unittest.TestCase):
             state_path = root / "state.sqlite"
             repository = root / "repository"
             repository.mkdir()
+            _initialize_git_repository(repository)
             store = TaskStore(state_path)
             try:
                 store.create(
@@ -334,6 +380,81 @@ class CliProductTests(unittest.TestCase):
             self.assertEqual(2, exit_code)
             self.assertEqual("THREAD_ID_ALREADY_EXISTS", json.loads(output.getvalue())["code"])
             runner.run.assert_not_called()
+
+    def test_non_git_full_local_change_is_blocked_before_runtime_loading(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repository = root / "plain-project"
+            repository.mkdir()
+            state_path = root / "state.sqlite"
+            output = StringIO()
+            with (
+                patch("repopilot_guard.cli.AppSettings") as settings,
+                patch("repopilot_guard.cli.SqliteCheckpointStore") as checkpoint_store,
+                patch("repopilot_guard.cli.GraphRunner") as runner,
+                patch("sys.stdout", output),
+            ):
+                exit_code = main(
+                    [
+                        "task",
+                        "start",
+                        "--repo",
+                        str(repository),
+                        "--task",
+                        "直接修改代码",
+                        "--task-mode",
+                        "full-local",
+                        "--confirm-full-access",
+                        FULL_ACCESS_CONFIRMATION,
+                        "--state-db",
+                        str(state_path),
+                    ]
+                )
+
+            payload = json.loads(output.getvalue())
+            self.assertEqual(2, exit_code)
+            self.assertEqual("FULL_LOCAL_CHANGE_REQUIRES_GIT", payload["code"])
+            self.assertEqual(["research"], payload["allowed_operations"])
+            self.assertFalse(state_path.exists())
+            settings.assert_not_called()
+            checkpoint_store.assert_not_called()
+            runner.assert_not_called()
+
+    def test_dirty_safe_task_is_blocked_before_runtime_loading(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repository = root / "dirty-project"
+            repository.mkdir()
+            _initialize_git_repository(repository)
+            (repository / "README.md").write_text("# dirty fixture\n", encoding="utf-8")
+            state_path = root / "state.sqlite"
+            output = StringIO()
+            with (
+                patch("repopilot_guard.cli.AppSettings") as settings,
+                patch("repopilot_guard.cli.SqliteCheckpointStore") as checkpoint_store,
+                patch("repopilot_guard.cli.GraphRunner") as runner,
+                patch("sys.stdout", output),
+            ):
+                exit_code = main(
+                    [
+                        "task",
+                        "start",
+                        "--repo",
+                        str(repository),
+                        "--task",
+                        "分析未提交改动",
+                        "--state-db",
+                        str(state_path),
+                    ]
+                )
+
+            payload = json.loads(output.getvalue())
+            self.assertEqual(2, exit_code)
+            self.assertEqual("DIRTY_SOURCE_BLOCKED", payload["code"])
+            self.assertFalse(state_path.exists())
+            settings.assert_not_called()
+            checkpoint_store.assert_not_called()
+            runner.assert_not_called()
 
     def test_cli_lease_heartbeat_renews_until_stopped(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

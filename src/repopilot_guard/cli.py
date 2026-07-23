@@ -31,7 +31,7 @@ from repopilot_guard.mcp_runtime import MAX_MCP_INPUT_CHARS, McpRuntime, McpRunt
 from repopilot_guard.permissions import FULL_ACCESS_CONFIRMATION, PermissionGrant, PermissionMode
 from repopilot_guard.plugins import PluginError, PluginRegistry
 from repopilot_guard.preflight import PreflightInspector
-from repopilot_guard.project_diagnostics import diagnose_project
+from repopilot_guard.project_diagnostics import assess_task_admission, diagnose_project
 from repopilot_guard.project_registry import ProjectRegistry
 from repopilot_guard.providers import OpenAICompatibleProvider
 from repopilot_guard.qdrant_bootstrap import QdrantBootstrapper, check_qdrant_health
@@ -216,7 +216,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_list.add_argument("--state-db", type=Path)
     task_start = task_subparsers.add_parser("start", help="以安全隔离或完全本机控制模式启动任务")
     task_source = task_start.add_mutually_exclusive_group(required=True)
-    task_source.add_argument("--repo", type=Path, help="已授权的 Git 仓库路径")
+    task_source.add_argument("--repo", type=Path, help="已授权的本地项目目录")
     task_source.add_argument("--project-id", help="已注册项目 ID")
     task_start.add_argument("--task", required=True, help="问题描述、修复目标或代码评审请求")
     task_start.add_argument("--operation", choices=[operation.value for operation in TaskOperation], default=TaskOperation.CHANGE.value, help="任务类型：change 会申请执行审批，research 只输出计划和报告")
@@ -527,13 +527,39 @@ def _welcome_project_summary(project: object) -> dict[str, object]:
     full_mode = task_modes["full_local"]
     assert isinstance(safe_mode, dict)
     assert isinstance(full_mode, dict)
+    recommended_operation = diagnosis.get("recommended_task_operation")
+    if recommended_operation not in {operation.value for operation in TaskOperation}:
+        recommended_operation = (
+            TaskOperation.RESEARCH.value
+            if full_mode.get("code") == "FULL_LOCAL_RESEARCH_ONLY"
+            else TaskOperation.CHANGE.value
+        )
+    safe_allowed = safe_mode.get("allowed_operations")
+    if not isinstance(safe_allowed, list):
+        safe_allowed = [operation.value for operation in TaskOperation] if safe_mode.get("status") == "READY" else []
+    full_allowed = full_mode.get("allowed_operations")
+    if not isinstance(full_allowed, list):
+        full_allowed = (
+            [TaskOperation.RESEARCH.value]
+            if full_mode.get("code") == "FULL_LOCAL_RESEARCH_ONLY"
+            else [operation.value for operation in TaskOperation]
+        )
     return {
         "project_id": project_payload["project_id"],
         "display_name": project_payload["display_name"],
         "is_git_repository": project_payload["is_git_repository"],
         "recommended_task_mode": diagnosis["recommended_task_mode"],
-        "safe_isolated": {"status": safe_mode["status"], "code": safe_mode["code"]},
-        "full_local": {"status": full_mode["status"], "code": full_mode["code"]},
+        "recommended_task_operation": recommended_operation,
+        "safe_isolated": {
+            "status": safe_mode["status"],
+            "code": safe_mode["code"],
+            "allowed_operations": safe_allowed,
+        },
+        "full_local": {
+            "status": full_mode["status"],
+            "code": full_mode["code"],
+            "allowed_operations": full_allowed,
+        },
         "java_maven": {"status": java_profile["status"], "code": java_profile["code"]},
     }
 
@@ -544,6 +570,14 @@ def _welcome_next_action(project: dict[str, object]) -> dict[str, str]:
         return {
             "type": "START_SAFE_ISOLATED_TASK",
             "command": f'repopilot-guard task start --project-id {project_id} --task "<描述代码任务>"',
+        }
+    if project.get("recommended_task_operation") == TaskOperation.RESEARCH.value:
+        return {
+            "type": "START_FULL_LOCAL_RESEARCH",
+            "command": (
+                f'repopilot-guard task start --project-id {project_id} --task "<描述研究问题>" '
+                f'--operation research --task-mode full-local --confirm-full-access "{FULL_ACCESS_CONFIRMATION}"'
+            ),
         }
     return {
         "type": "REVIEW_FULL_LOCAL_RISK",
@@ -1098,13 +1132,28 @@ def _run_task(args: argparse.Namespace) -> int:
             return _run_task_artifact_command(args)
         if args.task_command == "status":
             return _run_task_status(args)
+        state_path = _state_db_path(args.state_db)
         # 在构造模型、Qdrant 与图依赖前先验证高风险模式确认，避免无效请求产生外部调用。
         permission: PermissionGrant | None = None
         workspace_mode: WorkspaceMode | None = None
+        start_repository: Path | None = None
         if args.task_command == "start":
             permission, workspace_mode = _mode_context(args)
+            if args.project_id:
+                registry = ProjectRegistry(state_path)
+                start_repository = registry.get(args.project_id).root_path
+            else:
+                start_repository = args.repo
+            assert start_repository is not None
+            admission = assess_task_admission(
+                start_repository,
+                TaskMode(args.task_mode),
+                TaskOperation(args.operation),
+                include_uncommitted_changes=args.include_uncommitted_changes,
+            )
+            if not admission.ready:
+                return _print_json_result(admission.to_dict(), 2)
         settings = AppSettings()
-        state_path = _state_db_path(args.state_db)
         checkpoint_store = SqliteCheckpointStore(state_path)
         task_store = TaskStore(state_path)
         try:
@@ -1139,11 +1188,8 @@ def _run_task(args: argparse.Namespace) -> int:
                 assert result is not None
             else:
                 assert permission is not None and workspace_mode is not None
-                if args.project_id:
-                    registry = ProjectRegistry(state_path)
-                    repository = registry.get(args.project_id).root_path
-                else:
-                    repository = args.repo
+                assert start_repository is not None
+                repository = start_repository
                 request = TaskRequest(
                     repository=repository,
                     description=args.task,

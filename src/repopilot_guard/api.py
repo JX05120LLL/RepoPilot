@@ -25,7 +25,7 @@ from repopilot_guard.mcp_runtime import McpRuntime, McpRuntimeError
 from repopilot_guard.models import TaskMode, TaskOperation, TaskRequest, WorkspaceSelection
 from repopilot_guard.permissions import FULL_ACCESS_CONFIRMATION, PermissionGrant, PermissionMode
 from repopilot_guard.plugins import PluginError, PluginRegistry
-from repopilot_guard.project_diagnostics import diagnose_project
+from repopilot_guard.project_diagnostics import assess_task_admission, diagnose_project
 from repopilot_guard.project_registry import ProjectRegistry
 from repopilot_guard.task_store import StoredTaskEvent, TaskStore
 
@@ -255,6 +255,9 @@ def create_app(
         try:
             repository = registry.get(body.project_id).root_path if body.project_id else Path(str(body.repository))
             grant = _grant_for_mode(body.task_mode, body.confirmation)
+            admission = assess_task_admission(repository, body.task_mode, body.operation)
+            if not admission.ready:
+                raise HTTPException(409, admission.to_dict())
             request = TaskRequest(
                 repository=repository,
                 description=body.description,
@@ -584,12 +587,17 @@ def _task_snapshot(
     if persisted.lease_expires_at or persisted.cancellation_requested_at or persisted.error_summary == "TASK_LEASE_EXPIRED":
         return persisted.to_dict()
     if runtime_failed:
-        snapshot = persisted.to_dict()
         try:
-            state = runner.get(thread_id).state
+            result = runner.get(thread_id).to_dict()
+            persisted = task_store.sync_graph_result(result, execution_finished=False)
+            snapshot = persisted.to_dict()
+            state = result.get("state")
+            if not isinstance(state, dict):
+                state = {}
             snapshot["task_operation"] = state.get("task_operation", persisted.task_operation)
             snapshot["task_description"] = state.get("task_description", persisted.display_title or "")
         except (KeyError, ValueError, sqlite3.Error):
+            snapshot = persisted.to_dict()
             snapshot["task_operation"] = persisted.task_operation
             snapshot["task_description"] = persisted.display_title or ""
         return snapshot

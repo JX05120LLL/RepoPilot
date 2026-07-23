@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import subprocess
 import tempfile
 import time
 import unittest
@@ -23,7 +25,23 @@ from repopilot_guard.mcp_runtime import (
     McpToolDiscovery,
 )
 from repopilot_guard.plugins import PluginRegistry
+from repopilot_guard.permissions import FULL_ACCESS_CONFIRMATION
 from repopilot_guard.project_registry import ProjectRegistry
+
+
+def _initialize_git_repository(repository: Path) -> None:
+    """创建带基线提交的最小仓库，避免 API 测试伪造 `.git`。"""
+
+    commands = (
+        ("init", "-b", "main"),
+        ("config", "user.name", "RepoPilot Test"),
+        ("config", "user.email", "test@example.invalid"),
+    )
+    for arguments in commands:
+        subprocess.run(["git", *arguments], cwd=repository, check=True, capture_output=True)
+    (repository / "README.md").write_text("# fixture\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repository, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "fixture"], cwd=repository, check=True, capture_output=True)
 
 
 class FakeRunner:
@@ -161,10 +179,86 @@ class ApiTests(unittest.TestCase):
                 payload = response.json()
                 self.assertEqual(200, response.status_code)
                 self.assertEqual("full-local", payload["recommended_task_mode"])
+                self.assertEqual("research", payload["recommended_task_operation"])
                 self.assertEqual("GIT_REPOSITORY_REQUIRED", payload["task_modes"]["safe_isolated"]["code"])
                 self.assertEqual("FULL_LOCAL_RESEARCH_ONLY", payload["task_modes"]["full_local"]["code"])
+                self.assertEqual(["research"], payload["task_modes"]["full_local"]["allowed_operations"])
                 self.assertEqual("JAVA_MAVEN_PROFILE_READY", payload["profiles"]["java_maven"]["code"])
                 self.assertFalse((root / "runs").exists())
+            finally:
+                registry.close()
+
+    def test_non_git_project_only_admits_full_local_research(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repository = root / "non-git-project"
+            repository.mkdir()
+            registry = ProjectRegistry(root / "state.sqlite")
+            project = registry.add(repository, "非 Git 项目")
+            runner = FakeRunner(delay=0)
+            try:
+                with TestClient(create_app(runner, registry, root / "runs")) as client:
+                    blocked = client.post(
+                        "/api/tasks",
+                        json={
+                            "project_id": project.project_id,
+                            "description": "直接修改代码",
+                            "task_mode": "full-local",
+                            "operation": "change",
+                            "confirmation": FULL_ACCESS_CONFIRMATION,
+                            "thread_id": "blocked-change",
+                        },
+                    )
+
+                    self.assertEqual(409, blocked.status_code)
+                    self.assertEqual("FULL_LOCAL_CHANGE_REQUIRES_GIT", blocked.json()["detail"]["code"])
+                    self.assertEqual(["research"], blocked.json()["detail"]["allowed_operations"])
+                    self.assertFalse(runner.ran)
+                    self.assertEqual([], client.get("/api/tasks").json()["tasks"])
+
+                    admitted = client.post(
+                        "/api/tasks",
+                        json={
+                            "project_id": project.project_id,
+                            "description": "介绍项目结构",
+                            "task_mode": "full-local",
+                            "operation": "research",
+                            "confirmation": FULL_ACCESS_CONFIRMATION,
+                            "thread_id": "thread-1",
+                        },
+                    )
+
+                    self.assertEqual(200, admitted.status_code)
+                    deadline = time.monotonic() + 1
+                    while not runner.ran and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertTrue(runner.ran)
+                    self.assertEqual("research", runner.requests[0].operation.value)
+
+                    empty_git = root / "empty-git-project"
+                    empty_git.mkdir()
+                    subprocess.run(
+                        ["git", "init", "-b", "main"],
+                        cwd=empty_git,
+                        check=True,
+                        capture_output=True,
+                    )
+                    empty_project = registry.add(empty_git, "空 Git 项目")
+                    missing_baseline = client.post(
+                        "/api/tasks",
+                        json={
+                            "project_id": empty_project.project_id,
+                            "description": "直接修改代码",
+                            "task_mode": "full-local",
+                            "operation": "change",
+                            "confirmation": FULL_ACCESS_CONFIRMATION,
+                        },
+                    )
+                    self.assertEqual(409, missing_baseline.status_code)
+                    self.assertEqual(
+                        "FULL_LOCAL_CHANGE_REQUIRES_GIT_BASELINE",
+                        missing_baseline.json()["detail"]["code"],
+                    )
             finally:
                 registry.close()
 
@@ -358,6 +452,7 @@ class ApiTests(unittest.TestCase):
             root = Path(temporary_directory)
             repository = root / "repo"
             repository.mkdir()
+            _initialize_git_repository(repository)
             registry = ProjectRegistry(root / "state.sqlite")
             project = registry.add(repository, "演示项目")
             try:
@@ -431,6 +526,7 @@ class ApiTests(unittest.TestCase):
             root = Path(temporary_directory)
             repository = root / "repo"
             repository.mkdir()
+            _initialize_git_repository(repository)
             registry = ProjectRegistry(root / "state.sqlite")
             project = registry.add(repository, "演示项目")
             try:
@@ -461,6 +557,7 @@ class ApiTests(unittest.TestCase):
             root = Path(temporary_directory)
             repository = root / "repo"
             repository.mkdir()
+            _initialize_git_repository(repository)
             registry = ProjectRegistry(root / "state.sqlite")
             project = registry.add(repository, "失败恢复项目")
             try:
@@ -482,11 +579,23 @@ class ApiTests(unittest.TestCase):
                         time.sleep(0.02)
                         snapshot = client.get("/api/tasks/thread-1").json()
 
+                    connection = sqlite3.connect(registry.database_path)
+                    try:
+                        connection.execute(
+                            "UPDATE tasks SET display_title = NULL WHERE thread_id = ?",
+                            ("thread-1",),
+                        )
+                        connection.commit()
+                    finally:
+                        connection.close()
+                    snapshot = client.get("/api/tasks/thread-1").json()
+
                     self.assertEqual("BLOCKED", snapshot["status"])
                     self.assertEqual("BLOCKED", snapshot["verdict"])
                     self.assertEqual("TASK_RUNTIME_FAILED: RuntimeError", snapshot["error_summary"])
                     self.assertEqual("change", snapshot["task_operation"])
                     self.assertEqual("验证运行时失败状态", snapshot["task_description"])
+                    self.assertEqual("验证运行时失败状态", snapshot["display_title"])
                     self.assertNotIn("不得返回给客户端的内部错误", json.dumps(snapshot, ensure_ascii=False))
             finally:
                 registry.close()

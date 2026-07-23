@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -126,6 +127,71 @@ class TaskStoreTests(unittest.TestCase):
                 self.assertEqual("research", reopened.list()[0].task_operation)
             finally:
                 reopened.close()
+
+    def test_runtime_failure_keeps_strong_status_and_recovers_missing_title(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            store = TaskStore(root / "state.sqlite")
+            try:
+                task = store.create(
+                    thread_id="thread-legacy-failure",
+                    task_id="task-legacy-failure",
+                    project_id="project-1",
+                    repository=root / "repo",
+                    output_root=root / "runs",
+                    task_mode="full-local",
+                    permission_mode="full",
+                    workspace_mode="local",
+                )
+                self.assertIsNone(task.display_title)
+                store.mark_runtime_failure(task.thread_id, "TASK_RUNTIME_FAILED: GitCommandError")
+
+                recovered = store.sync_graph_result(
+                    {
+                        "thread_id": task.thread_id,
+                        "task_id": task.task_id,
+                        "status": "PATCH",
+                        "pending_approval": False,
+                        "state": {
+                            "task_operation": "research",
+                            "task_description": "介绍项目 API_KEY=do-not-expose",
+                            "tool_events": [],
+                        },
+                    },
+                    execution_finished=False,
+                )
+                events = store.events_after(task.thread_id, 0)
+
+                self.assertEqual("BLOCKED", recovered.status)
+                self.assertEqual("BLOCKED", recovered.verdict)
+                self.assertEqual("TASK_RUNTIME_FAILED: GitCommandError", recovered.error_summary)
+                self.assertEqual("research", recovered.task_operation)
+                self.assertEqual("介绍项目 API_KEY=[REDACTED]", recovered.display_title)
+                self.assertEqual(1, sum(event.event_type == "TASK_METADATA_RECOVERED" for event in events))
+                self.assertNotIn("do-not-expose", json.dumps([event.to_dict() for event in events], ensure_ascii=False))
+
+                store.sync_graph_result(
+                    {
+                        "thread_id": task.thread_id,
+                        "task_id": task.task_id,
+                        "status": "REPORT",
+                        "state": {
+                            "task_operation": "research",
+                            "task_description": "不得覆盖已恢复标题",
+                            "tool_events": [],
+                        },
+                    }
+                )
+                self.assertEqual("介绍项目 API_KEY=[REDACTED]", store.get(task.thread_id).display_title)
+                self.assertEqual(
+                    1,
+                    sum(
+                        event.event_type == "TASK_METADATA_RECOVERED"
+                        for event in store.events_after(task.thread_id, 0)
+                    ),
+                )
+            finally:
+                store.close()
 
     def test_legacy_task_table_migrates_operation_without_losing_task(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

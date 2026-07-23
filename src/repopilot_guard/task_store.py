@@ -412,6 +412,11 @@ class TaskStore:
         graph_task_operation = graph_state.get("task_operation")
         if graph_task_operation is not None and graph_task_operation not in _TASK_OPERATIONS:
             raise ValueError("TASK_OPERATION_INVALID")
+        graph_title = _normalize_task_title(
+            graph_state.get("task_description")
+            if isinstance(graph_state.get("task_description"), str)
+            else None
+        )
 
         with self._lock:
             try:
@@ -431,17 +436,29 @@ class TaskStore:
                     task_operation=str(graph_task_operation or "change"),
                     permission_mode=permission_mode,
                     workspace_mode=workspace_mode,
+                    display_title=graph_title,
                 )
             now = self._now()
             task_operation = str(graph_task_operation or previous.task_operation)
+            recover_title = previous.display_title is None and graph_title is not None
             if previous.cancellation_requested_at or previous.error_summary in {"TASK_LEASE_EXPIRED"} or (
                 previous.error_summary is not None and previous.error_summary.startswith("TASK_RUNTIME_FAILED:")
             ):
                 # 取消、租约回收和运行时故障是任务服务的强事实，旧 checkpoint 不得覆盖为等待审批或成功。
-                if task_operation != previous.task_operation:
+                if task_operation != previous.task_operation or recover_title:
                     self._connection.execute(
-                        "UPDATE tasks SET task_operation = ? WHERE thread_id = ?",
-                        (task_operation, thread_id),
+                        """
+                        UPDATE tasks
+                        SET task_operation = ?, display_title = COALESCE(display_title, ?)
+                        WHERE thread_id = ?
+                        """,
+                        (task_operation, graph_title, thread_id),
+                    )
+                if recover_title:
+                    self._append_event_locked(
+                        thread_id,
+                        "TASK_METADATA_RECOVERED",
+                        {"display_title_recovered": True},
                     )
                 for index, event in enumerate(events):
                     if isinstance(event, dict):
@@ -452,12 +469,30 @@ class TaskStore:
             self._connection.execute(
                 """
                 UPDATE tasks
-                SET task_operation = ?, status = ?, pending_approval = ?, verdict = ?, error_summary = ?,
+                SET task_operation = ?, display_title = COALESCE(display_title, ?),
+                    status = ?, pending_approval = ?, verdict = ?, error_summary = ?,
                     updated_at = ?, heartbeat_at = ?, lease_expires_at = ?
                 WHERE thread_id = ?
                 """,
-                (task_operation, status, int(pending_approval), verdict, error_summary, now, now, None if execution_finished else previous.lease_expires_at, thread_id),
+                (
+                    task_operation,
+                    graph_title,
+                    status,
+                    int(pending_approval),
+                    verdict,
+                    error_summary,
+                    now,
+                    now,
+                    None if execution_finished else previous.lease_expires_at,
+                    thread_id,
+                ),
             )
+            if recover_title:
+                self._append_event_locked(
+                    thread_id,
+                    "TASK_METADATA_RECOVERED",
+                    {"display_title_recovered": True},
+                )
             if (
                 previous.status != status
                 or previous.pending_approval != pending_approval

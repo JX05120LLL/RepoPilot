@@ -194,7 +194,9 @@ class ProjectRegistryTests(unittest.TestCase):
         payload = json.loads(output.getvalue())
         self.assertEqual(0, code)
         self.assertEqual("safe-isolated", payload["recommended_task_mode"])
+        self.assertEqual("change", payload["recommended_task_operation"])
         self.assertEqual("READY", payload["task_modes"]["safe_isolated"]["status"])
+        self.assertEqual(["change", "research"], payload["task_modes"]["safe_isolated"]["allowed_operations"])
         self.assertEqual("READY", payload["task_modes"]["full_local"]["status"])
         self.assertIsNotNone(payload["git"]["baseline_commit"])
 
@@ -214,8 +216,32 @@ class ProjectRegistryTests(unittest.TestCase):
         payload = json.loads(output.getvalue())
         self.assertEqual(0, code)
         self.assertEqual("full-local", payload["recommended_task_mode"])
+        self.assertEqual("research", payload["recommended_task_operation"])
         self.assertEqual("GIT_REPOSITORY_REQUIRED", payload["task_modes"]["safe_isolated"]["code"])
         self.assertEqual("FULL_LOCAL_RESEARCH_ONLY", payload["task_modes"]["full_local"]["code"])
+        self.assertEqual(["research"], payload["task_modes"]["full_local"]["allowed_operations"])
+
+    def test_project_doctor_requires_commit_before_change_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            project_root = root / "empty-git-project"
+            project_root.mkdir()
+            _git(project_root, "init", "-b", "main")
+            state_path = root / "state.sqlite"
+            registry = ProjectRegistry(state_path)
+            project = registry.add(project_root)
+            registry.close()
+            output = StringIO()
+            with redirect_stdout(output):
+                code = main(["project", "doctor", "--project-id", project.project_id, "--state-db", str(state_path)])
+
+        payload = json.loads(output.getvalue())
+        self.assertEqual(0, code)
+        self.assertEqual("full-local", payload["recommended_task_mode"])
+        self.assertEqual("research", payload["recommended_task_operation"])
+        self.assertEqual("GIT_BASELINE_UNAVAILABLE", payload["task_modes"]["safe_isolated"]["code"])
+        self.assertEqual("FULL_LOCAL_RESEARCH_ONLY", payload["task_modes"]["full_local"]["code"])
+        self.assertEqual(["research"], payload["task_modes"]["full_local"]["allowed_operations"])
 
 
 class WorkspaceSelectionTests(unittest.TestCase):
