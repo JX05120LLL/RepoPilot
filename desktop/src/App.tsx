@@ -191,6 +191,17 @@ type ProjectDiagnosis = {
   git: { is_repository: boolean; baseline_commit: string | null; dirty_entry_count: number };
   profiles: { java_maven: { status: string; code: string; warnings: string[] } };
 };
+type TaskOutcome = {
+  tone: "neutral" | "success" | "warning" | "danger";
+  title: string;
+  detail: string;
+};
+type UnifiedDiffLine = {
+  kind: "add" | "remove" | "context" | "meta" | "hunk";
+  content: string;
+  oldLine: number | null;
+  newLine: number | null;
+};
 
 const artifactLabels: Record<string, string> = {
   report: "任务报告",
@@ -203,10 +214,18 @@ const artifactLabels: Record<string, string> = {
 };
 
 const eventLabels: Record<string, string> = {
+  TASK_CREATED: "任务已创建",
   GRAPH_NODE_STARTED: "开始执行节点",
   GRAPH_NODE_COMPLETED: "完成工作节点",
   TOOL_CALL_STARTED: "调用受控工具",
   TOOL_CALL_COMPLETED: "工具返回结果",
+  TASK_BUDGET_SNAPSHOT: "任务预算已冻结",
+  WORKSPACE_PREPARED: "工作区已准备",
+  PREFLIGHT_COMPLETED: "环境预检完成",
+  MCP_BINDINGS_DISCOVERED: "MCP 能力已检查",
+  CONTEXT_INGESTED: "项目上下文已索引",
+  CONTEXT_RETRIEVED: "项目上下文已检索",
+  CONTEXT_BROKER_ASSEMBLED: "模型上下文已组装",
   APPROVAL_REQUIRED: "等待人工审批",
   TASK_STATUS_CHANGED: "任务状态更新",
   MODEL_USAGE_RECORDED: "模型用量已记录",
@@ -224,6 +243,24 @@ const eventLabels: Record<string, string> = {
   EXECUTION_APPROVED: "执行操作已批准",
 };
 
+const eventSummaryLabels: Record<string, string> = {
+  INTAKE: "任务输入、权限与工作区选择已校验。",
+  WORKSPACE: "工作区已绑定，Git 基线和目录边界已检查。",
+  PREFLIGHT: "本机依赖、模型服务和项目条件已检查。",
+  MCP_BINDINGS: "MCP 工具发现与任务级授权已检查。",
+  INGEST: "代码与研发文档索引状态已更新。",
+  RETRIEVE: "已按项目和代码基线检索上下文。",
+  CONTEXT_BROKER_READY: "模型上下文已在预算与来源边界内冻结。",
+  ANALYZE: "代码分析阶段已完成。",
+  RESEARCH_TOOLS: "受控只读工具研究已完成。",
+  PLAN: "修改计划阶段已完成。",
+  PLAN_APPROVAL: "计划审批结果已写入任务状态。",
+  EXECUTION_APPROVAL: "执行审批结果已写入任务状态。",
+  RUNNING: "任务执行器已开始处理。",
+  WAITING_APPROVAL: "任务已暂停，正在等待人工审批。",
+  MODEL_USAGE_REPORTED: "本次模型用量已纳入任务审计。",
+};
+
 function eventSummary(event: TimelineEvent): string {
   const candidates = [
     event.payload.message,
@@ -236,7 +273,252 @@ function eventSummary(event: TimelineEvent): string {
   const summary = candidates.find(
     (value) => typeof value === "string" && value.trim(),
   );
-  return typeof summary === "string" ? summary : "已写入可审计事件。";
+  if (typeof summary !== "string") return "已写入可审计事件。";
+  if (eventSummaryLabels[summary]) return eventSummaryLabels[summary];
+  if (summary.startsWith("TASK_RUNTIME_FAILED:")) {
+    return "运行时操作失败，任务已按策略安全阻断。";
+  }
+  return summary;
+}
+
+function resolveTaskOutcome(item: Task, running: boolean): TaskOutcome {
+  if (item.pending_approval) {
+    return {
+      tone: "warning",
+      title: "等待你的审批",
+      detail: "任务已暂停，不会在批准前继续执行后续动作。",
+    };
+  }
+  if (running) {
+    return {
+      tone: "neutral",
+      title: "任务正在运行",
+      detail: "RepoPilot 正在分析项目并持续记录可审计证据。",
+    };
+  }
+
+  const result = (item.verdict ?? item.status).toUpperCase();
+  if (result === "PASSED") {
+    return {
+      tone: "success",
+      title: "任务已通过验证",
+      detail: "代码 Diff 与声明的验证结果均已生成，可进入审阅。",
+    };
+  }
+  if (result === "FAILED") {
+    return {
+      tone: "danger",
+      title: "任务执行失败",
+      detail: "补丁或验证明确失败，请在证据与产物中查看原因。",
+    };
+  }
+  if (result === "BLOCKED") {
+    return {
+      tone: "danger",
+      title: "任务已安全阻断",
+      detail: "任务没有继续执行高风险动作，请查看最后一条证据定位原因。",
+    };
+  }
+  if (result === "CANCELLED") {
+    return {
+      tone: "warning",
+      title: "任务已取消",
+      detail: "取消请求已生效，任务不会继续执行。",
+    };
+  }
+  if (result === "UNVERIFIED") {
+    return {
+      tone: "warning",
+      title: "结果尚未验证",
+      detail: "当前已有分析或计划，但没有足够的补丁与验证证据。",
+    };
+  }
+  return {
+    tone: "neutral",
+    title: "任务已结束",
+    detail: "任务状态已经固化，可查看证据和产物了解完整过程。",
+  };
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function readArtifactJson(content: string): Record<string, unknown> | null {
+  try {
+    return asRecord(JSON.parse(content));
+  } catch {
+    return null;
+  }
+}
+
+function readString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function readStringList(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
+}
+
+function parseUnifiedDiff(content: string): UnifiedDiffLine[] {
+  let oldLine: number | null = null;
+  let newLine: number | null = null;
+  return content.replace(/\r\n/g, "\n").split("\n").map((line) => {
+    const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(line);
+    if (hunk) {
+      oldLine = Number(hunk[1]);
+      newLine = Number(hunk[2]);
+      return { kind: "hunk", content: line, oldLine: null, newLine: null };
+    }
+    if (line.startsWith("+++") || line.startsWith("---") || line.startsWith("diff ") || line.startsWith("index ") || line.startsWith("\\ No newline")) {
+      return { kind: "meta", content: line, oldLine: null, newLine: null };
+    }
+    if (line.startsWith("+")) {
+      const result = { kind: "add" as const, content: line, oldLine: null, newLine };
+      newLine = newLine === null ? null : newLine + 1;
+      return result;
+    }
+    if (line.startsWith("-")) {
+      const result = { kind: "remove" as const, content: line, oldLine, newLine: null };
+      oldLine = oldLine === null ? null : oldLine + 1;
+      return result;
+    }
+    if (line.startsWith(" ")) {
+      const result = { kind: "context" as const, content: line, oldLine, newLine };
+      oldLine = oldLine === null ? null : oldLine + 1;
+      newLine = newLine === null ? null : newLine + 1;
+      return result;
+    }
+    return { kind: "meta", content: line, oldLine: null, newLine: null };
+  });
+}
+
+function ArtifactContent({ kind, content }: { kind: string; content: string }) {
+  if (kind === "git_diff") {
+    const lines = parseUnifiedDiff(content);
+    return (
+      <div className="artifact-content diff-view" aria-label="代码变更 Diff">
+        {lines.map((line, index) => (
+          <div className={"diff-line diff-" + line.kind} key={index}>
+            <span>{line.oldLine ?? ""}</span>
+            <span>{line.newLine ?? ""}</span>
+            <code>{line.content || " "}</code>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
+  const data = readArtifactJson(content);
+  if (kind === "verification" && data) {
+    const status = readString(data.status) ?? "UNKNOWN";
+    const success = status === "PASSED";
+    const reports = readStringList(data.surefire_reports);
+    const argv = readStringList(data.argv);
+    const stdout = readString(data.stdout_summary);
+    const stderr = readString(data.stderr_summary);
+    return (
+      <div className="artifact-content verification-view">
+        <div className={"verification-verdict " + (success ? "passed" : "failed")}>
+          {success ? <CheckCircle size={20} weight="fill" /> : <WarningCircle size={20} weight="fill" />}
+          <div><strong>{success ? "验证通过" : "验证未通过"}</strong><span>{status}</span></div>
+        </div>
+        <dl className="artifact-facts">
+          <div><dt>Recipe</dt><dd>{readString(data.recipe) ?? "未记录"}</dd></div>
+          <div><dt>退出码</dt><dd>{String(data.exit_code ?? "未记录")}</dd></div>
+          <div><dt>耗时</dt><dd>{typeof data.duration_ms === "number" ? data.duration_ms.toLocaleString() + " ms" : "未记录"}</dd></div>
+          <div><dt>审计代码</dt><dd>{readString(data.code) ?? "未记录"}</dd></div>
+        </dl>
+        {argv.length > 0 && <code className="artifact-command">{argv.join(" ")}</code>}
+        {reports.length > 0 && (
+          <section className="artifact-list-section">
+            <h3>Surefire 报告</h3>
+            <ul>{reports.map((report) => <li key={report}>{report}</li>)}</ul>
+          </section>
+        )}
+        {(stdout || stderr) && (
+          <details className="artifact-details">
+            <summary>查看截断后的 Maven 输出摘要</summary>
+            {stdout && <pre>{stdout}</pre>}
+            {stderr && <pre>{stderr}</pre>}
+          </details>
+        )}
+      </div>
+    );
+  }
+
+  if (kind === "plan_json" && data) {
+    const evidence = Array.isArray(data.evidence) ? data.evidence.map(asRecord).filter(Boolean) as Record<string, unknown>[] : [];
+    return (
+      <div className="artifact-content plan-view">
+        <section className="plan-summary">
+          <span>问题摘要</span>
+          <p>{readString(data.summary) ?? readString(data.problem_summary) ?? "计划未提供问题摘要。"}</p>
+        </section>
+        <section className="artifact-list-section">
+          <h3>候选文件</h3>
+          <ul className="path-list">{readStringList(data.candidate_files).map((path) => <li key={path}>{path}</li>)}</ul>
+          {readStringList(data.candidate_files).length === 0 && <p>尚未确认可修改文件。</p>}
+        </section>
+        <section className="artifact-list-section">
+          <h3>修改步骤</h3>
+          <ol>{readStringList(data.steps).map((step, index) => <li key={index}>{step}</li>)}</ol>
+          {readStringList(data.steps).length === 0 && <p>本任务未生成写入步骤。</p>}
+        </section>
+        <section className="artifact-list-section">
+          <h3>验证建议</h3>
+          <p>{readStringList(data.verification).join("；") || "未记录额外验证建议。"}</p>
+          <code className="artifact-command">{readString(data.verification_recipe) ?? "未指定 Recipe"}</code>
+        </section>
+        {evidence.length > 0 && (
+          <section className="artifact-list-section">
+            <h3>来源证据</h3>
+            <ul className="path-list">
+              {evidence.map((item, index) => {
+                const path = readString(item.path) ?? "未知来源";
+                const lineStart = typeof item.line_start === "number" ? ":" + item.line_start : "";
+                const note = readString(item.note);
+                return <li key={path + index}><code>{path + lineStart}</code>{note && <span>{note}</span>}</li>;
+              })}
+            </ul>
+          </section>
+        )}
+      </div>
+    );
+  }
+
+  if (kind === "patch_proposal" && data) {
+    const changes = Array.isArray(data.changes) ? data.changes.map(asRecord).filter(Boolean) as Record<string, unknown>[] : [];
+    return (
+      <div className="artifact-content patch-view">
+        <section className="plan-summary"><span>补丁摘要</span><p>{readString(data.summary) ?? "补丁提案未提供摘要。"}</p></section>
+        <dl className="artifact-facts"><div><dt>Recipe</dt><dd>{readString(data.recipe) ?? "未记录"}</dd></div><div><dt>目标测试</dt><dd>{readString(data.test_class) ?? "未指定"}</dd></div></dl>
+        <section className="artifact-list-section"><h3>待修改文件</h3><ul className="path-list">{changes.map((change, index) => <li key={readString(change.path) ?? String(index)}>{readString(change.path) ?? "未命名文件"}</li>)}</ul></section>
+      </div>
+    );
+  }
+
+  if (kind === "telemetry" && data) {
+    const model = asRecord(data.model);
+    const budget = asRecord(data.budget);
+    return (
+      <div className="artifact-content telemetry-view">
+        <dl className="artifact-facts">
+          <div><dt>节点</dt><dd>{String(data.node_count ?? "未记录")}</dd></div>
+          <div><dt>总耗时</dt><dd>{typeof data.node_total_duration_ms === "number" ? data.node_total_duration_ms.toLocaleString() + " ms" : "未记录"}</dd></div>
+          <div><dt>Token</dt><dd>{typeof model?.total_tokens === "number" ? model.total_tokens.toLocaleString() : "未记录"}</dd></div>
+          <div><dt>预算</dt><dd>{readString(budget?.status) ?? "未记录"}</dd></div>
+        </dl>
+        <pre className="artifact-raw-content">{content}</pre>
+      </div>
+    );
+  }
+
+  return <pre className="artifact-content artifact-raw-content">{content}</pre>;
 }
 
 function compactTaskLabel(item: Task): string {
@@ -1024,8 +1306,12 @@ export function App() {
         : "非 Git 项目"
       : "等待选择项目";
   const taskIsRunning = Boolean(
-    task && !["REPORT", "BLOCKED", "CANCELLED"].includes(task.status),
+    task &&
+      !["REPORT", "FAILED", "PASSED", "BLOCKED", "CANCELLED", "UNVERIFIED"].includes(
+        task.status,
+      ),
   );
+  const taskOutcome = task ? resolveTaskOutcome(task, taskIsRunning) : null;
   const taskStatus =
     task?.status ?? (!apiReady ? "OFFLINE" : runtimeHealth.status);
   const serviceStatus = !apiReady
@@ -1285,6 +1571,21 @@ export function App() {
                             {task.pending_approval ? "等待审批" : taskStatus}
                           </span>
                         </div>
+                        {taskOutcome && (
+                          <div className={"task-outcome outcome-" + taskOutcome.tone} aria-live="polite">
+                            <span>
+                              {taskOutcome.tone === "success"
+                                ? <CheckCircle size={18} weight="fill" />
+                                : taskOutcome.tone === "neutral"
+                                  ? <CircleNotch className={taskIsRunning ? "spin" : ""} size={18} />
+                                  : <WarningCircle size={18} weight="fill" />}
+                            </span>
+                            <div>
+                              <strong>{taskOutcome.title}</strong>
+                              <p>{taskOutcome.detail}</p>
+                            </div>
+                          </div>
+                        )}
                         {visibleEvents.length === 0 && taskIsRunning && (
                           <div className="activity-loading" aria-label="任务正在初始化"><span /><span /><span /></div>
                         )}
@@ -1363,151 +1664,162 @@ export function App() {
             </div>
 
             <div className="composer-region">
-              <div className="composer">
-                {(requestError ||
-                  (apiReady && runtimeHealth.status !== "READY") ||
-                  (!task && Boolean(currentProject) && !operationAllowed) ||
-                  (mode === "safe-isolated" && safeModeBlockedByProject)) && (
-                  <div className="composer-error">
-                    <WarningCircle size={16} />
-                    <span>
-                      {requestError ||
-                        (runtimeHealth.status !== "READY"
-                          ? runtimeHealth.status === "BLOCKED"
-                            ? "Agent 运行依赖未就绪：" +
-                              (runtimeHealth.message ?? runtimeHealth.code) +
-                              "（" +
-                              runtimeHealth.code +
-                              "）"
-                            : "本机 Agent API 版本需要更新"
-                          : !operationAllowed
-                            ? taskAdmissionMessage
-                            : safeModeWarningMessage)}
-                    </span>
-                  </div>
-                )}
-                {mode === "full-local" && !confirmed && (
-                  <label className="full-access-confirmation">
-                    <input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />
-                    <span><b>确认完全本机访问</b>Agent 将直接在当前项目目录中执行已实现的高风险操作。</span>
-                  </label>
-                )}
-                {(documentPath || documentResult) && (
-                  <div className="attachment-row">
-                    <FileArrowUp size={16} />
-                    <span>{documentPath || documentResult?.document?.display_name || "研发文档"}</span>
-                    {documentPath && (
-                      <button type="button" onClick={() => void indexDocument()} disabled={documentBusy || !projectId}>
-                        {documentBusy ? "正在索引" : "加入上下文"}
-                      </button>
-                    )}
-                  </div>
-                )}
-                <textarea
-                  value={description}
-                  onChange={(event) => setDescription(event.target.value)}
-                  onKeyDown={(event) => {
-                    if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && canStart) {
-                      event.preventDefault();
-                      void start();
-                    }
-                  }}
-                  placeholder={
-                    task
-                      ? taskIsRunning
-                        ? "当前任务正在运行"
-                        : "任务已结束，请新建任务后继续"
-                      : operation === "research"
-                        ? "描述要理解、定位或评估的代码问题"
-                        : "描述要完成的代码改动"
-                  }
-                  aria-label="代码任务描述"
-                  disabled={Boolean(task)}
-                />
-                <div className="composer-toolbar">
-                  <div className="composer-tools">
-                    <button className="icon-button" type="button" title="添加 MD 或 TXT 研发文档" onClick={() => void chooseDocument()} disabled={!projectId || Boolean(task)}>
-                      <Paperclip size={19} />
-                    </button>
-                    <div className="operation-control" role="group" aria-label="任务类型">
-                      <button
-                        className={operation === "change" ? "active" : ""}
-                        type="button"
-                        disabled={Boolean(task) || !allowedOperations.includes("change")}
-                        onClick={() => setOperation("change")}
-                        aria-label="修改代码"
-                        aria-pressed={operation === "change"}
-                        title="生成计划，经审批后修改代码并运行验证"
-                      >
-                        <FileCode size={15} />
-                        <span>修改代码</span>
-                      </button>
-                      <button
-                        className={operation === "research" ? "active" : ""}
-                        type="button"
-                        disabled={Boolean(task) || !allowedOperations.includes("research")}
-                        onClick={() => setOperation("research")}
-                        aria-label="仅研究"
-                        aria-pressed={operation === "research"}
-                        title="只研究代码并输出证据化计划，不写入文件"
-                      >
-                        <ListMagnifyingGlass size={15} />
-                        <span>仅研究</span>
-                      </button>
+              {task ? (
+                <div className={"task-command-bar outcome-" + (taskOutcome?.tone ?? "neutral")}>
+                  <div className="task-command-status">
+                    {taskOutcome?.tone === "success"
+                      ? <CheckCircle size={19} weight="fill" />
+                      : taskOutcome?.tone === "neutral"
+                        ? <CircleNotch className={taskIsRunning ? "spin" : ""} size={19} />
+                        : <WarningCircle size={19} weight="fill" />}
+                    <div>
+                      <strong>{taskOutcome?.title ?? "任务状态已更新"}</strong>
+                      <span>{task.pending_approval ? "请在上方完成审批" : task.verdict ?? task.status}</span>
                     </div>
-                    <label className={"permission-control mode-" + mode}>
-                      {mode === "safe-isolated" ? <ShieldCheck size={17} /> : <WarningCircle size={17} />}
-                      <select
-                        value={mode}
-                        disabled={Boolean(task)}
-                        aria-label="任务权限模式"
-                        onChange={(event) => {
-                          const nextMode = event.target.value as Mode;
-                          const readiness =
-                            nextMode === "safe-isolated"
-                              ? projectDiagnosis?.task_modes.safe_isolated
-                              : projectDiagnosis?.task_modes.full_local;
-                          const nextAllowed = readiness?.allowed_operations;
-                          setMode(nextMode);
-                          if (nextAllowed?.length && !nextAllowed.includes(operation)) {
-                            setOperation(nextAllowed[0]);
-                          }
-                          if (nextMode === "safe-isolated") setConfirmed(false);
-                        }}
-                      >
-                        <option
-                          value="safe-isolated"
-                          disabled={Boolean(
-                            safeModeReadiness && safeModeReadiness.status !== "READY",
-                          )}
-                        >
-                          安全隔离
-                        </option>
-                        <option value="full-local">完全本机</option>
-                      </select>
-                    </label>
-                    {task && !taskIsRunning && !task.archived_at && (
-                      <button className="text-action" type="button" onClick={() => void archiveTask()}>
-                        <Archive size={16} />归档
-                      </button>
-                    )}
-                    {task && !taskIsRunning && (
-                      <button className="text-action" type="button" onClick={beginNewTask}>
-                        <Plus size={16} />新建
+                  </div>
+                  <div className="task-command-actions">
+                    {artifacts.length > 0 && (
+                      <button className="secondary-button" type="button" onClick={() => setActiveView("review")}>
+                        <ListMagnifyingGlass size={16} />审阅产物
                       </button>
                     )}
                     {taskIsRunning && (
-                      <button className="text-action danger-text" type="button" onClick={() => void cancelTask()}>
-                        <XCircle size={16} />停止
+                      <button className="danger-button" type="button" onClick={() => void cancelTask()}>
+                        <XCircle size={16} />停止任务
+                      </button>
+                    )}
+                    {!taskIsRunning && !task.archived_at && (
+                      <button className="secondary-button" type="button" onClick={() => void archiveTask()}>
+                        <Archive size={16} />归档
+                      </button>
+                    )}
+                    {!taskIsRunning && (
+                      <button className="primary-button" type="button" onClick={beginNewTask}>
+                        <Plus size={16} />新建任务
                       </button>
                     )}
                   </div>
-                  <button className="send-button" type="button" title="开始任务（Ctrl + Enter）" onClick={() => void start()} disabled={!canStart || taskIsRunning}>
-                    <ArrowUp size={19} weight="bold" />
-                  </button>
                 </div>
-              </div>
-              <p className="composer-caption">{currentProject ? projectStatusLabel : "选择项目后即可创建任务"}</p>
+              ) : (
+                <>
+                  <div className="composer">
+                    {(requestError ||
+                      (apiReady && runtimeHealth.status !== "READY") ||
+                      (Boolean(currentProject) && !operationAllowed) ||
+                      (mode === "safe-isolated" && safeModeBlockedByProject)) && (
+                      <div className="composer-error">
+                        <WarningCircle size={16} />
+                        <span>
+                          {requestError ||
+                            (runtimeHealth.status !== "READY"
+                              ? runtimeHealth.status === "BLOCKED"
+                                ? "Agent 运行依赖未就绪：" +
+                                  (runtimeHealth.message ?? runtimeHealth.code) +
+                                  "（" +
+                                  runtimeHealth.code +
+                                  "）"
+                                : "本机 Agent API 版本需要更新"
+                              : !operationAllowed
+                                ? taskAdmissionMessage
+                                : safeModeWarningMessage)}
+                        </span>
+                      </div>
+                    )}
+                    {mode === "full-local" && !confirmed && (
+                      <label className="full-access-confirmation">
+                        <input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />
+                        <span><b>确认完全本机访问</b>Agent 将直接在当前项目目录中执行已实现的高风险操作。</span>
+                      </label>
+                    )}
+                    {(documentPath || documentResult) && (
+                      <div className="attachment-row">
+                        <FileArrowUp size={16} />
+                        <span>{documentPath || documentResult?.document?.display_name || "研发文档"}</span>
+                        {documentPath && (
+                          <button type="button" onClick={() => void indexDocument()} disabled={documentBusy || !projectId}>
+                            {documentBusy ? "正在索引" : "加入上下文"}
+                          </button>
+                        )}
+                      </div>
+                    )}
+                    <textarea
+                      value={description}
+                      onChange={(event) => setDescription(event.target.value)}
+                      onKeyDown={(event) => {
+                        if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && canStart) {
+                          event.preventDefault();
+                          void start();
+                        }
+                      }}
+                      placeholder={operation === "research"
+                        ? "描述要理解、定位或评估的代码问题"
+                        : "描述要完成的代码改动"}
+                      aria-label="代码任务描述"
+                    />
+                    <div className="composer-toolbar">
+                      <div className="composer-tools">
+                        <button className="icon-button" type="button" title="添加 MD 或 TXT 研发文档" onClick={() => void chooseDocument()} disabled={!projectId}>
+                          <Paperclip size={19} />
+                        </button>
+                        <div className="operation-control" role="group" aria-label="任务类型">
+                          <button
+                            className={operation === "change" ? "active" : ""}
+                            type="button"
+                            disabled={!allowedOperations.includes("change")}
+                            onClick={() => setOperation("change")}
+                            aria-label="修改代码"
+                            aria-pressed={operation === "change"}
+                            title="生成计划，经审批后修改代码并运行验证"
+                          >
+                            <FileCode size={15} />
+                            <span>修改代码</span>
+                          </button>
+                          <button
+                            className={operation === "research" ? "active" : ""}
+                            type="button"
+                            disabled={!allowedOperations.includes("research")}
+                            onClick={() => setOperation("research")}
+                            aria-label="仅研究"
+                            aria-pressed={operation === "research"}
+                            title="只研究代码并输出证据化计划，不写入文件"
+                          >
+                            <ListMagnifyingGlass size={15} />
+                            <span>仅研究</span>
+                          </button>
+                        </div>
+                        <label className={"permission-control mode-" + mode}>
+                          {mode === "safe-isolated" ? <ShieldCheck size={17} /> : <WarningCircle size={17} />}
+                          <select
+                            value={mode}
+                            aria-label="任务权限模式"
+                            onChange={(event) => {
+                              const nextMode = event.target.value as Mode;
+                              const readiness = nextMode === "safe-isolated"
+                                ? projectDiagnosis?.task_modes.safe_isolated
+                                : projectDiagnosis?.task_modes.full_local;
+                              const nextAllowed = readiness?.allowed_operations;
+                              setMode(nextMode);
+                              if (nextAllowed?.length && !nextAllowed.includes(operation)) {
+                                setOperation(nextAllowed[0]);
+                              }
+                              if (nextMode === "safe-isolated") setConfirmed(false);
+                            }}
+                          >
+                            <option value="safe-isolated" disabled={Boolean(safeModeReadiness && safeModeReadiness.status !== "READY")}>
+                              安全隔离
+                            </option>
+                            <option value="full-local">完全本机</option>
+                          </select>
+                        </label>
+                      </div>
+                      <button className="send-button" type="button" title="开始任务（Ctrl + Enter）" onClick={() => void start()} disabled={!canStart}>
+                        <ArrowUp size={19} weight="bold" />
+                      </button>
+                    </div>
+                  </div>
+                  <p className="composer-caption">{currentProject ? projectStatusLabel : "选择项目后即可创建任务"}</p>
+                </>
+              )}
             </div>
           </section>
         )}
@@ -1671,7 +1983,7 @@ export function App() {
                     {artifactVersions.find((version) => version.version === selectedArtifactVersion)?.sha256 ??
                       artifacts.find((artifact) => artifact.kind === selectedArtifact)?.sha256}
                   </p>
-                  <pre>{artifactContent}</pre>
+                  <ArtifactContent kind={selectedArtifact} content={artifactContent} />
                 </>
               ) : (
                 <div className="reader-empty"><FileCode size={24} /><span>从左侧选择报告、计划、Diff 或验证结果</span></div>
