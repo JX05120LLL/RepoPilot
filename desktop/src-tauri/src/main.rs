@@ -148,7 +148,16 @@ fn main() {
     let app = tauri::Builder::default()
         .setup(|app| {
             let resource_dir = app.path().resource_dir().ok();
-            let runtime_dir = app.path().app_data_dir().ok().and_then(|path| {
+            let runtime_override = env::var_os("REPOPILOT_DESKTOP_DATA_DIR").and_then(|value| {
+                let path = PathBuf::from(value);
+                if path.is_absolute() {
+                    Some(path)
+                } else {
+                    eprintln!("REPOPILOT_DESKTOP_DATA_DIR 必须是绝对路径，已回退到默认数据目录。");
+                    None
+                }
+            });
+            let runtime_dir = runtime_override.or_else(|| app.path().app_data_dir().ok()).and_then(|path| {
                 fs::create_dir_all(&path)
                     .map(|_| path)
                     .map_err(|error| eprintln!("无法创建 RepoPilot 运行目录: {error}"))
@@ -161,6 +170,13 @@ fn main() {
             Ok(())
         })
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_single_instance::init(|app, _arguments, _working_directory| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .build(tauri::generate_context!())
         .expect("无法启动 RepoPilot Desktop");
 

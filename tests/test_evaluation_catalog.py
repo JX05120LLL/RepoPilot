@@ -8,7 +8,13 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from repopilot_guard.evaluation import BaselineValidator, EvaluationCatalog, EvaluationRunner, FixtureBuilder
+from repopilot_guard.evaluation import (
+    BaselineValidator,
+    EvaluationCatalog,
+    EvaluationProviderSummary,
+    EvaluationRunner,
+    FixtureBuilder,
+)
 from repopilot_guard.cli import main
 from repopilot_guard.recipes import MavenExecutionResult
 
@@ -106,6 +112,15 @@ class EvaluationCatalogTests(unittest.TestCase):
             self.assertNotEqual(source.resolve(), fake_runner.repository.resolve())
             self.assertEqual(status_before, FixtureBuilder._git(source, "status", "--porcelain"))
             self.assertTrue(report["all_matched"])
+            self.assertEqual(2, report["schema_version"])
+            self.assertEqual(["J01"], report["metadata"]["selected_task_ids"])
+            self.assertEqual(64, len(report["metadata"]["catalog_sha256"]))
+            self.assertEqual(64, len(report["metadata"]["fixture_set_sha256"]))
+            self.assertEqual("0.1.0", report["metadata"]["repopilot"]["version"])
+            self.assertIn(report["metadata"]["repopilot"]["source_tree_state"], {"CLEAN", "DIRTY", "UNAVAILABLE"})
+            self.assertEqual("J01/workspace", report["results"][0]["validation_workspace"])
+            self.assertEqual("J01/maven-stdout.txt", report["results"][0]["stdout_log"])
+            self.assertNotIn(str(root), json.dumps(report, ensure_ascii=False))
             self.assertTrue((root / "baseline-results/baseline-report.csv").is_file())
             self.assertTrue((root / "baseline-results/baseline-report.md").is_file())
             self.assertEqual("1 test failed", (root / "baseline-results/J01/maven-stdout.txt").read_text(encoding="utf-8"))
@@ -149,7 +164,7 @@ class EvaluationCatalogTests(unittest.TestCase):
                             "status": "PASSED",
                             "code": "MAVEN_SUCCEEDED",
                             "recipe": "test",
-                            "argv": ["mvn", "-q", "test"],
+                            "argv": [r"D:\private-tools\apache-maven\bin\mvn.cmd", "-q", "test"],
                             "exit_code": 0,
                             "duration_ms": 120,
                             "surefire_reports": ["target/surefire-reports/TEST-OrderControllerTest.xml"],
@@ -163,7 +178,20 @@ class EvaluationCatalogTests(unittest.TestCase):
             fixtures = root / "fixtures"
             FixtureBuilder(EvaluationCatalog(catalog_path)).prepare_all(fixtures)
             fake_graph = FakeGraphRunner()
-            results = EvaluationRunner(EvaluationCatalog(catalog_path), fake_graph).run(fixtures, root / "results", task_ids={"J01"}, approval="auto")
+            provider = EvaluationProviderSummary(
+                chat_model="deepseek-chat",
+                embedding_model="sk-secretToken123",
+                embedding_dimensions=1024,
+            )
+            results = EvaluationRunner(EvaluationCatalog(catalog_path), fake_graph, provider).run(
+                fixtures,
+                root / "results",
+                task_ids={"J01"},
+                approval="auto",
+            )
+            report_path = root / "results" / "evaluation-report.json"
+            report_text = report_path.read_text(encoding="utf-8")
+            report = json.loads(report_text)
             self.assertEqual(1, len(results))
             self.assertEqual("PASSED", results[0].actual_status)
             self.assertTrue(results[0].matched_expectation)
@@ -176,7 +204,15 @@ class EvaluationCatalogTests(unittest.TestCase):
             self.assertEqual(("target/surefire-reports/TEST-OrderControllerTest.xml",), results[0].verification_surefire_reports)
             self.assertEqual(("src/main/java/com/repopilot/demo/web/OrderController.java",), results[0].changed_paths)
             self.assertEqual("test", fake_graph.request.verification_contract.recipe)
-            self.assertTrue((root / "results" / "evaluation-report.json").is_file())
+            self.assertEqual(2, report["schema_version"])
+            self.assertEqual("deepseek-chat", report["metadata"]["provider"]["chat_model"])
+            self.assertEqual("INVALID_IDENTIFIER_REDACTED", report["metadata"]["provider"]["embedding_model"])
+            self.assertEqual(1024, report["metadata"]["provider"]["embedding_dimensions"])
+            self.assertEqual(["J01"], report["metadata"]["selected_task_ids"])
+            self.assertEqual("mvn.cmd", report["results"][0]["verification_argv"][0])
+            self.assertNotIn("private-tools", report_text)
+            self.assertNotIn("sk-secretToken123", report_text)
+            self.assertTrue(report_path.is_file())
             self.assertTrue((root / "results" / "evaluation-report.csv").is_file())
             self.assertTrue((root / "results" / "evaluation-report.md").is_file())
 

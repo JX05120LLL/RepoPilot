@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+import zipfile
 from io import StringIO
 from pathlib import Path
 from threading import Event
@@ -178,9 +179,12 @@ class CliProductTests(unittest.TestCase):
         rust_source = (repository_root / "desktop" / "src-tauri" / "src" / "main.rs").read_text(encoding="utf-8")
         self.assertIn("app_data_dir", rust_source)
         self.assertIn("REPOPILOT_STATE_DB_PATH", rust_source)
+        self.assertIn("REPOPILOT_DESKTOP_DATA_DIR", rust_source)
         self.assertIn("CREATE_NO_WINDOW", rust_source)
         self.assertIn("WindowEvent::CloseRequested", rust_source)
         self.assertIn("app_handle.exit(0)", rust_source)
+        self.assertIn("tauri_plugin_single_instance", rust_source)
+        self.assertIn("get_webview_window(\"main\")", rust_source)
 
     def test_task_summary_excludes_raw_messages_and_tool_arguments(self) -> None:
         encoded = json.dumps(_task_summary(_Result()), ensure_ascii=False)
@@ -669,6 +673,23 @@ class CliProductTests(unittest.TestCase):
             self.assertEqual(str(expected / "state.sqlite"), payload["state_db"])
             self.assertFalse(expected.exists())
 
+    def test_desktop_paths_honor_absolute_runtime_directory_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            runtime_dir = Path(temporary_directory) / "repopilot-runtime"
+            output = StringIO()
+            with (
+                patch.dict(os.environ, {"REPOPILOT_DESKTOP_DATA_DIR": str(runtime_dir)}, clear=True),
+                patch("sys.stdout", output),
+            ):
+                exit_code = main(["desktop", "paths"])
+
+            payload = json.loads(output.getvalue())
+            self.assertEqual(0, exit_code)
+            self.assertEqual(str(runtime_dir.resolve()), payload["runtime_dir"])
+            self.assertEqual(str(runtime_dir.resolve() / ".env"), payload["config_file"])
+            self.assertEqual(str(runtime_dir.resolve() / "state.sqlite"), payload["state_db"])
+            self.assertFalse(runtime_dir.exists())
+
     def test_task_artifact_commands_list_and_verify_persisted_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -685,6 +706,31 @@ class CliProductTests(unittest.TestCase):
                     permission_mode="safe",
                     workspace_mode="worktree",
                 )
+            finally:
+                store.close()
+
+            pending_archive = root / "exports" / "pending.zip"
+            output = StringIO()
+            with patch("sys.stdout", output):
+                exit_code = main(
+                    [
+                        "task",
+                        "export",
+                        "--thread-id",
+                        "thread-artifact-cli",
+                        "--output",
+                        str(pending_archive),
+                        "--state-db",
+                        str(state_path),
+                    ]
+                )
+            self.assertEqual(2, exit_code)
+            self.assertEqual("TASK_EXPORT_NOT_FINALIZED", json.loads(output.getvalue())["code"])
+            self.assertFalse(pending_archive.exists())
+            self.assertFalse(pending_archive.parent.exists())
+
+            store = TaskStore(state_path)
+            try:
                 store.sync_graph_result(
                     {
                         "thread_id": "thread-artifact-cli",
@@ -724,6 +770,114 @@ class CliProductTests(unittest.TestCase):
                 exit_code = main(["task", "artifact", "--thread-id", "thread-artifact-cli", "--kind", "plan_json", "--state-db", str(state_path)])
             self.assertEqual(2, exit_code)
             self.assertEqual("TASK_ARTIFACT_INTEGRITY_MISMATCH", json.loads(output.getvalue())["code"])
+
+    def test_task_export_creates_portable_audit_bundle_and_rejects_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "state.sqlite"
+            repository = root / "private-repository"
+            output_root = root / "private-runs"
+            archive_path = root / "exports" / "audit.zip"
+            store = TaskStore(state_path)
+            try:
+                store.create(
+                    thread_id="thread-export-cli",
+                    task_id="task-export-cli",
+                    project_id="project-1",
+                    repository=repository,
+                    output_root=output_root,
+                    task_mode="safe-isolated",
+                    permission_mode="safe",
+                    workspace_mode="worktree",
+                )
+                store.sync_graph_result(
+                    {
+                        "thread_id": "thread-export-cli",
+                        "status": "REPORT",
+                        "pending_approval": False,
+                        "verdict": "PASSED",
+                        "state": {
+                            "tool_events": [{"type": "MODEL_USAGE", "api_key": "never-export-this"}],
+                            "plan": {"summary": "修复订单校验", "candidate_files": ["src/OrderController.java"], "steps": ["增加校验"]},
+                            "git_diff": "diff --git a/src/OrderController.java b/src/OrderController.java\n",
+                            "verification_result": {"status": "PASSED", "code": "MAVEN_SUCCEEDED"},
+                        },
+                    }
+                )
+                report = next(item for item in store.artifacts("thread-export-cli") if item.kind == "report")
+            finally:
+                store.close()
+
+            output = StringIO()
+            with patch("sys.stdout", output):
+                exit_code = main(
+                    [
+                        "task",
+                        "export",
+                        "--thread-id",
+                        "thread-export-cli",
+                        "--output",
+                        str(archive_path),
+                        "--state-db",
+                        str(state_path),
+                    ]
+                )
+            payload = json.loads(output.getvalue())
+            self.assertEqual(0, exit_code)
+            self.assertEqual("TASK_EVIDENCE_EXPORTED", payload["code"])
+            self.assertTrue(archive_path.is_file())
+            self.assertEqual(64, len(payload["export"]["sha256"]))
+
+            with zipfile.ZipFile(archive_path) as archive:
+                names = set(archive.namelist())
+                manifest = json.loads(archive.read("manifest.json"))
+                evidence = archive.read("evidence.jsonl").decode("utf-8")
+            self.assertIn("artifacts/report.md", names)
+            self.assertIn("artifacts/changes.diff", names)
+            self.assertIn("evidence.jsonl", names)
+            self.assertEqual("thread-export-cli", manifest["task"]["thread_id"])
+            self.assertNotIn(str(repository), json.dumps(manifest, ensure_ascii=False))
+            self.assertNotIn(str(output_root), json.dumps(manifest, ensure_ascii=False))
+            self.assertNotIn("never-export-this", evidence)
+            self.assertIn("[REDACTED]", evidence)
+
+            output = StringIO()
+            with patch("sys.stdout", output):
+                exit_code = main(
+                    [
+                        "task",
+                        "export",
+                        "--thread-id",
+                        "thread-export-cli",
+                        "--output",
+                        str(archive_path),
+                        "--state-db",
+                        str(state_path),
+                    ]
+                )
+            self.assertEqual(2, exit_code)
+            self.assertEqual("TASK_EXPORT_OUTPUT_EXISTS", json.loads(output.getvalue())["code"])
+
+            artifact_path = output_root / "task-export-cli" / report.relative_path
+            artifact_path.write_text("tampered", encoding="utf-8")
+            tampered_archive = root / "exports" / "tampered.zip"
+            output = StringIO()
+            with patch("sys.stdout", output):
+                exit_code = main(
+                    [
+                        "task",
+                        "export",
+                        "--thread-id",
+                        "thread-export-cli",
+                        "--output",
+                        str(tampered_archive),
+                        "--state-db",
+                        str(state_path),
+                    ]
+                )
+            self.assertEqual(2, exit_code)
+            self.assertEqual("TASK_ARTIFACT_INTEGRITY_MISMATCH", json.loads(output.getvalue())["code"])
+            self.assertFalse(tampered_archive.exists())
 
     def test_task_management_commands_list_events_and_archive_without_path_leakage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

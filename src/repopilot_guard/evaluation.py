@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import csv
 import json
+import platform
 import re
 import subprocess
+from datetime import datetime, timezone
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from uuid import uuid4
 
+from repopilot_guard import __version__
 from repopilot_guard.models import TaskOperation, TaskRequest, VerificationContract, WorkspaceMode, WorkspaceSelection
 from repopilot_guard.permissions import PermissionGrant
 from repopilot_guard.policy import MavenRecipeName
@@ -26,6 +30,57 @@ class EvaluationTask:
     expected_status: str
     baseline_status: str | None = None
     target_test_class: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationProviderSummary:
+    """只保存可公开的模型标识，不接收 Base URL 或 API Key。"""
+
+    chat_model: str | None = None
+    embedding_model: str | None = None
+    embedding_dimensions: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationReportMetadata:
+    generated_at: str
+    repopilot_version: str
+    source_revision: str | None
+    source_tree_state: str
+    catalog_sha256: str
+    fixture_set_sha256: str
+    selected_task_ids: tuple[str, ...]
+    operating_system: str
+    operating_system_release: str
+    machine: str
+    python_version: str
+    chat_model: str | None
+    embedding_model: str | None
+    embedding_dimensions: int | None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "generated_at": self.generated_at,
+            "repopilot": {
+                "version": self.repopilot_version,
+                "source_revision": self.source_revision,
+                "source_tree_state": self.source_tree_state,
+            },
+            "catalog_sha256": self.catalog_sha256,
+            "fixture_set_sha256": self.fixture_set_sha256,
+            "selected_task_ids": list(self.selected_task_ids),
+            "runtime": {
+                "operating_system": self.operating_system,
+                "operating_system_release": self.operating_system_release,
+                "machine": self.machine,
+                "python_version": self.python_version,
+            },
+            "provider": {
+                "chat_model": self.chat_model,
+                "embedding_model": self.embedding_model,
+                "embedding_dimensions": self.embedding_dimensions,
+            },
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,13 +137,13 @@ class BaselineValidationResult:
             "matched_expectation": self.matched_expectation,
             "baseline_commit": self.baseline_commit,
             "source_unchanged": self.source_unchanged,
-            "validation_workspace": str(self.validation_workspace),
+            "validation_workspace": f"{self.task_id}/workspace",
             "code": self.code,
             "exit_code": self.exit_code,
             "duration_ms": self.duration_ms,
             "surefire_reports": list(self.surefire_reports),
-            "stdout_log": str(self.stdout_log),
-            "stderr_log": str(self.stderr_log),
+            "stdout_log": f"{self.task_id}/maven-stdout.txt",
+            "stderr_log": f"{self.task_id}/maven-stderr.txt",
         }
 
 
@@ -133,7 +188,7 @@ class EvaluationRunResult:
             "verification_status": self.verification_status,
             "verification_code": self.verification_code,
             "verification_recipe": self.verification_recipe,
-            "verification_argv": list(self.verification_argv),
+            "verification_argv": _portable_verification_argv(self.verification_argv),
             "verification_exit_code": self.verification_exit_code,
             "verification_duration_ms": self.verification_duration_ms,
             "verification_surefire_reports": list(self.verification_surefire_reports),
@@ -506,7 +561,8 @@ class BaselineValidator:
         if not selected or (task_ids and {task.task_id for task in selected} != task_ids):
             raise ValueError("EVALUATION_BASELINE_TASK_NOT_FOUND")
         results = tuple(self._validate_task(task, fixtures, output) for task in selected)
-        self._write_report(output, results)
+        metadata = _build_report_metadata(self.catalog, results)
+        self._write_report(output, results, metadata)
         return results
 
     def _validate_task(
@@ -574,10 +630,15 @@ class BaselineValidator:
             raise ValueError("EVALUATION_BASELINE_CLONE_FAILED")
 
     @staticmethod
-    def _write_report(root: Path, results: tuple[BaselineValidationResult, ...]) -> None:
+    def _write_report(
+        root: Path,
+        results: tuple[BaselineValidationResult, ...],
+        metadata: EvaluationReportMetadata,
+    ) -> None:
         matched = sum(item.matched_expectation for item in results)
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
+            "metadata": metadata.to_dict(),
             "validation_count": len(results),
             "matched_expectations": matched,
             "all_matched": matched == len(results),
@@ -594,6 +655,8 @@ class BaselineValidator:
             writer.writerows(item.to_dict() for item in results)
         lines = [
             "# RepoPilot fixture 基线验证报告",
+            "",
+            *_metadata_markdown(metadata),
             "",
             f"- 验证任务：{len(results)}",
             f"- 符合预期：{matched}",
@@ -640,9 +703,15 @@ def _scenario_name(category: str) -> str:
 class EvaluationRunner:
     """顺序执行真实或 fake Graph，并以 Graph/Maven/Diff 事实生成评测报告。"""
 
-    def __init__(self, catalog: EvaluationCatalog, graph_runner: object) -> None:
+    def __init__(
+        self,
+        catalog: EvaluationCatalog,
+        graph_runner: object,
+        provider_summary: EvaluationProviderSummary | None = None,
+    ) -> None:
         self.catalog = catalog
         self.graph_runner = graph_runner
+        self.provider_summary = provider_summary or EvaluationProviderSummary()
 
     def run(
         self,
@@ -662,7 +731,8 @@ class EvaluationRunner:
         if not selected or (task_ids and {task.task_id for task in selected} != task_ids):
             raise ValueError("EVALUATION_TASK_NOT_FOUND")
         results = tuple(self._run_task(task, fixtures_root.expanduser().resolve(), root, approval) for task in selected)
-        self._write_run_report(root, results)
+        metadata = _build_report_metadata(self.catalog, results, self.provider_summary)
+        self._write_run_report(root, results, metadata)
         return results
 
     def _run_task(self, task: EvaluationTask, fixtures_root: Path, result_root: Path, approval: str) -> EvaluationRunResult:
@@ -736,10 +806,15 @@ class EvaluationRunner:
         )
 
     @staticmethod
-    def _write_run_report(root: Path, results: tuple[EvaluationRunResult, ...]) -> None:
+    def _write_run_report(
+        root: Path,
+        results: tuple[EvaluationRunResult, ...],
+        metadata: EvaluationReportMetadata,
+    ) -> None:
         passed = sum(item.matched_expectation for item in results)
         payload = {
-            "schema_version": 1,
+            "schema_version": 2,
+            "metadata": metadata.to_dict(),
             "run_count": len(results),
             "matched_expectations": passed,
             "results": [item.to_dict() for item in results],
@@ -750,9 +825,109 @@ class EvaluationRunner:
             writer = csv.DictWriter(stream, fieldnames=fields)
             writer.writeheader()
             writer.writerows(item.to_dict() for item in results)
-        lines = ["# RepoPilot 端到端评测报告", "", f"- 执行任务：{len(results)}", f"- 期望匹配：{passed}", "", "| 任务 | 期望 | 实际 | 匹配 | Diff | 范围 | Maven Recipe | 契约 | 退出码 | 源仓库未变 |", "|---|---|---|---|---|---|---|---|---|---|"]
+        lines = [
+            "# RepoPilot 端到端评测报告",
+            "",
+            *_metadata_markdown(metadata),
+            "",
+            f"- 执行任务：{len(results)}",
+            f"- 期望匹配：{passed}",
+            "",
+            "| 任务 | 期望 | 实际 | 匹配 | Diff | 范围 | Maven Recipe | 契约 | 退出码 | 源仓库未变 |",
+            "|---|---|---|---|---|---|---|---|---|---|",
+        ]
         lines.extend(f"| {item.task_id} | {item.expected_status} | {item.actual_status} | {'是' if item.matched_expectation else '否'} | {'是' if item.git_diff_present else '否'} | {'合规' if item.scope_valid else '越界'} | {item.verification_recipe or '-'} / {item.verification_status or '-'} | {'合规' if item.verification_contract_valid else '不合规'} | {item.verification_exit_code if item.verification_exit_code is not None else '-'} | {'是' if item.source_unchanged else '否'} |" for item in results)
         (root / "evaluation-report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _build_report_metadata(
+    catalog: EvaluationCatalog,
+    results: tuple[BaselineValidationResult | EvaluationRunResult, ...],
+    provider_summary: EvaluationProviderSummary | None = None,
+) -> EvaluationReportMetadata:
+    source_revision, source_tree_state = _source_fingerprint(catalog.catalog_path)
+    fixture_digest = sha256()
+    for item in sorted(results, key=lambda result: result.task_id):
+        fixture_digest.update(f"{item.task_id}\0{item.baseline_commit}\n".encode("utf-8"))
+    provider = provider_summary or EvaluationProviderSummary()
+    return EvaluationReportMetadata(
+        generated_at=datetime.now(timezone.utc).isoformat(),
+        repopilot_version=__version__,
+        source_revision=source_revision,
+        source_tree_state=source_tree_state,
+        catalog_sha256=sha256(catalog.catalog_path.read_bytes()).hexdigest(),
+        fixture_set_sha256=fixture_digest.hexdigest(),
+        selected_task_ids=tuple(sorted(item.task_id for item in results)),
+        operating_system=platform.system() or "UNKNOWN",
+        operating_system_release=platform.release() or "UNKNOWN",
+        machine=platform.machine() or "UNKNOWN",
+        python_version=platform.python_version(),
+        chat_model=_public_identifier(provider.chat_model),
+        embedding_model=_public_identifier(provider.embedding_model),
+        embedding_dimensions=provider.embedding_dimensions,
+    )
+
+
+def _source_fingerprint(catalog_path: Path) -> tuple[str | None, str]:
+    repository = next((path for path in (catalog_path.parent, *catalog_path.parents) if (path / ".git").exists()), None)
+    if repository is None:
+        return None, "UNAVAILABLE"
+    revision = subprocess.run(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"),
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    status = subprocess.run(
+        ("git", "-C", str(repository), "status", "--porcelain"),
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if revision.returncode != 0 or status.returncode != 0:
+        return None, "UNAVAILABLE"
+    value = revision.stdout.strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", value):
+        return None, "UNAVAILABLE"
+    return value.lower(), "DIRTY" if status.stdout.strip() else "CLEAN"
+
+
+def _public_identifier(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    credential_marker = re.search(r"(?i)(?:^sk-|api[_-]?key|bearer|password|secret|token)", normalized)
+    if credential_marker is None and re.fullmatch(r"[A-Za-z0-9._:/+\-]{1,128}", normalized):
+        return normalized
+    return "INVALID_IDENTIFIER_REDACTED"
+
+
+def _portable_verification_argv(argv: tuple[str, ...]) -> list[str]:
+    if not argv:
+        return []
+    command = re.split(r"[\\/]", argv[0])[-1] or "mvn"
+    return [command, *argv[1:]]
+
+
+def _metadata_markdown(metadata: EvaluationReportMetadata) -> list[str]:
+    revision = metadata.source_revision or "UNAVAILABLE"
+    chat_model = metadata.chat_model or "未记录"
+    embedding_model = metadata.embedding_model or "未记录"
+    dimensions = str(metadata.embedding_dimensions) if metadata.embedding_dimensions is not None else "未记录"
+    return [
+        "## 运行指纹",
+        "",
+        f"- 生成时间：`{metadata.generated_at}`",
+        f"- RepoPilot：`{metadata.repopilot_version}` / `{revision}` / `{metadata.source_tree_state}`",
+        f"- 任务目录 SHA-256：`{metadata.catalog_sha256}`",
+        f"- Fixture 集合 SHA-256：`{metadata.fixture_set_sha256}`",
+        f"- 运行环境：`{metadata.operating_system} {metadata.operating_system_release}` / `{metadata.machine}` / `Python {metadata.python_version}`",
+        f"- Provider：Chat `{chat_model}`；Embedding `{embedding_model}` / `{dimensions}` 维",
+    ]
 
 
 def _changed_paths_in_scope(changed_paths: tuple[str, ...], expected_patterns: tuple[str, ...]) -> bool:

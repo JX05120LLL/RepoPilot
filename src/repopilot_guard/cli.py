@@ -23,7 +23,13 @@ from repopilot_guard.config import AppSettings, ComponentCheck, LocalStateSettin
 from repopilot_guard.coordinator import TaskCoordinator
 from repopilot_guard.context import ContextChunkStore, ContextIndexer, ContextLoader, ContextRetriever, ManagedDocumentStore
 from repopilot_guard.document_indexing import index_uploaded_document
-from repopilot_guard.evaluation import BaselineValidator, EvaluationCatalog, EvaluationRunner, FixtureBuilder
+from repopilot_guard.evaluation import (
+    BaselineValidator,
+    EvaluationCatalog,
+    EvaluationProviderSummary,
+    EvaluationRunner,
+    FixtureBuilder,
+)
 from repopilot_guard.graph import GraphRunner, SqliteCheckpointStore, create_live_graph
 from repopilot_guard.models import TaskMode, TaskOperation, TaskRequest, WorkspaceMode, WorkspaceSelection, default_output_root
 from repopilot_guard.mcp import McpCapabilityRegistry, McpConfigError, McpConfigLoader
@@ -37,6 +43,7 @@ from repopilot_guard.providers import OpenAICompatibleProvider
 from repopilot_guard.qdrant_bootstrap import QdrantBootstrapper, check_qdrant_health
 from repopilot_guard.skills import SkillError, SkillRegistry
 from repopilot_guard.task_store import StoredTask, TaskStore
+from repopilot_guard.task_export import TaskEvidenceExporter
 from repopilot_guard.workspace import GitClient, GitCommandError, WorkspaceManager
 
 
@@ -249,6 +256,10 @@ def build_parser() -> argparse.ArgumentParser:
     task_artifact.add_argument("--kind", required=True, help="例如 plan_markdown、git_diff、verification 或 report")
     task_artifact.add_argument("--version", type=int, help="读取指定不可变历史版本，必须为正整数")
     task_artifact.add_argument("--state-db", type=Path)
+    task_export = task_subparsers.add_parser("export", help="导出经哈希校验的任务证据 ZIP，不递归读取任务目录")
+    task_export.add_argument("--thread-id", required=True)
+    task_export.add_argument("--output", required=True, type=Path, help="新建 ZIP 的目标路径；已存在文件会被拒绝")
+    task_export.add_argument("--state-db", type=Path)
     task_archive = task_subparsers.add_parser("archive", help="归档终态任务，保留 checkpoint、证据和产物")
     task_archive.add_argument("--thread-id", required=True)
     task_archive.add_argument("--state-db", type=Path)
@@ -414,7 +425,12 @@ def _run_evaluation(args: argparse.Namespace) -> int:
         try:
             runner = GraphRunner(create_live_graph(settings, checkpoint.checkpointer), default_budget=settings.task_budget())
             selected = None if args.all else set(args.task_id or [])
-            results = EvaluationRunner(EvaluationCatalog(args.catalog), runner).run(
+            provider_summary = EvaluationProviderSummary(
+                chat_model=settings.chat_model,
+                embedding_model=settings.embedding_model,
+                embedding_dimensions=settings.embedding_dimensions,
+            )
+            results = EvaluationRunner(EvaluationCatalog(args.catalog), runner, provider_summary).run(
                 args.fixtures,
                 args.output,
                 task_ids=selected,
@@ -1128,7 +1144,7 @@ def _run_task(args: argparse.Namespace) -> int:
     try:
         if args.task_command in {"list", "events", "archive"}:
             return _run_task_store_command(args)
-        if args.task_command in {"artifacts", "artifact"}:
+        if args.task_command in {"artifacts", "artifact", "export"}:
             return _run_task_artifact_command(args)
         if args.task_command == "status":
             return _run_task_status(args)
@@ -1513,6 +1529,16 @@ def _run_task_artifact_command(args: argparse.Namespace) -> int:
 
     store = TaskStore(_state_db_path(args.state_db))
     try:
+        if args.task_command == "export":
+            exported = TaskEvidenceExporter(store).export(args.thread_id, args.output)
+            return _print_json_result(
+                {
+                    "status": "READY",
+                    "code": "TASK_EVIDENCE_EXPORTED",
+                    "output": str(args.output.expanduser().resolve()),
+                    "export": exported.to_dict(),
+                }
+            )
         if args.task_command == "artifacts":
             artifacts = [artifact.to_dict() for artifact in store.artifacts(args.thread_id)]
             return _print_json_result({"status": "READY", "thread_id": args.thread_id, "artifacts": artifacts})
@@ -1532,10 +1558,10 @@ def _run_task_artifact_command(args: argparse.Namespace) -> int:
         )
     except ValueError as error:
         code = str(error)
-        if not code.startswith("TASK_ARTIFACT_") and code != "TASK_NOT_FOUND":
+        if not code.startswith(("TASK_ARTIFACT_", "TASK_EXPORT_")) and code != "TASK_NOT_FOUND":
             code = "TASK_ARTIFACT_UNAVAILABLE"
         return _print_json_result(
-            {"status": "BLOCKED", "code": code, "message": "任务产物不可读取、超出限制或完整性校验失败。"},
+            {"status": "BLOCKED", "code": code, "message": "任务产物或证据包不可读取、超出限制、目标冲突或完整性校验失败。"},
             2,
         )
     finally:
