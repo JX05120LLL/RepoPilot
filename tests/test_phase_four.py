@@ -107,6 +107,26 @@ class LoopingResearchModel(PlannedResearchModel):
         return ResearchDecision("继续搜索。", (ToolCall("search_code", {"query": "OrderService"}),))
 
 
+class ApplicationRepairingPatchModel(PlannedResearchModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.patch_count = 0
+
+    def propose_patch(self, messages: list[dict[str, str]], state: object) -> PatchGenerationResult:
+        self.patch_count += 1
+        expected_old_text = "void findOrder( ) {}" if self.patch_count == 1 else "void findOrder() {}"
+        return PatchGenerationResult(
+            PatchProposal(
+                summary="测试补丁",
+                changes=[{
+                    "path": "src/main/java/com/example/OrderService.java",
+                    "expected_old_text": expected_old_text,
+                    "new_text": "void findOrder() { /* verified */ }",
+                }],
+            )
+        )
+
+
 class FailingProjectMemoryWriter:
     def record(self, **_: object) -> ProjectMemoryResult:
         return ProjectMemoryResult("BLOCKED", "PROJECT_MEMORY_INDEX_FAILED", "Qdrant 不可用。", failure_component="qdrant")
@@ -488,6 +508,31 @@ class PhaseFourGraphTests(unittest.TestCase):
             store.close()
         self.assertEqual("WAITING_APPROVAL", completed.status)
         self.assertEqual("EXECUTION_REVIEW", completed.state["pending_approval_action"])
+
+    def test_patch_application_repair_uses_one_verified_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repository = create_java_repository(root)
+            manager = WorkspaceManager()
+            before = manager.snapshot(repository)
+            model = ApplicationRepairingPatchModel()
+            runner, store = self._runner(root / "state.sqlite", model)
+            initial = runner.run(TaskRequest(repository, "修复订单查询", root / "runs"), "patch-repair-thread")
+            execution_review = runner.resume("patch-repair-thread", approved=True)
+            completed = runner.resume("patch-repair-thread", approved=True)
+            worktree = Path(str(completed.state["workspace_path"]))
+            updated_source = (worktree / "src/main/java/com/example/OrderService.java").read_text(encoding="utf-8")
+            after = manager.snapshot(repository)
+            store.close()
+
+        self.assertTrue(initial.pending_approval)
+        self.assertTrue(execution_review.pending_approval)
+        self.assertEqual(2, model.patch_count)
+        self.assertEqual("READY", completed.state["patch_result"]["status"])
+        self.assertIn("void findOrder() { /* verified */ }", updated_source)
+        self.assertEqual(before, after)
+        events = {event["type"] for event in completed.state["tool_events"]}
+        self.assertIn("PATCH_APPLICATION_REPAIR_REQUESTED", events)
 
     def test_unknown_tool_is_audited_and_never_becomes_shell_execution(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

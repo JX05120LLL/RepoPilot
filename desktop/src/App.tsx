@@ -165,6 +165,7 @@ type ManagedDocument = {
 type RuntimeHealth = {
   status: "UNKNOWN" | "READY" | "BLOCKED";
   code: string;
+  message?: string;
 };
 type ProjectModeReadiness = {
   status: "READY" | "BLOCKED";
@@ -224,7 +225,10 @@ function eventSummary(event: TimelineEvent): string {
 }
 
 function compactTaskLabel(item: Task): string {
-  return item.display_title || item.task_id || item.thread_id.slice(0, 12);
+  const title = item.display_title?.trim();
+  if (title) return title;
+  const identifier = (item.task_id || item.thread_id).replace(/^task-/, "");
+  return "未命名任务 · " + identifier.slice(-8);
 }
 
 export function App() {
@@ -339,7 +343,11 @@ export function App() {
       const payload = (await response.json()) as {
         status?: string;
         agent_status?: "READY" | "BLOCKED";
-        dependencies?: Array<{ status?: string; code?: string }>;
+        dependencies?: Array<{
+          status?: string;
+          code?: string;
+          message?: string;
+        }>;
       };
       // Desktop workflow needs the runtime dependency contract, not only an HTTP 200.
       const hasCurrentContract =
@@ -356,6 +364,13 @@ export function App() {
         code:
           blockedDependency?.code ??
           (hasCurrentContract ? "AGENT_RUNTIME_READY" : "API_VERSION_MISMATCH"),
+        message:
+          blockedDependency?.message ??
+          (hasCurrentContract
+            ? payload.agent_status === "READY"
+              ? "本机服务、模型和检索依赖已就绪。"
+              : "Agent 运行依赖未满足，请检查本机服务。"
+            : "桌面端与本机 API 版本不兼容，请更新后重试。"),
       });
       if (ready)
         setRequestError((current) =>
@@ -363,7 +378,11 @@ export function App() {
         );
     } catch {
       setApiReady(false);
-      setRuntimeHealth({ status: "UNKNOWN", code: "API_UNAVAILABLE" });
+      setRuntimeHealth({
+        status: "UNKNOWN",
+        code: "API_UNAVAILABLE",
+        message: "无法连接本机 API，请启动 RepoPilot 后端后重试。",
+      });
     }
   }
 
@@ -1266,7 +1285,11 @@ export function App() {
                       {requestError ||
                         (runtimeHealth.status !== "READY"
                           ? runtimeHealth.status === "BLOCKED"
-                            ? "Agent 运行依赖未就绪：" + runtimeHealth.code
+                            ? "Agent 运行依赖未就绪：" +
+                              (runtimeHealth.message ?? runtimeHealth.code) +
+                              "（" +
+                              runtimeHealth.code +
+                              "）"
                             : "本机 Agent API 版本需要更新"
                           : safeModeWarningMessage)}
                     </span>

@@ -53,10 +53,42 @@ impl BackendProcess {
             return;
         };
         if let Some(mut process) = child.take() {
-            let _ = process.kill();
-            let _ = process.wait();
+            terminate_backend_process(&mut process);
         }
     }
+}
+
+#[cfg(windows)]
+fn terminate_backend_process(process: &mut Child) {
+    // PyInstaller 的 one-file sidecar 会派生真正的 Python 进程；只结束 bootloader
+    // 会留下监听端口的子进程，因此仅针对本应用启动的根 PID 结束整棵进程树。
+    let process_id = process.id().to_string();
+    let taskkill = env::var_os("SystemRoot")
+        .map(|root| PathBuf::from(root).join("System32").join("taskkill.exe"))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("taskkill.exe"));
+    let mut command = Command::new(taskkill);
+    command
+        .args(["/PID", &process_id, "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW);
+
+    let terminated = command
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !terminated {
+        let _ = process.kill();
+    }
+    let _ = process.wait();
+}
+
+#[cfg(not(windows))]
+fn terminate_backend_process(process: &mut Child) {
+    let _ = process.kill();
+    let _ = process.wait();
 }
 
 fn api_is_reachable() -> bool {

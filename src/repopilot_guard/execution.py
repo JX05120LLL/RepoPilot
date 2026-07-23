@@ -18,6 +18,7 @@ from repopilot_guard.workspace import GitClient
 MAX_PATCH_FILES = 8
 MAX_FILE_BYTES = 256 * 1024
 MAX_PATCH_BYTES = 512 * 1024
+MAX_PATCH_REPAIR_SNAPSHOT_BYTES = 32 * 1024
 
 
 class PatchFileChange(BaseModel):
@@ -42,6 +43,7 @@ class PatchApplyResult:
     message: str
     changed_paths: tuple[str, ...] = ()
     diff: str = ""
+    failed_path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,7 +97,12 @@ class StructuredPatchApplier:
             new_text = _adapt_line_endings(change.new_text, original_text)
             matches = original_text.count(expected_old_text)
             if matches != 1:
-                return PatchApplyResult("BLOCKED", "PATCH_OLD_TEXT_NOT_UNIQUE", f"预期旧文本在 {change.path} 中匹配 {matches} 次，要求恰好一次")
+                return PatchApplyResult(
+                    "BLOCKED",
+                    "PATCH_OLD_TEXT_NOT_UNIQUE",
+                    f"预期旧文本在 {change.path} 中匹配 {matches} 次，要求恰好一次",
+                    failed_path=change.path,
+                )
             updated = original_text.replace(expected_old_text, new_text, 1).encode("utf-8")
             total_bytes += len(updated)
             if total_bytes > MAX_PATCH_BYTES:
@@ -116,6 +123,34 @@ class StructuredPatchApplier:
 
         diff = self._git.run(root, "diff", "--binary", "HEAD")
         return PatchApplyResult("READY", "PATCH_APPLIED", "结构化补丁已应用，尚未验证。", tuple(change.path for change in proposal.changes), diff)
+
+    def repair_snapshot(
+        self,
+        workspace_root: Path,
+        path: str,
+        permission: PermissionGrant,
+        candidate_files: set[str] | None = None,
+    ) -> str | None:
+        """返回一次补丁纠错所需的受限文件快照，不记录到审计或任务状态。"""
+        if candidate_files is not None and path not in candidate_files:
+            return None
+        root = workspace_root.expanduser().resolve()
+        target = (root / path).resolve()
+        decision = PolicyGuard(root, permission).check_path(ToolName.APPLY_PATCH, target)
+        if not decision.allowed or not target.is_file():
+            return None
+        try:
+            if target.stat().st_size > MAX_PATCH_REPAIR_SNAPSHOT_BYTES:
+                return None
+            raw = target.read_bytes()
+        except OSError:
+            return None
+        if b"\0" in raw:
+            return None
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
 
 
 class VerificationRunner:
