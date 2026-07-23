@@ -99,3 +99,62 @@ class PolicyGuard:
         elif test_class is not None:
             return PolicyDecision(False, "Only targeted_test accepts a test class.", "INVALID_RECIPE_ARGUMENT")
         return PolicyDecision(True, "Maven Recipe is allowlisted.")
+
+
+class TaskIntentGuard:
+    """在模型运行前拒绝安全隔离模式中明确的越权任务意图。
+
+    这不是自然语言理解或内容审核器。它只匹配少数可确定识别的高风险
+    组合，防止模型把“修改项目外文件”悄悄改写成仓库内无关改动，或把
+    “忽略权限执行 shell”误当作正常研发需求。更复杂的上下文注入仍由
+    工具白名单、路径策略和两级审批共同约束。
+    """
+
+    _external_scope_markers = (
+        "项目外",
+        "仓库外",
+        "工作区外",
+        "外部文件",
+        "outside project",
+        "outside repository",
+        "outside repo",
+        "outside workspace",
+    )
+    _write_markers = ("修改", "写入", "创建", "删除", "移动", "改动", "modify", "write", "create", "delete", "move")
+    _override_markers = ("忽略权限", "忽略规则", "忽略指令", "ignore permission", "ignore permissions", "ignore instruction", "ignore instructions")
+    _shell_markers = ("shell", "powershell", "cmd", "bash", "终端命令", "执行命令")
+    _sensitive_file_markers = (".env", "id_rsa", "id_ed25519", "credentials", ".pem", ".key", ".p12", ".pfx", ".jks")
+    _read_markers = ("读取", "查看", "显示", "导出", "read", "show", "display", "cat")
+
+    def __init__(self, permission: PermissionGrant) -> None:
+        self._permission = permission
+
+    def check_description(self, description: str) -> PolicyDecision:
+        """仅对默认安全模式执行确定性任务意图检查。"""
+        if self._permission.is_full_access:
+            return PolicyDecision(True, "完全权限模式已由用户确认；任务意图继续受已注册工具和审批限制。", "USER_GRANTED_FULL_ACCESS")
+
+        normalized = " ".join(description.lower().split())
+        if self._contains_all(normalized, self._external_scope_markers, self._write_markers):
+            return PolicyDecision(
+                False,
+                "安全隔离修复不允许请求修改项目、仓库或工作区之外的文件。",
+                "TASK_PATH_ESCAPE_INTENT_BLOCKED",
+            )
+        if self._contains_all(normalized, self._override_markers, self._shell_markers):
+            return PolicyDecision(
+                False,
+                "不可信内容要求忽略权限或执行 shell，任务已在模型运行前阻断。",
+                "PROMPT_INJECTION_BLOCKED",
+            )
+        if self._contains_all(normalized, self._sensitive_file_markers, self._read_markers):
+            return PolicyDecision(
+                False,
+                "安全隔离修复不允许请求读取或导出敏感凭证文件。",
+                "TASK_SENSITIVE_FILE_INTENT_BLOCKED",
+            )
+        return PolicyDecision(True, "任务意图未命中确定性高风险规则。")
+
+    @staticmethod
+    def _contains_all(text: str, first_group: tuple[str, ...], second_group: tuple[str, ...]) -> bool:
+        return any(marker in text for marker in first_group) and any(marker in text for marker in second_group)

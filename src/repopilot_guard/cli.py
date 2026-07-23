@@ -25,7 +25,7 @@ from repopilot_guard.context import ContextChunkStore, ContextIndexer, ContextLo
 from repopilot_guard.document_indexing import index_uploaded_document
 from repopilot_guard.evaluation import BaselineValidator, EvaluationCatalog, EvaluationRunner, FixtureBuilder
 from repopilot_guard.graph import GraphRunner, SqliteCheckpointStore, create_live_graph
-from repopilot_guard.models import TaskMode, TaskRequest, WorkspaceMode, WorkspaceSelection, default_output_root
+from repopilot_guard.models import TaskMode, TaskOperation, TaskRequest, WorkspaceMode, WorkspaceSelection, default_output_root
 from repopilot_guard.mcp import McpCapabilityRegistry, McpConfigError, McpConfigLoader
 from repopilot_guard.mcp_runtime import MAX_MCP_INPUT_CHARS, McpRuntime, McpRuntimeError
 from repopilot_guard.permissions import FULL_ACCESS_CONFIRMATION, PermissionGrant, PermissionMode
@@ -219,6 +219,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_source.add_argument("--repo", type=Path, help="已授权的 Git 仓库路径")
     task_source.add_argument("--project-id", help="已注册项目 ID")
     task_start.add_argument("--task", required=True, help="问题描述、修复目标或代码评审请求")
+    task_start.add_argument("--operation", choices=[operation.value for operation in TaskOperation], default=TaskOperation.CHANGE.value, help="任务类型：change 会申请执行审批，research 只输出计划和报告")
     task_start.add_argument("--task-mode", choices=[mode.value for mode in TaskMode], default=TaskMode.SAFE_ISOLATED.value)
     task_start.add_argument("--confirm-full-access", help=f"完全本机控制必须填写：{FULL_ACCESS_CONFIRMATION}")
     task_start.add_argument("--start-ref", default="HEAD", help="安全隔离修复使用的 Git 起始分支或提交")
@@ -259,6 +260,7 @@ def build_parser() -> argparse.ArgumentParser:
     agent_source.add_argument("--repo", type=Path)
     agent_source.add_argument("--project-id")
     agent_plan.add_argument("--task", required=True)
+    agent_plan.add_argument("--operation", choices=[operation.value for operation in TaskOperation], default=TaskOperation.CHANGE.value, help="任务类型：change 会申请执行审批，research 只输出计划和报告")
     agent_plan.add_argument("--output", type=Path, default=default_output_root())
     agent_plan.add_argument("--thread-id")
     agent_plan.add_argument("--state-db", type=Path)
@@ -1153,6 +1155,7 @@ def _run_task(args: argparse.Namespace) -> int:
                         include_uncommitted_changes=args.include_uncommitted_changes,
                     ),
                     approved_mcp_tools=tuple(args.approve_mcp_tool),
+                    operation=TaskOperation(args.operation),
                 )
                 thread_id = args.thread_id or str(uuid4())
                 task_store.create(
@@ -1569,6 +1572,7 @@ def _run_agent(args: argparse.Namespace) -> int:
                         include_uncommitted_changes=args.include_uncommitted_changes,
                     ),
                     approved_mcp_tools=tuple(args.approve_mcp_tool),
+                    operation=TaskOperation(args.operation),
                 )
                 result = runner.run(request, args.thread_id, permission)
                 if registry:

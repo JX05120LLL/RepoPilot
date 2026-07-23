@@ -54,6 +54,7 @@ class PermissionSnapshot:
     workspace_mode: str
     granted_at: str
     approved_mcp_tools: tuple[str, ...] = ()
+    task_operation: str = "change"
 
     def __post_init__(self) -> None:
         if not self.task_id.strip():
@@ -65,6 +66,8 @@ class PermissionSnapshot:
             for capability_id in self.approved_mcp_tools
         ):
             raise ValueError("PERMISSION_SNAPSHOT_MCP_APPROVAL_INVALID")
+        if self.task_operation not in {"change", "research"}:
+            raise ValueError("PERMISSION_SNAPSHOT_OPERATION_INVALID")
         try:
             datetime.fromisoformat(self.granted_at)
         except ValueError as error:
@@ -77,6 +80,7 @@ class PermissionSnapshot:
         grant: PermissionGrant,
         workspace_mode: str,
         approved_mcp_tools: tuple[str, ...] = (),
+        task_operation: str = "change",
     ) -> "PermissionSnapshot":
         return cls(
             task_id=task_id,
@@ -84,6 +88,7 @@ class PermissionSnapshot:
             workspace_mode=workspace_mode,
             granted_at=datetime.now(timezone.utc).isoformat(),
             approved_mcp_tools=tuple(sorted(set(approved_mcp_tools))),
+            task_operation=task_operation,
         )
 
     @classmethod
@@ -99,6 +104,7 @@ class PermissionSnapshot:
                 workspace_mode=str(payload["workspace_mode"]),
                 granted_at=str(payload["granted_at"]),
                 approved_mcp_tools=tuple(sorted(set(_mcp_tool_ids(payload.get("approved_mcp_tools", []))))),
+                task_operation=str(payload.get("task_operation", "change")),
             )
         except (KeyError, TypeError, ValueError) as error:
             if isinstance(error, ValueError) and str(error).startswith("PERMISSION_SNAPSHOT_"):
@@ -113,6 +119,7 @@ class PermissionSnapshot:
             "workspace_mode": self.workspace_mode,
             "granted_at": self.granted_at,
             "approved_mcp_tools": list(self.approved_mcp_tools),
+            "task_operation": self.task_operation,
             "audit_code": "USER_GRANTED_FULL_ACCESS" if self.grant.is_full_access else "SAFE_MODE",
         }
 

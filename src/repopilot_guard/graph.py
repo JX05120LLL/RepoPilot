@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -40,15 +41,15 @@ from repopilot_guard.context import (
 from repopilot_guard.context_broker import ContextBroker
 from repopilot_guard.execution import PatchProposal, StructuredPatchApplier, VerificationRunner
 from repopilot_guard.mcp_agent import McpToolBinding, TaskMcpBindingService, bindings_registry
-from repopilot_guard.models import TaskBudget, TaskRequest, VerificationContract, WorkspaceMode, WorkspaceSelection
+from repopilot_guard.models import TaskBudget, TaskOperation, TaskRequest, VerificationContract, WorkspaceMode, WorkspaceSelection
 from repopilot_guard.permissions import PermissionGrant, PermissionMode, PermissionSnapshot
-from repopilot_guard.policy import MavenRecipeName
+from repopilot_guard.policy import MavenRecipeName, TaskIntentGuard
 from repopilot_guard.preflight import PreflightInspector
 from repopilot_guard.providers import OpenAICompatibleProvider
 from repopilot_guard.qdrant_bootstrap import QdrantBootstrapper, check_qdrant_health
 from repopilot_guard.repository_tools import RepositoryTools, ToolResult
 from repopilot_guard.tool_runtime import ToolRuntime
-from repopilot_guard.workspace import WorkspaceManager
+from repopilot_guard.workspace import GitCommandError, WorkspaceManager
 
 
 MAX_RESEARCH_ROUNDS = 6
@@ -178,6 +179,7 @@ class GraphState(TypedDict, total=False):
     repository: str
     output_root: str
     task_description: str
+    task_operation: str
     verification_contract: dict[str, object] | None
     budget_snapshot: dict[str, object]
     approved_mcp_tools: list[str]
@@ -190,6 +192,7 @@ class GraphState(TypedDict, total=False):
     include_uncommitted_changes: bool
     workspace_path: str | None
     base_commit: str | None
+    workspace_dirty_entries: list[str]
     context_references: list[dict[str, object]]
     context_snapshot: dict[str, object] | None
     mcp_bindings: list[dict[str, object]]
@@ -852,17 +855,27 @@ class CodingGraphFactory:
         try:
             snapshot = _permission_snapshot_from_state(state)
             _budget_from_state(state)
+            TaskOperation(state["task_operation"])
         except ValueError:
             return _blocked(state, "TASK_SNAPSHOT_INVALID", "任务权限或预算快照无效，已阻断。")
         if (
             not state["task_description"].strip()
             or snapshot.task_id != state["task_id"]
             or snapshot.workspace_mode != state["workspace_mode"]
+            or snapshot.task_operation != state["task_operation"]
             or snapshot.grant.mode.value != state["permission_mode"]
             or snapshot.grant.confirmation != state.get("permission_confirmation")
             or tuple(state.get("approved_mcp_tools", [])) != snapshot.approved_mcp_tools
         ):
             return _blocked(state, "INTAKE_INVALID", "任务描述或权限上下文无效。")
+        intent_decision = TaskIntentGuard(snapshot.grant).check_description(state["task_description"])
+        if not intent_decision.allowed:
+            return _blocked(
+                state,
+                intent_decision.audit_code,
+                intent_decision.reason,
+                {"type": "TASK_INTENT_BLOCKED", "code": intent_decision.audit_code},
+            )
         try:
             if state.get("verification_contract") is not None:
                 VerificationContract.from_dict(state["verification_contract"])
@@ -892,15 +905,24 @@ class CodingGraphFactory:
                 else None
             ),
             approved_mcp_tools=tuple(state.get("approved_mcp_tools", [])),
+            operation=TaskOperation(state["task_operation"]),
         )
         result = self._workspace_manager.prepare(request, permission)
         event = {"type": "WORKSPACE_PREPARED", **result.to_dict()}
         if result.status != "READY" or not result.workspace_path or not result.base_commit:
             return _blocked(state, result.code, result.message, event)
+        try:
+            workspace_status = self._workspace_manager.status(result.workspace_path)
+            dirty_entries = [str(item) for item in workspace_status.get("dirty_entries", [])]
+        except (GitCommandError, OSError, subprocess.SubprocessError):
+            if not result.base_commit.startswith("non-git-"):
+                return _blocked(state, "WORKSPACE_STATUS_UNAVAILABLE", "无法冻结任务工作区状态，已阻断。", event)
+            dirty_entries = []
         return {
             "status": "PREFLIGHT",
             "workspace_path": str(result.workspace_path),
             "base_commit": result.base_commit,
+            "workspace_dirty_entries": dirty_entries,
             "tool_events": [*state["tool_events"], event],
         }
 
@@ -1035,7 +1057,7 @@ class CodingGraphFactory:
         executor = self._executor(state)
         try:
             decision = self._research_model.analyze(state["messages"], executor.langchain_tools)
-        except Exception:
+        except (GitCommandError, OSError, subprocess.SubprocessError):
             return _blocked(state, "MODEL_ANALYSIS_FAILED", "模型分析失败，未生成猜测计划。")
         cancelled = self._cancelled(state)
         if cancelled:
@@ -1145,12 +1167,15 @@ class CodingGraphFactory:
         cancelled = self._cancelled(state)
         if cancelled:
             return cancelled
+        research_only = TaskOperation(state["task_operation"]) is TaskOperation.RESEARCH
         approval = interrupt(
             {
                 "type": "PLAN_APPROVAL_REQUIRED",
                 "thread_id": state["thread_id"],
                 "task_id": state["task_id"],
-                "message": "计划已生成。本次确认只保留计划给阶段五，不会修改代码。",
+                "message": "研究计划已生成。确认后将输出只读结论，不会修改代码或运行 Maven。"
+                if research_only
+                else "计划已生成。本次确认只保留计划给阶段五，不会修改代码。",
                 "plan": state.get("plan"),
                 "revision": state["plan_revision"],
             }
@@ -1175,6 +1200,13 @@ class CodingGraphFactory:
             }
         if decision != "approve":
             return _blocked(state, "PLAN_REJECTED", "用户未确认计划，未执行任何写入。")
+        if research_only:
+            return {
+                "status": "REPORT",
+                "pending_approval": False,
+                "pending_approval_action": None,
+                "tool_events": [*state["tool_events"], {"type": "PLAN_APPROVED"}, {"type": "RESEARCH_PLAN_APPROVED"}],
+            }
         return {
             "status": "WAITING_APPROVAL",
             "pending_approval": True,
@@ -1211,6 +1243,22 @@ class CodingGraphFactory:
         cancelled = self._cancelled(state)
         if cancelled:
             return cancelled
+        try:
+            workspace_status = self._workspace_manager.status(Path(str(state["workspace_path"])))
+            current_dirty_entries = [str(item) for item in workspace_status.get("dirty_entries", [])]
+        except Exception:
+            return _blocked(state, "WORKSPACE_STATUS_UNAVAILABLE", "补丁执行前无法复核工作区状态，已阻断。")
+        if current_dirty_entries != state.get("workspace_dirty_entries", []):
+            return _blocked(
+                state,
+                "WORKSPACE_CHANGED_AFTER_APPROVAL",
+                "工作区在任务准备后发生变化；为避免覆盖并发改动，已拒绝生成和应用补丁。",
+                {
+                    "type": "WORKSPACE_DRIFT_BLOCKED",
+                    "baseline_entry_count": len(state.get("workspace_dirty_entries", [])),
+                    "current_entry_count": len(current_dirty_entries),
+                },
+            )
         budget_blocked = _block_if_model_budget_reached(state)
         if budget_blocked:
             return budget_blocked
@@ -1485,7 +1533,7 @@ class CodingGraphFactory:
 
     @staticmethod
     def _route_after_plan_approval(state: GraphState) -> str:
-        if state["status"] == "BLOCKED":
+        if state["status"] in {"BLOCKED", "REPORT"}:
             return "report"
         return "plan" if state["status"] == "PLAN" else "next"
 
@@ -1562,6 +1610,7 @@ class GraphRunner:
                 grant,
                 request.workspace_selection.mode.value,
                 request.approved_mcp_tools,
+                request.operation.value,
             )
             budget = request.budget.restricted_by(self._default_budget)
             initial_state: GraphState = {
@@ -1575,6 +1624,7 @@ class GraphRunner:
                 "repository": str(request.repository),
                 "output_root": str(request.output_root),
                 "task_description": request.description,
+                "task_operation": request.operation.value,
                 "verification_contract": request.verification_contract.to_dict() if request.verification_contract else None,
                 "budget_snapshot": budget.to_dict(),
                 "approved_mcp_tools": list(request.approved_mcp_tools),
@@ -1587,6 +1637,7 @@ class GraphRunner:
                 "include_uncommitted_changes": request.workspace_selection.include_uncommitted_changes,
                 "workspace_path": None,
                 "base_commit": None,
+                "workspace_dirty_entries": [],
                 "context_references": [],
                 "context_snapshot": None,
                 "mcp_bindings": [],
@@ -1624,6 +1675,7 @@ class GraphRunner:
         if (
             snapshot.task_id != current.task_id
             or snapshot.workspace_mode != current.state["workspace_mode"]
+            or snapshot.task_operation != current.state["task_operation"]
             or snapshot.grant.mode.value != current.state["permission_mode"]
             or snapshot.grant.confirmation != current.state.get("permission_confirmation")
             or snapshot.approved_mcp_tools != tuple(current.state.get("approved_mcp_tools", []))
@@ -1749,6 +1801,7 @@ def _permission_snapshot_from_state(state: GraphState) -> PermissionSnapshot:
         str(state["task_id"]),
         PermissionGrant(PermissionMode(state["permission_mode"]), state.get("permission_confirmation")),
         str(state["workspace_mode"]),
+        task_operation=str(state.get("task_operation", TaskOperation.CHANGE.value)),
     )
 
 

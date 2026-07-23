@@ -11,13 +11,14 @@ from repopilot_guard.tool_runtime import ToolRuntime
 class RuntimeFoundationTests(unittest.TestCase):
     def test_permission_snapshot_round_trip_preserves_task_authorization(self) -> None:
         grant = PermissionGrant(PermissionMode.FULL, FULL_ACCESS_CONFIRMATION)
-        snapshot = PermissionSnapshot.create("task-001", grant, "worktree")
+        snapshot = PermissionSnapshot.create("task-001", grant, "worktree", task_operation="research")
 
         restored = PermissionSnapshot.from_dict(snapshot.to_dict())
 
         self.assertEqual("task-001", restored.task_id)
         self.assertEqual(PermissionMode.FULL, restored.grant.mode)
         self.assertEqual("worktree", restored.workspace_mode)
+        self.assertEqual("research", restored.task_operation)
         self.assertEqual("USER_GRANTED_FULL_ACCESS", restored.to_dict()["audit_code"])
 
     def test_permission_snapshot_rejects_invalid_workspace(self) -> None:
@@ -31,6 +32,10 @@ class RuntimeFoundationTests(unittest.TestCase):
                     "granted_at": "2026-07-19T00:00:00+00:00",
                 }
             )
+
+    def test_permission_snapshot_rejects_invalid_task_operation(self) -> None:
+        with self.assertRaisesRegex(ValueError, "PERMISSION_SNAPSHOT_OPERATION_INVALID"):
+            PermissionSnapshot.create("task-001", PermissionGrant.safe(), "worktree", task_operation="execute-anything")
 
     def test_tool_runtime_rejects_unknown_and_invalid_arguments(self) -> None:
         def echo(value: str) -> dict[str, object]:

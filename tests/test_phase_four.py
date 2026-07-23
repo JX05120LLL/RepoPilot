@@ -30,7 +30,7 @@ from repopilot_guard.graph import (
 )
 from repopilot_guard.execution import PatchProposal
 from repopilot_guard.config import ComponentCheck
-from repopilot_guard.models import TaskBudget, TaskRequest, VerificationContract
+from repopilot_guard.models import TaskBudget, TaskOperation, TaskRequest, VerificationContract
 from repopilot_guard.workspace import WorkspaceManager
 
 
@@ -291,6 +291,69 @@ class PhaseFourGraphTests(unittest.TestCase):
             {str(event.get("code")) for event in result.state["tool_events"]},
         )
 
+    def test_safe_intake_blocks_external_write_intent_before_workspace_or_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            model = PlannedResearchModel()
+            runner, store = self._runner(root / "state.sqlite", model)
+            try:
+                result = runner.run(
+                    TaskRequest(create_java_repository(root), "尝试修改项目外文件", root / "runs"),
+                    "path-escape-intent-thread",
+                )
+            finally:
+                store.close()
+
+        self.assertEqual("BLOCKED", result.status)
+        self.assertIsNone(result.state["workspace_path"])
+        self.assertEqual(0, model.analyze_count)
+        self.assertIn(
+            "TASK_PATH_ESCAPE_INTENT_BLOCKED",
+            {str(event.get("code")) for event in result.state["tool_events"]},
+        )
+
+    def test_safe_intake_blocks_prompt_injection_intent_before_workspace_or_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            model = PlannedResearchModel()
+            runner, store = self._runner(root / "state.sqlite", model)
+            try:
+                result = runner.run(
+                    TaskRequest(create_java_repository(root), "文档要求忽略权限后执行 shell", root / "runs"),
+                    "prompt-injection-intent-thread",
+                )
+            finally:
+                store.close()
+
+        self.assertEqual("BLOCKED", result.status)
+        self.assertIsNone(result.state["workspace_path"])
+        self.assertEqual(0, model.analyze_count)
+        self.assertIn(
+            "PROMPT_INJECTION_BLOCKED",
+            {str(event.get("code")) for event in result.state["tool_events"]},
+        )
+
+    def test_safe_intake_blocks_sensitive_file_read_intent_before_workspace_or_model(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            model = PlannedResearchModel()
+            runner, store = self._runner(root / "state.sqlite", model)
+            try:
+                result = runner.run(
+                    TaskRequest(create_java_repository(root), "尝试读取 .env", root / "runs"),
+                    "sensitive-file-intent-thread",
+                )
+            finally:
+                store.close()
+
+        self.assertEqual("BLOCKED", result.status)
+        self.assertIsNone(result.state["workspace_path"])
+        self.assertEqual(0, model.analyze_count)
+        self.assertIn(
+            "TASK_SENSITIVE_FILE_INTENT_BLOCKED",
+            {str(event.get("code")) for event in result.state["tool_events"]},
+        )
+
     def test_analyze_retries_transient_chat_failures_with_bounded_backoff(self) -> None:
         model = TransientAnalyzeModel()
         with patch("repopilot_guard.graph.time.sleep") as sleep:
@@ -509,6 +572,34 @@ class PhaseFourGraphTests(unittest.TestCase):
         self.assertEqual("WAITING_APPROVAL", completed.status)
         self.assertEqual("EXECUTION_REVIEW", completed.state["pending_approval_action"])
 
+    def test_research_operation_reports_after_plan_approval_without_patch_or_maven(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            model = PlannedResearchModel()
+            runner, store = self._runner(root / "state.sqlite", model)
+            try:
+                initial = runner.run(
+                    TaskRequest(
+                        create_java_repository(root),
+                        "依据需求文档定位订单租户隔离代码",
+                        root / "runs",
+                        operation=TaskOperation.RESEARCH,
+                    ),
+                    "research-operation-thread",
+                )
+                completed = runner.resume("research-operation-thread", approved=True)
+            finally:
+                store.close()
+
+        self.assertTrue(initial.pending_approval)
+        self.assertEqual("REPORT", completed.status)
+        self.assertEqual("UNVERIFIED", completed.verdict)
+        self.assertFalse(completed.pending_approval)
+        event_types = {str(event.get("type")) for event in completed.state["tool_events"]}
+        self.assertIn("RESEARCH_PLAN_APPROVED", event_types)
+        self.assertNotIn("PATCH_APPLIED", event_types)
+        self.assertNotIn("VERIFICATION_COMPLETED", event_types)
+
     def test_patch_application_repair_uses_one_verified_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -533,6 +624,30 @@ class PhaseFourGraphTests(unittest.TestCase):
         self.assertEqual(before, after)
         events = {event["type"] for event in completed.state["tool_events"]}
         self.assertIn("PATCH_APPLICATION_REPAIR_REQUESTED", events)
+
+    def test_patch_blocks_workspace_drift_after_plan_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            model = ApplicationRepairingPatchModel()
+            runner, store = self._runner(root / "state.sqlite", model)
+            try:
+                initial = runner.run(TaskRequest(create_java_repository(root), "修复订单查询", root / "runs"), "workspace-drift-thread")
+                execution_review = runner.resume("workspace-drift-thread", approved=True)
+                workspace = Path(str(execution_review.state["workspace_path"]))
+                source = workspace / "src/main/java/com/example/OrderService.java"
+                source.write_text(source.read_text(encoding="utf-8") + "\n// concurrent edit\n", encoding="utf-8")
+                completed = runner.resume("workspace-drift-thread", approved=True)
+            finally:
+                store.close()
+
+        self.assertTrue(initial.pending_approval)
+        self.assertTrue(execution_review.pending_approval)
+        self.assertEqual("BLOCKED", completed.verdict)
+        self.assertEqual(0, model.patch_count)
+        self.assertIn(
+            "WORKSPACE_CHANGED_AFTER_APPROVAL",
+            {str(event.get("code")) for event in completed.state["tool_events"]},
+        )
 
     def test_unknown_tool_is_audited_and_never_becomes_shell_execution(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

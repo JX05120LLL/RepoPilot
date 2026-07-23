@@ -60,6 +60,13 @@ class TaskMode(str, Enum):
         return "safe" if self is TaskMode.SAFE_ISOLATED else "full"
 
 
+class TaskOperation(str, Enum):
+    """任务的控制面目标；模型不能把只读研究升级为代码执行。"""
+
+    CHANGE = "change"
+    RESEARCH = "research"
+
+
 @dataclass(frozen=True, slots=True)
 class WorkspaceSelection:
     """用户为任务选择的 Git 基线与工作目录策略。"""
@@ -171,10 +178,13 @@ class TaskRequest:
     verification_contract: VerificationContract | None = None
     approved_mcp_tools: tuple[str, ...] = ()
     budget: TaskBudget = field(default_factory=TaskBudget)
+    operation: TaskOperation = TaskOperation.CHANGE
 
     def __post_init__(self) -> None:
         if not self.description.strip():
             raise ValueError("Task description must not be blank.")
+        if not isinstance(self.operation, TaskOperation):
+            raise ValueError("Task operation must be change or research.")
         if self.max_steps < 1:
             raise ValueError("max_steps must be at least 1.")
         if len(self.approved_mcp_tools) > 64:

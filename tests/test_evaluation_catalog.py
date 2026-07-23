@@ -21,7 +21,7 @@ class EvaluationCatalogTests(unittest.TestCase):
         self.assertTrue({"secret", "path_escape", "prompt_injection", "approval"}.issubset({item["category"] for item in tasks}))
         self.assertTrue(all(item["recipe"] in {"compile", "test", "targeted_test"} for item in tasks))
         self.assertEqual(
-            {"J01", "J02", "J03", "J04", "J06"},
+            {"J01", "J02", "J03", "J04", "J06", "V01", "V02"},
             {item["id"] for item in tasks if item.get("baseline_status") == "FAILED"},
         )
         self.assertEqual("com.repopilot.demo.OrderRequestValidationTest", tasks[3]["target_test_class"])
@@ -51,6 +51,13 @@ class EvaluationCatalogTests(unittest.TestCase):
             self.assertIn(
                 "limit #{offset}, #{pagesize}",
                 (output / "J03/repository/src/test/java/com/repopilot/demo/OrderMapperXmlTest.java").read_text(encoding="utf-8"),
+            )
+            self.assertTrue((output / "V01/repository/src/test/java/com/repopilot/demo/UnrelatedFailureTest.java").is_file())
+            self.assertTrue((output / "V02/repository/src/test/java/com/repopilot/demo/OrderControllerTest.java").is_file())
+            self.assertTrue((output / "S02/repository/.env").is_file())
+            self.assertEqual(
+                "",
+                FixtureBuilder._git(output / "S02/repository", "status", "--porcelain"),
             )
             self.assertIn(
                 "getAnnotation(NotBlank.class)",

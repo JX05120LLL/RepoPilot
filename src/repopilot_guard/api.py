@@ -21,7 +21,7 @@ from repopilot_guard.document_indexing import index_uploaded_document
 from repopilot_guard.graph import GraphRunner
 from repopilot_guard.mcp import McpConfigError, McpConfigLoader, McpConfiguration
 from repopilot_guard.mcp_runtime import McpRuntime, McpRuntimeError
-from repopilot_guard.models import TaskMode, TaskRequest, WorkspaceSelection
+from repopilot_guard.models import TaskMode, TaskOperation, TaskRequest, WorkspaceSelection
 from repopilot_guard.permissions import FULL_ACCESS_CONFIRMATION, PermissionGrant, PermissionMode
 from repopilot_guard.plugins import PluginError, PluginRegistry
 from repopilot_guard.project_diagnostics import diagnose_project
@@ -34,6 +34,7 @@ class CreateTaskBody(BaseModel):
     repository: str | None = None
     description: str = Field(min_length=1)
     task_mode: TaskMode = TaskMode.SAFE_ISOLATED
+    operation: TaskOperation = TaskOperation.CHANGE
     confirmation: str | None = None
     thread_id: str | None = None
     output_root: str | None = None
@@ -260,6 +261,7 @@ def create_app(
                 project_id=body.project_id,
                 workspace_selection=WorkspaceSelection(mode=body.task_mode.workspace_mode),
                 approved_mcp_tools=tuple(body.approved_mcp_tools),
+                operation=body.operation,
             )
             thread_id = body.thread_id or str(uuid4())
             store.create(
