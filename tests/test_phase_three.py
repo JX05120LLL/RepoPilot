@@ -489,3 +489,53 @@ class ContextTests(unittest.TestCase):
             imported.managed_path.write_text("externally modified", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "MANAGED_DOCUMENT_INTEGRITY_FAILED"):
                 documents.chunks_for(imported, project_id="project-a", repo_commit="commit-a")
+
+    def test_task_attachment_is_project_scoped_and_uses_controlled_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "external-requirements.md"
+            source.write_text("# 订单需求\n订单查询必须按租户隔离。\n", encoding="utf-8")
+            documents = ManagedDocumentStore(root / "state.sqlite")
+            imported = documents.import_document(source, project_id="project-a")
+
+            resolved = documents.resolve_for_task(
+                project_id="project-a",
+                repo_commit="commit-a",
+                document_ids=(imported.document_id,),
+            )
+            cross_project = documents.resolve_for_task(
+                project_id="project-b",
+                repo_commit="commit-a",
+                document_ids=(imported.document_id,),
+            )
+
+            self.assertEqual("READY", resolved.status)
+            self.assertEqual("TASK_ATTACHMENTS_READY", resolved.code)
+            self.assertEqual("task_attachment", resolved.contexts[0].source_type)
+            self.assertEqual(imported.document_id, resolved.documents[0]["document_id"])
+            self.assertNotIn(str(source), str(resolved.documents))
+            self.assertEqual("BLOCKED", cross_project.status)
+            self.assertEqual("TASK_ATTACHMENT_NOT_FOUND", cross_project.code)
+
+    def test_task_attachment_reserves_one_context_fragment_for_each_document(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            documents = ManagedDocumentStore(root / "state.sqlite")
+            imported = []
+            for index in range(4):
+                source = root / f"requirements-{index}.md"
+                source.write_text(f"# 需求 {index}\n" + ("内容" * 1_000), encoding="utf-8")
+                imported.append(documents.import_document(source, project_id="project-a"))
+
+            resolved = documents.resolve_for_task(
+                project_id="project-a",
+                repo_commit="commit-a",
+                document_ids=tuple(document.document_id for document in imported),
+            )
+
+            self.assertEqual("READY", resolved.status)
+            self.assertEqual(
+                [document.document_id for document in imported],
+                [context.document_id for context in resolved.contexts],
+            )
+            self.assertTrue(resolved.truncated)

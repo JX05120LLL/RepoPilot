@@ -136,6 +136,45 @@ class ContextBrokerTests(unittest.TestCase):
             self.assertGreater(result.snapshot.omitted_items, 0)
             self.assertIn("[上下文已按预算截断]", result.model_message)
 
+    def test_explicit_task_attachment_precedes_vector_retrieval_and_is_auditable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            attachment = RetrievedContext(
+                "订单查询必须按租户过滤。",
+                1.0,
+                "uploaded_documents/requirements.md",
+                1,
+                1,
+                "task_attachment",
+                "a" * 64,
+            )
+            result = ContextBroker(
+                budget=ContextBudget(
+                    total_chars=1_000,
+                    retrieval_chars=400,
+                    attached_document_chars=400,
+                    skill_catalog_chars=100,
+                    skill_instruction_chars=100,
+                    project_rule_chars=100,
+                )
+            ).assemble(
+                task_description="修复订单查询权限",
+                project_id="orders",
+                repo_commit="abc123",
+                workspace_root=root,
+                retrieval=_retrieval(),
+                permission=PermissionGrant.safe(),
+                attached_contexts=(attachment,),
+            )
+
+            self.assertIn("用户显式任务附件", result.model_message)
+            self.assertLess(
+                result.model_message.index("订单查询必须按租户过滤。"),
+                result.model_message.index("class OrderService"),
+            )
+            self.assertIn("task_attachment", {source.source_type for source in result.snapshot.sources})
+            self.assertNotIn("订单查询必须按租户过滤。", str(result.snapshot.to_dict()))
+
 
 if __name__ == "__main__":
     unittest.main()

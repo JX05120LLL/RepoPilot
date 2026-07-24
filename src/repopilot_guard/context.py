@@ -25,6 +25,9 @@ MAX_CHUNK_CHARACTERS = 1200
 CHUNK_OVERLAP_CHARACTERS = 200
 EMBEDDING_BATCH_SIZE = 10
 MAX_RETRIEVAL_CANDIDATES = 64
+# 一项任务最多绑定 4 份文档，每份先保证一个片段进入 Context Broker。
+# 其余内容仍可由受限的 retrieve_context 按需检索，不让第一份长文档挖占所有显式附件预算。
+MAX_ATTACHED_DOCUMENT_CHUNKS = 1
 TRANSIENT_OPERATION_ATTEMPTS = 3
 TRANSIENT_RETRY_BASE_DELAY_SECONDS = 1.0
 CODE_EXTENSIONS = frozenset({".java", ".xml"})
@@ -233,6 +236,31 @@ class ManagedDocument:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class AttachedDocumentContextResult:
+    """任务级文档附件的受控快照。
+
+    它不依赖向量相似度命中，因此用户明确添加的文档不会被静默忽略。
+    """
+
+    status: str
+    code: str
+    message: str
+    contexts: tuple[RetrievedContext, ...] = ()
+    documents: tuple[dict[str, str], ...] = ()
+    truncated: bool = False
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "code": self.code,
+            "message": self.message,
+            "documents": [dict(item) for item in self.documents],
+            "context_count": len(self.contexts),
+            "truncated": self.truncated,
+        }
+
+
 class ManagedDocumentStore:
     """保存用户主动选择的 MD/TXT 副本，不修改用户仓库或保留源文件绝对路径。"""
 
@@ -349,6 +377,84 @@ class ManagedDocumentStore:
             document_id=document.document_id,
             markdown=document.managed_path.suffix.lower() == ".md",
         )
+
+    def resolve_for_task(
+        self,
+        *,
+        project_id: str,
+        repo_commit: str,
+        document_ids: tuple[str, ...],
+    ) -> AttachedDocumentContextResult:
+        """将已经受控导入的文档转为当前任务的强制上下文。
+
+        用于模型的路径只是稳定显示名，从不返回用户的源文件路径或受管理的副本路径。
+        """
+
+        try:
+            documents = self.require_documents(project_id=project_id, document_ids=document_ids)
+            contexts: list[RetrievedContext] = []
+            truncated = False
+            for document in documents:
+                chunks = self.chunks_for(document, project_id=project_id, repo_commit=repo_commit)
+                selected = chunks[:MAX_ATTACHED_DOCUMENT_CHUNKS]
+                truncated = truncated or len(chunks) > len(selected)
+                contexts.extend(
+                    RetrievedContext(
+                        content=chunk.content,
+                        score=1.0,
+                        path=chunk.path,
+                        line_start=chunk.line_start,
+                        line_end=chunk.line_end,
+                        source_type="task_attachment",
+                        document_id=document.document_id,
+                    )
+                    for chunk in selected
+                )
+            return AttachedDocumentContextResult(
+                "READY",
+                "TASK_ATTACHMENTS_READY",
+                "用户显式附加的研发文档已冻结到当前任务上下文。",
+                tuple(contexts),
+                tuple(
+                    {
+                        "document_id": document.document_id,
+                        "display_name": document.display_name,
+                        "content_sha256": document.content_sha256,
+                    }
+                    for document in documents
+                ),
+                truncated,
+            )
+        except ValueError as error:
+            return AttachedDocumentContextResult(
+                "BLOCKED",
+                str(error),
+                "任务附件不可用、归属不匹配或完整性校验失败。",
+            )
+
+    def require_documents(self, *, project_id: str, document_ids: tuple[str, ...]) -> tuple[ManagedDocument, ...]:
+        """将文档 ID 绑定到项目；未知、跨项目或重复 ID 均按阻断处理。"""
+
+        if not project_id.strip():
+            raise ValueError("TASK_ATTACHMENTS_REQUIRE_PROJECT")
+        if len(document_ids) > 4:
+            raise ValueError("TASK_ATTACHMENTS_LIMIT_EXCEEDED")
+        if len(set(document_ids)) != len(document_ids):
+            raise ValueError("TASK_ATTACHMENTS_DUPLICATE")
+        if any(
+            not isinstance(document_id, str)
+            or len(document_id) != 64
+            or any(character not in "0123456789abcdef" for character in document_id)
+            for document_id in document_ids
+        ):
+            raise ValueError("TASK_ATTACHMENT_ID_INVALID")
+        if not document_ids:
+            return ()
+        available = {document.document_id: document for document in self.list_documents(project_id=project_id)}
+        missing = [document_id for document_id in document_ids if document_id not in available]
+        if missing:
+            raise ValueError("TASK_ATTACHMENT_NOT_FOUND")
+        return tuple(available[document_id] for document_id in document_ids)
 
     def list_documents(self, *, project_id: str) -> tuple[ManagedDocument, ...]:
         """列出项目已导入文档；结果不包含用户最初选择的外部路径。"""

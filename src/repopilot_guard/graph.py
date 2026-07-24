@@ -28,6 +28,7 @@ from repopilot_guard.capabilities import (
 )
 from repopilot_guard.config import AppSettings, ComponentCheck
 from repopilot_guard.context import (
+    AttachedDocumentContextResult,
     ContextChunkStore,
     ContextIndexer,
     ContextLoader,
@@ -36,6 +37,7 @@ from repopilot_guard.context import (
     ProjectMemoryResult,
     ProjectMemoryRetriever,
     RetrievalResult,
+    ManagedDocumentStore,
     VerifiedProjectMemoryWriter,
 )
 from repopilot_guard.context_broker import ContextBroker
@@ -183,6 +185,8 @@ class GraphState(TypedDict, total=False):
     verification_contract: dict[str, object] | None
     budget_snapshot: dict[str, object]
     approved_mcp_tools: list[str]
+    attached_document_ids: list[str]
+    attached_documents: list[dict[str, str]]
     project_id: str | None
     permission_mode: str
     permission_confirmation: str | None
@@ -503,11 +507,13 @@ class LiveContextService:
         indexer: ContextIndexer,
         retriever: ContextRetriever,
         memory_retriever: ProjectMemoryRetriever | None = None,
+        managed_documents: ManagedDocumentStore | None = None,
     ) -> None:
         self._loader = loader
         self._indexer = indexer
         self._retriever = retriever
         self._memory_retriever = memory_retriever
+        self._managed_documents = managed_documents
 
     def ingest(self, workspace: GraphWorkspaceContext, project_id: str, permission: PermissionGrant) -> IndexResult:
         chunks, skipped = self._loader.load_project(
@@ -541,6 +547,26 @@ class LiveContextService:
             memory_result.truncated or code_result.truncated,
             strategy="current_commit_hybrid_plus_verified_project_memory",
             candidate_count=memory_result.candidate_count + code_result.candidate_count,
+        )
+
+    def task_attachments(
+        self,
+        project_id: str,
+        repo_commit: str,
+        document_ids: tuple[str, ...],
+    ) -> AttachedDocumentContextResult:
+        """返回当前任务显式绑定的文档片段，与 Qdrant 排序结果互不替代。"""
+
+        if self._managed_documents is None:
+            return AttachedDocumentContextResult(
+                "BLOCKED",
+                "TASK_ATTACHMENTS_UNAVAILABLE",
+                "当前运行未配置受控研发文档存储，不能忽略任务附件继续执行。",
+            )
+        return self._managed_documents.resolve_for_task(
+            project_id=project_id,
+            repo_commit=repo_commit,
+            document_ids=document_ids,
         )
 
 
@@ -627,6 +653,7 @@ def create_live_graph(settings: AppSettings, checkpointer: SqliteSaver) -> Any:
                 ContextIndexer(bootstrapper.client, embeddings, ContextChunkStore(settings.state_db_path)),
                 ContextRetriever(bootstrapper.client, embeddings),
                 ProjectMemoryRetriever(bootstrapper.client, embeddings),
+                ManagedDocumentStore(settings.state_db_path),
             )
             research_model = OpenAIResearchModel(provider)
             project_memory_writer = VerifiedProjectMemoryWriter(bootstrapper.client, embeddings)
@@ -856,6 +883,13 @@ class CodingGraphFactory:
             snapshot = _permission_snapshot_from_state(state)
             _budget_from_state(state)
             TaskOperation(state["task_operation"])
+            TaskRequest(
+                repository=Path(state["repository"]),
+                description=state["task_description"],
+                output_root=Path(state["output_root"]),
+                task_id=state["task_id"],
+                attached_document_ids=tuple(state.get("attached_document_ids", [])),
+            )
         except ValueError:
             return _blocked(state, "TASK_SNAPSHOT_INVALID", "任务权限或预算快照无效，已阻断。")
         if (
@@ -905,6 +939,7 @@ class CodingGraphFactory:
                 else None
             ),
             approved_mcp_tools=tuple(state.get("approved_mcp_tools", [])),
+            attached_document_ids=tuple(state.get("attached_document_ids", [])),
             operation=TaskOperation(state["task_operation"]),
         )
         result = self._workspace_manager.prepare(request, permission)
@@ -981,6 +1016,24 @@ class CodingGraphFactory:
         if cancelled:
             return cancelled
         result = self._context_service.retrieve(state["task_description"], _project_id(state), str(state["base_commit"]))
+        attachment_contexts = ()
+        attachment_documents: list[dict[str, str]] = []
+        attachment_event: dict[str, object] | None = None
+        attached_document_ids = tuple(state.get("attached_document_ids", []))
+        if attached_document_ids:
+            attachment_resolver = getattr(self._context_service, "task_attachments", None)
+            if not callable(attachment_resolver):
+                return _blocked(
+                    state,
+                    "TASK_ATTACHMENTS_UNAVAILABLE",
+                    "当前 Agent 上下文服务不支持任务附件，已阻断而非忽略附件。",
+                )
+            attachments = attachment_resolver(_project_id(state), str(state["base_commit"]), attached_document_ids)
+            attachment_event = {"type": "TASK_ATTACHMENTS_RESOLVED", **attachments.to_dict()}
+            if attachments.status != "READY":
+                return _blocked(state, attachments.code, attachments.message, attachment_event)
+            attachment_contexts = attachments.contexts
+            attachment_documents = [dict(item) for item in attachments.documents]
         try:
             mcp_bindings = _mcp_bindings_from_state(state)
         except ValueError:
@@ -999,6 +1052,7 @@ class CodingGraphFactory:
             approved_capability_ids=state.get("approved_mcp_tools", []),
             capabilities=capabilities,
             bound_tool_ids=bound_tool_ids,
+            attached_contexts=attachment_contexts,
         )
         references = [
             {
@@ -1037,7 +1091,8 @@ class CodingGraphFactory:
             "status": "ANALYZE",
             "context_references": references,
             "context_snapshot": broker_result.snapshot.to_dict(),
-            "tool_events": [*state["tool_events"], event, broker_event],
+            "attached_documents": attachment_documents,
+            "tool_events": [*state["tool_events"], *([attachment_event] if attachment_event else []), event, broker_event],
             "messages": [*state["messages"], {"role": "system", "content": broker_result.model_message}],
         }
 
@@ -1628,6 +1683,8 @@ class GraphRunner:
                 "verification_contract": request.verification_contract.to_dict() if request.verification_contract else None,
                 "budget_snapshot": budget.to_dict(),
                 "approved_mcp_tools": list(request.approved_mcp_tools),
+                "attached_document_ids": list(request.attached_document_ids),
+                "attached_documents": [],
                 "project_id": request.project_id,
                 "permission_mode": grant.mode.value,
                 "permission_confirmation": grant.confirmation,
@@ -1814,14 +1871,15 @@ def _project_id(state: GraphState) -> str:
 
 
 def _allows_non_git_local_research(state: GraphState, result: PhaseOnePreflightResult) -> bool:
-    """完全本机控制可研究非 Git 项目，但安全隔离修复必须保留 Git 基线。"""
+    """完全本机控制下的只读研究可进入非 Git 目录，写入任务仍必须保留 Git 基线。"""
     repository_check = next((check for check in result.checks if check.component == "repository"), None)
     return bool(
         repository_check
         and state.get("workspace_mode") == WorkspaceMode.LOCAL.value
         and state.get("permission_mode") == PermissionMode.FULL.value
+        and state.get("task_operation") == TaskOperation.RESEARCH.value
         and repository_check.code == "REPOSITORY_PREFLIGHT_FAILED"
-        and repository_check.missing_fields == ("Repository is not a Git working tree.",)
+        and "Repository is not a Git working tree." in repository_check.missing_fields
     )
 
 

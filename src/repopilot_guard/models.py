@@ -11,6 +11,9 @@ from typing import Any
 from uuid import uuid4
 
 
+MAX_ATTACHED_DOCUMENTS = 4
+
+
 def default_output_root() -> Path:
     """将运行产物放在被检视仓库之外，避免污染原始工作区。"""
     return Path(gettempdir()) / "repopilot-guard" / "runs"
@@ -177,6 +180,7 @@ class TaskRequest:
     workspace_selection: WorkspaceSelection = field(default_factory=WorkspaceSelection)
     verification_contract: VerificationContract | None = None
     approved_mcp_tools: tuple[str, ...] = ()
+    attached_document_ids: tuple[str, ...] = ()
     budget: TaskBudget = field(default_factory=TaskBudget)
     operation: TaskOperation = TaskOperation.CHANGE
 
@@ -196,6 +200,17 @@ class TaskRequest:
             for capability_id in self.approved_mcp_tools
         ):
             raise ValueError("approved_mcp_tools must contain MCP capability IDs.")
+        if len(self.attached_document_ids) > MAX_ATTACHED_DOCUMENTS:
+            raise ValueError("attached_document_ids supports at most 4 documents.")
+        if any(
+            not isinstance(document_id, str)
+            or len(document_id) != 64
+            or any(character not in "0123456789abcdef" for character in document_id)
+            for document_id in self.attached_document_ids
+        ):
+            raise ValueError("attached_document_ids must contain managed document IDs.")
+        if len(set(self.attached_document_ids)) != len(self.attached_document_ids):
+            raise ValueError("attached_document_ids must not contain duplicates.")
 
         repository = self.repository.expanduser().resolve()
         output_root = self.output_root.expanduser().resolve()
@@ -210,6 +225,7 @@ class TaskRequest:
         object.__setattr__(self, "output_root", output_root)
         # 任务快照使用确定性顺序，避免同一授权集合产生不同恢复状态。
         object.__setattr__(self, "approved_mcp_tools", tuple(sorted(set(self.approved_mcp_tools))))
+        object.__setattr__(self, "attached_document_ids", tuple(self.attached_document_ids))
 
 
 @dataclass(frozen=True, slots=True)

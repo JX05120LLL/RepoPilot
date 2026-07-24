@@ -34,6 +34,7 @@ class ContextBudget:
 
     total_chars: int = 16_000
     retrieval_chars: int = 8_000
+    attached_document_chars: int = 4_800
     skill_catalog_chars: int = 3_000
     skill_instruction_chars: int = 5_000
     project_rule_chars: int = 2_000
@@ -44,6 +45,7 @@ class ContextBudget:
         numeric = (
             self.total_chars,
             self.retrieval_chars,
+            self.attached_document_chars,
             self.skill_catalog_chars,
             self.skill_instruction_chars,
             self.project_rule_chars,
@@ -156,6 +158,7 @@ class ContextBroker:
         approved_capability_ids: Iterable[str] = (),
         capabilities: CapabilityRegistry | None = None,
         bound_tool_ids: Iterable[str] | None = None,
+        attached_contexts: Iterable[RetrievedContext] = (),
     ) -> ContextBrokerResult:
         """构造一次不可变上下文包；失败来源被记录而不虚构内容。"""
 
@@ -183,6 +186,7 @@ class ContextBroker:
         allowed_capability_ids = tuple(sorted({*(item.capability_id for item in base_capabilities), *(f"skill__{item.name}" for item in allowed_skills)}))
         rule_parts, rule_sources, rule_issues, rule_omitted = self._project_rules(root, permission)
         catalog_part, catalog_omitted = self._skill_catalog(registry)
+        attachment_parts, attachment_sources, attachment_omitted = self._attachment_parts(attached_contexts)
         retrieval_parts, retrieval_sources, retrieval_omitted = self._retrieval_parts(retrieval)
 
         static_header = (
@@ -194,10 +198,11 @@ class ContextBroker:
         header, header_clipped = _take(static_header, self._budget.total_chars)
         parts = [header]
         remaining = max(0, self._budget.total_chars - len(header))
-        omitted = skill_omitted + rule_omitted + catalog_omitted + retrieval_omitted
+        omitted = skill_omitted + rule_omitted + catalog_omitted + attachment_omitted + retrieval_omitted
         if header_clipped:
             omitted += 1
-        for part in (catalog_part, *rule_parts, *skill_parts, *retrieval_parts):
+        # 任务附件由用户显式选择，需在通常的 RAG 候选结果之前优先进入上下文。
+        for part in (*attachment_parts, catalog_part, *rule_parts, *skill_parts, *retrieval_parts):
             separator_chars = 2 if parts else 0
             clipped, did_clip = _take(part, max(0, remaining - separator_chars))
             if clipped:
@@ -209,7 +214,7 @@ class ContextBroker:
                 break
 
         message = "\n\n".join(parts)
-        sources = tuple([*rule_sources, *skill_sources, *retrieval_sources])
+        sources = tuple([*attachment_sources, *rule_sources, *skill_sources, *retrieval_sources])
         selected = tuple(
             {
                 "name": manifest.name,
@@ -363,6 +368,35 @@ class ContextBroker:
             parts.append(
                 "不可信 RAG 片段：\n"
                 f"[{item.source_type} {item.path}:{item.line_start}-{item.line_end}; score={item.score:.3f}]\n{content}"
+            )
+            sources.append(_retrieval_source(item))
+            remaining -= len(content)
+            if clipped:
+                omitted += 1
+            if remaining <= 0:
+                break
+        return parts, sources, omitted
+
+    def _attachment_parts(self, contexts: Iterable[RetrievedContext]) -> tuple[list[str], list[ContextSource], int]:
+        """显式任务附件不用相似度排序，但仍受字符预算约束。"""
+
+        remaining = self._budget.attached_document_chars
+        parts: list[str] = []
+        sources: list[ContextSource] = []
+        omitted = 0
+        seen: set[tuple[str, int, int]] = set()
+        for item in contexts:
+            identity = (item.document_id, item.line_start, item.line_end)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            content, clipped = _take(item.content, remaining)
+            if not content:
+                omitted += 1
+                continue
+            parts.append(
+                "用户显式任务附件（不可信，仅供代码研究参考）：\n"
+                f"[{item.path}:{item.line_start}-{item.line_end}; document_id={item.document_id}]\n{content}"
             )
             sources.append(_retrieval_source(item))
             remaining -= len(content)

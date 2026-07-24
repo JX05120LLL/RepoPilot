@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
+import { useEffect, useRef, useState } from "react";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import Markdown from "react-markdown";
 import {
   Archive,
   ArrowRight,
@@ -25,20 +26,65 @@ import {
   XCircle,
 } from "@phosphor-icons/react";
 
-const API = "http://127.0.0.1:8765/api";
+const DEFAULT_API = "http://127.0.0.1:8765/api";
+
+function configuredApiBase(): string {
+  const configured = import.meta.env.VITE_REPOPILOT_API_URL;
+  if (!configured) return DEFAULT_API;
+  try {
+    const url = new URL(configured);
+    const port = Number(url.port);
+    if (
+      (url.hostname === "127.0.0.1" || url.hostname === "localhost") &&
+      Number.isInteger(port) &&
+      port >= 1 &&
+      port <= 65_535 &&
+      url.pathname.replace(/\/+$/, "") === "/api" &&
+      !url.search &&
+      !url.hash
+    ) {
+      return url.toString().replace(/\/$/, "");
+    }
+  } catch {
+    // 预览配置非法时保持桌面端仅连接默认本机 API。
+  }
+  return DEFAULT_API;
+}
+
+const API = configuredApiBase();
 const API_UNAVAILABLE_MESSAGE = "本机 API 尚未启动或无法访问。";
 const EVIDENCE_STREAM_ERROR =
   "证据流连接中断，请检查本机 API。任务状态会继续尝试轮询。";
+const TASK_EVIDENCE_EXPORT_CAPABILITY = "task_evidence_export";
 type Mode = "safe-isolated" | "full-local";
 type Operation = "change" | "research";
 type WorkspaceView = "task" | "context" | "review";
+type EvidenceScope = "key" | "all";
 type Project = {
   project_id: string;
   display_name: string;
   root_path?: string;
   is_git_repository?: boolean;
 };
-type Interrupt = { type: string; message?: string };
+type Interrupt = {
+  type: string;
+  message?: string;
+  candidate_files?: unknown;
+  recipe?: unknown;
+  target_test_class?: unknown;
+};
+type TaskProgressStage = {
+  id: string;
+  label: string;
+  state: "completed" | "current" | "pending" | "passed" | "failed" | "blocked" | "cancelled" | "unverified";
+};
+type TaskProgress = {
+  current_stage: string;
+  summary: string;
+  terminal: boolean;
+  terminal_kind: string | null;
+  stages: TaskProgressStage[];
+};
 type Task = {
   thread_id: string;
   trace_id?: string;
@@ -53,11 +99,14 @@ type Task = {
   status: string;
   pending_approval: boolean;
   verdict?: string | null;
+  progress?: TaskProgress;
   archived_at?: string | null;
   interrupts?: Interrupt[];
   state?: {
     task_operation?: string;
     task_description?: string;
+    plan?: Record<string, unknown> | null;
+    pending_approval_action?: string | null;
   };
 };
 type Artifact = {
@@ -73,6 +122,13 @@ type ArtifactVersion = {
   sha256: string;
   size_bytes: number;
   created_at: string;
+};
+type TaskEvidenceExport = {
+  thread_id: string;
+  artifact_count: number;
+  event_count: number;
+  size_bytes: number;
+  sha256: string;
 };
 type TimelineEvent = {
   id: string;
@@ -116,6 +172,11 @@ type ContextSnapshot = {
   }>;
   bound_tool_ids: string[];
   capability_ids: string[];
+};
+type TaskAttachment = {
+  document_id: string;
+  display_name: string;
+  content_sha256: string;
 };
 type Telemetry = {
   node_count: number;
@@ -174,6 +235,21 @@ type RuntimeHealth = {
   code: string;
   message?: string;
 };
+type RuntimeConfiguration = {
+  status: "READY" | "BLOCKED";
+  code?: string;
+  message?: string;
+  writable: boolean;
+  restart_required: boolean;
+  chat?: { base_url: string; model: string; api_key_configured: boolean };
+  embedding?: {
+    base_url: string;
+    model: string;
+    dimensions: number | null;
+    api_key_configured: boolean;
+  };
+  qdrant?: { url: string };
+};
 type ProjectModeReadiness = {
   status: "READY" | "BLOCKED";
   code: string;
@@ -201,6 +277,13 @@ type UnifiedDiffLine = {
   content: string;
   oldLine: number | null;
   newLine: number | null;
+};
+
+type DiffFileSummary = {
+  path: string;
+  additions: number;
+  deletions: number;
+  binary: boolean;
 };
 
 const artifactLabels: Record<string, string> = {
@@ -260,6 +343,44 @@ const eventSummaryLabels: Record<string, string> = {
   WAITING_APPROVAL: "任务已暂停，正在等待人工审批。",
   MODEL_USAGE_REPORTED: "本次模型用量已纳入任务审计。",
 };
+
+const keyEvidenceTypes = new Set([
+  "TASK_CREATED",
+  "TASK_BUDGET_SNAPSHOT",
+  "WORKSPACE_PREPARED",
+  "PREFLIGHT_COMPLETED",
+  "CONTEXT_INGESTED",
+  "CONTEXT_RETRIEVED",
+  "CONTEXT_BROKER_ASSEMBLED",
+  "PLAN_GENERATED",
+  "APPROVAL_REQUIRED",
+  "PLAN_APPROVED",
+  "EXECUTION_APPROVED",
+  "TASK_RUNTIME_FAILED",
+  "TASK_STATUS_CHANGED",
+]);
+
+const keyEvidenceNodes = new Set([
+  "INTAKE",
+  "WORKSPACE",
+  "PREFLIGHT",
+  "PLAN",
+  "PLAN_APPROVAL",
+  "EXECUTION_APPROVAL",
+  "PATCH",
+  "VERIFY",
+  "REVIEW",
+  "REPORT",
+]);
+
+function isKeyEvidenceEvent(event: TimelineEvent): boolean {
+  if (keyEvidenceTypes.has(event.type)) return true;
+  const node = event.payload.node;
+  if (typeof node === "string" && keyEvidenceNodes.has(node)) return true;
+  return /APPROVAL|PATCH|VERIFY|VERIFICATION|FAILED|BLOCKED|CANCELLED/.test(
+    event.type,
+  );
+}
 
 function eventSummary(event: TimelineEvent): string {
   const candidates = [
@@ -397,19 +518,96 @@ function parseUnifiedDiff(content: string): UnifiedDiffLine[] {
   });
 }
 
+function summarizeUnifiedDiff(content: string): DiffFileSummary[] {
+  const files: DiffFileSummary[] = [];
+  let current: DiffFileSummary | null = null;
+
+  for (const line of content.replace(/\r\n/g, "\n").split("\n")) {
+    const header = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
+    if (header) {
+      current = {
+        path: header[2],
+        additions: 0,
+        deletions: 0,
+        binary: false,
+      };
+      files.push(current);
+      continue;
+    }
+    if (!current) continue;
+    if (line.startsWith("Binary files ") || line.startsWith("GIT binary patch")) {
+      current.binary = true;
+      continue;
+    }
+    if (line.startsWith("+") && !line.startsWith("+++")) {
+      current.additions += 1;
+    } else if (line.startsWith("-") && !line.startsWith("---")) {
+      current.deletions += 1;
+    }
+  }
+  return files;
+}
+
+function DiffSummary({ files }: { files: DiffFileSummary[] }) {
+  const additions = files.reduce((total, file) => total + file.additions, 0);
+  const deletions = files.reduce((total, file) => total + file.deletions, 0);
+  const visibleFiles = files.slice(0, 12);
+
+  return (
+    <section className="diff-summary" aria-label="代码变更摘要">
+      <div className="diff-summary-facts">
+        <span><b>{files.length}</b> 个文件</span>
+        <span className="diff-add"><b>+{additions}</b> 新增</span>
+        <span className="diff-remove"><b>-{deletions}</b> 删除</span>
+      </div>
+      {files.length > 0 ? (
+        <ul className="diff-file-list">
+          {visibleFiles.map((file) => (
+            <li key={file.path}>
+              <code title={file.path}>{file.path}</code>
+              {file.binary ? (
+                <span className="diff-binary">二进制</span>
+              ) : (
+                <span><i className="diff-add">+{file.additions}</i><i className="diff-remove">-{file.deletions}</i></span>
+              )}
+            </li>
+          ))}
+          {files.length > visibleFiles.length && (
+            <li className="diff-file-more">其余 {files.length - visibleFiles.length} 个文件请查看下方完整 Diff</li>
+          )}
+        </ul>
+      ) : (
+        <p>当前产物没有可解析的文件级变更。</p>
+      )}
+    </section>
+  );
+}
+
 function ArtifactContent({ kind, content }: { kind: string; content: string }) {
   if (kind === "git_diff") {
     const lines = parseUnifiedDiff(content);
+    const files = summarizeUnifiedDiff(content);
     return (
       <div className="artifact-content diff-view" aria-label="代码变更 Diff">
-        {lines.map((line, index) => (
-          <div className={"diff-line diff-" + line.kind} key={index}>
-            <span>{line.oldLine ?? ""}</span>
-            <span>{line.newLine ?? ""}</span>
-            <code>{line.content || " "}</code>
-          </div>
-        ))}
+        <DiffSummary files={files} />
+        <div className="diff-code-lines">
+          {lines.map((line, index) => (
+            <div className={"diff-line diff-" + line.kind} key={index}>
+              <span>{line.oldLine ?? ""}</span>
+              <span>{line.newLine ?? ""}</span>
+              <code>{line.content || " "}</code>
+            </div>
+          ))}
+        </div>
       </div>
+    );
+  }
+
+  if (kind === "report" || kind === "plan_markdown") {
+    return (
+      <article className="artifact-content markdown-content">
+        <Markdown>{content}</Markdown>
+      </article>
     );
   }
 
@@ -549,6 +747,7 @@ export function App() {
   const [showTaskSearch, setShowTaskSearch] = useState(false);
   const [taskQuery, setTaskQuery] = useState("");
   const [events, setEvents] = useState<TimelineEvent[]>([]);
+  const [evidenceScope, setEvidenceScope] = useState<EvidenceScope>("key");
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [selectedArtifact, setSelectedArtifact] = useState("");
   const [artifactVersions, setArtifactVersions] = useState<ArtifactVersion[]>(
@@ -558,7 +757,11 @@ export function App() {
     number | null
   >(null);
   const [artifactContent, setArtifactContent] = useState("");
+  const [exportPath, setExportPath] = useState("");
+  const [exportingEvidence, setExportingEvidence] = useState(false);
+  const [evidenceExport, setEvidenceExport] = useState<TaskEvidenceExport | null>(null);
   const [revisionComment, setRevisionComment] = useState("");
+  const [approvalBusy, setApprovalBusy] = useState(false);
   const [requestError, setRequestError] = useState("");
   const [mcpServer, setMcpServer] = useState("");
   const [mcpConfigPath, setMcpConfigPath] = useState(".repopilot/mcp.toml");
@@ -568,20 +771,38 @@ export function App() {
   const [approvedMcpTools, setApprovedMcpTools] = useState<string[]>([]);
   const [contextSnapshot, setContextSnapshot] =
     useState<ContextSnapshot | null>(null);
+  const [taskAttachments, setTaskAttachments] = useState<TaskAttachment[]>([]);
   const [telemetry, setTelemetry] = useState<Telemetry | null>(null);
   const [plugins, setPlugins] = useState<Plugin[]>([]);
   const [pluginSource, setPluginSource] = useState("");
   const [pluginBusy, setPluginBusy] = useState(false);
   const [apiReady, setApiReady] = useState(false);
+  const [apiCapabilities, setApiCapabilities] = useState<string[]>([]);
+  const taskSearchRef = useRef<HTMLInputElement>(null);
+  const taskDescriptionRef = useRef<HTMLTextAreaElement>(null);
   const [runtimeHealth, setRuntimeHealth] = useState<RuntimeHealth>({
     status: "UNKNOWN",
     code: "API_NOT_CHECKED",
   });
+  const [runtimeConfiguration, setRuntimeConfiguration] =
+    useState<RuntimeConfiguration | null>(null);
+  const [runtimeConfigurationBusy, setRuntimeConfigurationBusy] = useState(false);
+  const [runtimeConfigurationMessage, setRuntimeConfigurationMessage] = useState("");
+  const [chatBaseUrl, setChatBaseUrl] = useState("");
+  const [chatApiKey, setChatApiKey] = useState("");
+  const [chatModel, setChatModel] = useState("");
+  const [clearChatApiKey, setClearChatApiKey] = useState(false);
+  const [embeddingBaseUrl, setEmbeddingBaseUrl] = useState("");
+  const [embeddingApiKey, setEmbeddingApiKey] = useState("");
+  const [embeddingModel, setEmbeddingModel] = useState("");
+  const [embeddingDimensions, setEmbeddingDimensions] = useState("");
+  const [clearEmbeddingApiKey, setClearEmbeddingApiKey] = useState(false);
+  const [qdrantUrl, setQdrantUrl] = useState("");
   const [documentPath, setDocumentPath] = useState("");
   const [documentBusy, setDocumentBusy] = useState(false);
-  const [documentResult, setDocumentResult] =
-    useState<DocumentIndexResult | null>(null);
   const [documents, setDocuments] = useState<ManagedDocument[]>([]);
+  const [attachedDocumentIds, setAttachedDocumentIds] = useState<string[]>([]);
+  const [showDocumentPicker, setShowDocumentPicker] = useState(false);
   const [projectDiagnosis, setProjectDiagnosis] = useState<ProjectDiagnosis | null>(null);
 
   async function loadProjects() {
@@ -607,6 +828,29 @@ export function App() {
     if (!response.ok) throw new Error("无法读取插件目录");
     const data = (await response.json()) as { plugins?: Plugin[] };
     setPlugins(data.plugins ?? []);
+  }
+
+  async function loadRuntimeConfiguration() {
+    const response = await fetch(`${API}/runtime/configuration`);
+    if (response.status === 404 || response.status === 405) {
+      setRuntimeConfiguration(null);
+      return;
+    }
+    if (!response.ok) throw new Error("无法读取运行配置");
+    const payload = (await response.json()) as RuntimeConfiguration;
+    setRuntimeConfiguration(payload);
+    if (payload.chat) {
+      setChatBaseUrl(payload.chat.base_url);
+      setChatModel(payload.chat.model);
+    }
+    if (payload.embedding) {
+      setEmbeddingBaseUrl(payload.embedding.base_url);
+      setEmbeddingModel(payload.embedding.model);
+      setEmbeddingDimensions(
+        payload.embedding.dimensions === null ? "" : String(payload.embedding.dimensions),
+      );
+    }
+    if (payload.qdrant) setQdrantUrl(payload.qdrant.url);
   }
 
   async function loadDocuments(targetProjectId: string) {
@@ -646,6 +890,7 @@ export function App() {
       const payload = (await response.json()) as {
         status?: string;
         agent_status?: "READY" | "BLOCKED";
+        capabilities?: unknown;
         dependencies?: Array<{
           status?: string;
           code?: string;
@@ -659,6 +904,10 @@ export function App() {
       const ready =
         response.ok && payload.status === "READY" && hasCurrentContract;
       setApiReady(ready);
+      const capabilities = Array.isArray(payload.capabilities)
+        ? payload.capabilities.filter((item): item is string => typeof item === "string")
+        : [];
+      setApiCapabilities(ready ? capabilities : []);
       const blockedDependency = payload.dependencies?.find(
         (item) => item.status === "BLOCKED",
       );
@@ -681,6 +930,7 @@ export function App() {
         );
     } catch {
       setApiReady(false);
+      setApiCapabilities([]);
       setRuntimeHealth({
         status: "UNKNOWN",
         code: "API_UNAVAILABLE",
@@ -694,9 +944,31 @@ export function App() {
       loadProjects(),
       loadTasks(showArchived),
       loadPlugins(),
+      loadRuntimeConfiguration(),
       checkApiHealth(),
     ]).catch(() => setRequestError(API_UNAVAILABLE_MESSAGE));
   }, [showArchived]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const shortcut = event.ctrlKey || event.metaKey;
+      if (shortcut && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setShowTaskSearch(true);
+        window.requestAnimationFrame(() => taskSearchRef.current?.focus());
+        return;
+      }
+      if (shortcut && event.key.toLowerCase() === "n") {
+        event.preventDefault();
+        beginNewTask();
+        window.requestAnimationFrame(() => taskDescriptionRef.current?.focus());
+        return;
+      }
+      if (event.key === "Escape") setShowTaskSearch(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   useEffect(() => {
     const timer = window.setInterval(() => void checkApiHealth(), 5_000);
@@ -704,6 +976,9 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    setAttachedDocumentIds([]);
+    setDocumentPath("");
+    setShowDocumentPicker(false);
     void loadDocuments(projectId).catch((error) =>
       setRequestError(
         error instanceof Error ? error.message : "无法读取已导入研发文档",
@@ -811,6 +1086,7 @@ export function App() {
         const contextPayload = contextResponse.ok
           ? ((await contextResponse.json()) as {
               context_snapshot?: ContextSnapshot;
+              attached_documents?: TaskAttachment[];
             })
           : {};
         const telemetryResponse = await fetch(
@@ -837,6 +1113,7 @@ export function App() {
           });
           setArtifacts(artifactPayload.artifacts ?? []);
           setContextSnapshot(contextPayload.context_snapshot ?? null);
+          setTaskAttachments(contextPayload.attached_documents ?? []);
           setTelemetry(telemetryPayload);
         }
       } catch {
@@ -934,6 +1211,48 @@ export function App() {
     };
   }, [task?.thread_id, selectedArtifact, selectedArtifactVersion]);
 
+  useEffect(() => {
+    setEvidenceScope("key");
+  }, [task?.thread_id]);
+
+  useEffect(() => {
+    function isEditableTarget(target: EventTarget | null): boolean {
+      return (
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target instanceof HTMLSelectElement ||
+        (target instanceof HTMLElement && target.isContentEditable)
+      );
+    }
+
+    function handleShortcut(event: KeyboardEvent) {
+      const key = event.key.toLowerCase();
+      if ((event.ctrlKey || event.metaKey) && key === "k") {
+        event.preventDefault();
+        setShowTaskSearch(true);
+        window.requestAnimationFrame(() => taskSearchRef.current?.focus());
+        return;
+      }
+      if (event.key === "Escape" && showTaskSearch) {
+        event.preventDefault();
+        setShowTaskSearch(false);
+        setTaskQuery("");
+        return;
+      }
+      if (
+        (event.ctrlKey || event.metaKey) &&
+        key === "n" &&
+        !isEditableTarget(event.target)
+      ) {
+        event.preventDefault();
+        beginNewTask();
+      }
+    }
+
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
+  }, [showTaskSearch]);
+
   async function addProject() {
     if (!projectPath.trim()) return;
     setRequestError("");
@@ -1013,6 +1332,54 @@ export function App() {
     }
   }
 
+  async function saveRuntimeConfiguration() {
+    if (!runtimeConfiguration?.writable) return;
+    setRuntimeConfigurationBusy(true);
+    setRuntimeConfigurationMessage("");
+    setRequestError("");
+    const dimensions = embeddingDimensions.trim();
+    const payload: Record<string, string | number> = {};
+    const addText = (name: string, value: string) => {
+      if (value.trim()) payload[name] = value.trim();
+    };
+    addText("chat_base_url", chatBaseUrl);
+    addText("chat_model", chatModel);
+    addText("embedding_base_url", embeddingBaseUrl);
+    addText("embedding_model", embeddingModel);
+    addText("qdrant_url", qdrantUrl);
+    if (dimensions) payload.embedding_dimensions = Number(dimensions);
+    if (chatApiKey) payload.chat_api_key = chatApiKey;
+    else if (clearChatApiKey) payload.chat_api_key = "";
+    if (embeddingApiKey) payload.embedding_api_key = embeddingApiKey;
+    else if (clearEmbeddingApiKey) payload.embedding_api_key = "";
+    try {
+      const response = await fetch(`${API}/runtime/configuration`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const raw = (await response.json()) as RuntimeConfiguration & {
+        detail?: { code?: string; message?: string } | string;
+      };
+      const detail = typeof raw.detail === "object" ? raw.detail : undefined;
+      if (!response.ok) {
+        throw new Error(detail?.message ?? detail?.code ?? "运行配置保存失败");
+      }
+      setRuntimeConfiguration(raw);
+      setChatApiKey("");
+      setEmbeddingApiKey("");
+      setClearChatApiKey(false);
+      setClearEmbeddingApiKey(false);
+      setRuntimeConfigurationMessage(
+        raw.message ?? "配置已保存；重启 RepoPilot Desktop 后生效。",
+      );
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "运行配置保存失败");
+    } finally {
+      setRuntimeConfigurationBusy(false);
+    }
+  }
+
   async function chooseProjectDirectory() {
     try {
       const selected = await open({
@@ -1043,10 +1410,25 @@ export function App() {
     }
   }
 
-  async function indexDocument() {
+  function toggleTaskDocument(documentId: string, selected: boolean) {
+    if (selected && !attachedDocumentIds.includes(documentId) && attachedDocumentIds.length >= 4) {
+      setRequestError("单个任务最多附加 4 份研发文档，请先移除已有附件。");
+      return;
+    }
+    setAttachedDocumentIds((current) => {
+      if (!selected) return current.filter((id) => id !== documentId);
+      if (current.includes(documentId)) return current;
+      return [...current, documentId];
+    });
+  }
+
+  async function indexDocument(attachToCurrentTask = true) {
     if (!projectId || !documentPath.trim()) return;
+    if (attachToCurrentTask && attachedDocumentIds.length >= 4) {
+      setRequestError("单个任务最多附加 4 份研发文档，请先移除已有附件。");
+      return;
+    }
     setDocumentBusy(true);
-    setDocumentResult(null);
     setRequestError("");
     try {
       const response = await fetch(
@@ -1068,13 +1450,68 @@ export function App() {
             payload.code ??
             (typeof raw.detail === "string" ? raw.detail : "文档索引失败"),
         );
-      setDocumentResult(payload);
       setDocumentPath("");
       await loadDocuments(projectId);
+      const documentId = payload.document?.document_id;
+      if (attachToCurrentTask && documentId) {
+        setAttachedDocumentIds((current) =>
+          current.includes(documentId) ? current : [...current, documentId],
+        );
+      }
     } catch (error) {
       setRequestError(error instanceof Error ? error.message : "文档索引失败");
     } finally {
       setDocumentBusy(false);
+    }
+  }
+
+  async function exportEvidence() {
+    if (!task || taskIsRunning) return;
+    setRequestError("");
+    setEvidenceExport(null);
+    let output = exportPath.trim();
+    if (!output) {
+      try {
+        const selected = await save({
+          title: "导出 RepoPilot 审计证据包",
+          defaultPath: `repopilot-${task.thread_id}.zip`,
+          filters: [{ name: "RepoPilot 审计包", extensions: ["zip"] }],
+        });
+        if (!selected) return;
+        output = selected;
+      } catch {
+        setRequestError(
+          "系统保存对话框仅在已安装的 RepoPilot Desktop 中可用；浏览器预览时请填写 ZIP 的绝对路径。",
+        );
+        return;
+      }
+    }
+    setExportingEvidence(true);
+    try {
+      const response = await fetch(`${API}/tasks/${encodeURIComponent(task.thread_id)}/export`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ output }),
+      });
+      const raw = (await response.json()) as {
+        export?: TaskEvidenceExport;
+        detail?: string | { code?: string; message?: string };
+      };
+      if (!response.ok) {
+        const detail = raw.detail;
+        throw new Error(
+          typeof detail === "string"
+            ? detail
+            : detail?.message ?? detail?.code ?? "审计证据包导出失败",
+        );
+      }
+      if (!raw.export) throw new Error("审计证据包导出结果无效");
+      setEvidenceExport(raw.export);
+      setExportPath("");
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "审计证据包导出失败");
+    } finally {
+      setExportingEvidence(false);
     }
   }
 
@@ -1105,6 +1542,7 @@ export function App() {
     setSelectedArtifactVersion(null);
     setArtifactContent("");
     setContextSnapshot(null);
+    setTaskAttachments([]);
     setTelemetry(null);
     setRequestError("");
     try {
@@ -1118,6 +1556,7 @@ export function App() {
           operation,
           confirmation: confirmed ? "我已了解完全权限风险" : null,
           approved_mcp_tools: approvedMcpTools,
+          attached_document_ids: attachedDocumentIds,
         }),
       });
       const payload = await response.json();
@@ -1175,22 +1614,32 @@ export function App() {
   }
 
   async function approve(decision: "approve" | "revise" | "reject") {
-    if (!task) return;
-    const response = await fetch(`${API}/tasks/${task.thread_id}/approval`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        decision,
-        comment: decision === "revise" ? revisionComment : null,
-      }),
-    });
-    const payload = await response.json();
-    if (!response.ok) {
-      setRequestError(payload.detail ?? "审批提交失败");
-      return;
+    if (!task || approvalBusy) return;
+    setApprovalBusy(true);
+    setRequestError("");
+    try {
+      const response = await fetch(`${API}/tasks/${task.thread_id}/approval`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          decision,
+          comment: decision === "revise" ? revisionComment : null,
+        }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        setRequestError(
+          typeof payload.detail === "string" ? payload.detail : "审批提交失败",
+        );
+        return;
+      }
+      if (decision === "revise") setRevisionComment("");
+      setTask(payload as Task);
+    } catch {
+      setRequestError("审批请求未送达本机 API，请检查服务状态后重试。");
+    } finally {
+      setApprovalBusy(false);
     }
-    if (decision === "revise") setRevisionComment("");
-    setTask(payload as Task);
   }
 
   async function cancelTask() {
@@ -1233,6 +1682,7 @@ export function App() {
     setSelectedArtifactVersion(null);
     setArtifactContent("");
     setContextSnapshot(null);
+    setTaskAttachments([]);
     setTelemetry(null);
     setDescription("");
     setMode("safe-isolated");
@@ -1241,6 +1691,12 @@ export function App() {
     setRevisionComment("");
     setRequestError("");
     setActiveView("task");
+  }
+
+  function applyTaskStarter(value: string) {
+    setDescription(value);
+    setRequestError("");
+    window.requestAnimationFrame(() => taskDescriptionRef.current?.focus());
   }
 
   async function selectTask(selected: Task) {
@@ -1288,7 +1744,7 @@ export function App() {
   const taskAdmissionMessage = operationAllowed
     ? ""
     : mode === "full-local" && operation === "change"
-      ? "当前项目不是 Git 仓库，无法生成可信基线和 Diff；请使用仅研究，或先初始化 Git 并创建提交。"
+      ? "当前项目不是 Git 仓库，无法生成可信基线和 Diff；请使用计划模式，或先初始化 Git 并创建提交。"
       : (selectedModeReadiness?.message ?? "当前项目不支持所选任务类型。");
   const safeModeBlockedByProject = Boolean(
     currentProject && (safeModeReadiness ? safeModeReadiness.status !== "READY" : !currentProject.is_git_repository),
@@ -1298,13 +1754,65 @@ export function App() {
     ? projectDiagnosis.task_modes.safe_isolated.status === "READY"
       ? "隔离修复可用"
       : projectDiagnosis.task_modes.full_local.code === "FULL_LOCAL_RESEARCH_ONLY"
-        ? "仅完整本机研究"
+        ? "仅完整本机计划"
         : projectDiagnosis.task_modes.safe_isolated.code
     : currentProject
       ? currentProject.is_git_repository
         ? "Git 基线待诊断"
         : "非 Git 项目"
       : "等待选择项目";
+  const projectReadinessItems = currentProject
+    ? [
+        {
+          label: "工作区",
+          value:
+            projectDiagnosis?.task_modes.safe_isolated.status === "READY"
+              ? "安全隔离可用"
+              : "完整本机研究",
+        },
+        {
+          label: "Git 基线",
+          value: currentProject.is_git_repository ? "已识别" : "未初始化",
+        },
+        {
+          label: "工程 Profile",
+          value:
+            projectDiagnosis?.profiles.java_maven.status === "READY"
+              ? "Java / Maven"
+              : "等待预检",
+        },
+      ]
+    : [];
+  const taskStarters =
+    operation === "research"
+      ? [
+          {
+            label: "梳理项目结构",
+            value: "梳理当前项目的模块结构、主要入口和核心业务链路，并给出带来源的说明。",
+          },
+          {
+            label: "定位相关代码",
+            value: "根据需求描述定位相关的 Controller、Service、Mapper 和测试文件，并说明每个文件的职责。",
+          },
+          {
+            label: "生成修改计划",
+            value: "分析当前项目中潜在的参数校验、权限隔离和异常处理风险，生成一份带证据引用的修改计划。",
+          },
+        ]
+      : [
+          {
+            label: "修复参数校验",
+            value: "定位接口参数校验缺失的问题，提出最小修改方案，并使用现有 Maven 测试验证。",
+          },
+          {
+            label: "检查权限过滤",
+            value: "检查当前查询链路中的租户或权限过滤是否完整，定位风险并在最小范围内修复。",
+          },
+          {
+            label: "补充回归测试",
+            value: "分析当前变更涉及的行为边界，定位已有测试并补充最小的 Maven 回归测试。",
+          },
+        ];
   const taskIsRunning = Boolean(
     task &&
       !["REPORT", "FAILED", "PASSED", "BLOCKED", "CANCELLED", "UNVERIFIED"].includes(
@@ -1312,6 +1820,17 @@ export function App() {
       ),
   );
   const taskOutcome = task ? resolveTaskOutcome(task, taskIsRunning) : null;
+  const taskCanExportEvidence = Boolean(
+    task &&
+      ["REPORT", "BLOCKED", "CANCELLED"].includes(task.status) &&
+      apiCapabilities.includes(TASK_EVIDENCE_EXPORT_CAPABILITY),
+  );
+  const taskEvidenceExportRequiresApiRestart = Boolean(
+    task &&
+      ["REPORT", "BLOCKED", "CANCELLED"].includes(task.status) &&
+      apiReady &&
+      !apiCapabilities.includes(TASK_EVIDENCE_EXPORT_CAPABILITY),
+  );
   const taskStatus =
     task?.status ?? (!apiReady ? "OFFLINE" : runtimeHealth.status);
   const serviceStatus = !apiReady
@@ -1320,6 +1839,17 @@ export function App() {
       ? "ready"
       : "degraded";
   const visibleEvents = events.slice(-14);
+  const attachedDocuments = attachedDocumentIds.map((documentId) =>
+    documents.find((document) => document.document_id === documentId) ?? {
+      document_id: documentId,
+      display_name: `已绑定文档 ${documentId.slice(0, 8)}`,
+      content_sha256: "",
+      imported_at: "",
+    },
+  );
+  const keyEvidenceEvents = events.filter(isKeyEvidenceEvent);
+  const reviewEvents =
+    evidenceScope === "key" ? keyEvidenceEvents : events;
   const activeTaskOperation = task ? resolvedTaskOperation(task) : operation;
   const activeTaskMode: Mode =
     task?.task_mode === "full-local" ? "full-local" : "safe-isolated";
@@ -1332,6 +1862,19 @@ export function App() {
       activeTaskOperation === "research" &&
       interrupt?.type === "PLAN_APPROVAL_REQUIRED",
   );
+  const approvalPlan = asRecord(task?.state?.plan);
+  const approvalCandidateFiles = readStringList(
+    interrupt?.candidate_files ?? approvalPlan?.candidate_files,
+  );
+  const approvalRecipe =
+    readString(interrupt?.recipe) ??
+    readString(approvalPlan?.verification_recipe) ??
+    "未指定";
+  const approvalTargetTest =
+    readString(interrupt?.target_test_class) ??
+    readString(approvalPlan?.target_test_class);
+  const approvalSteps = readStringList(approvalPlan?.steps);
+  const executionApproval = interrupt?.type === "EXECUTION_APPROVAL_REQUIRED";
   const canStart =
     !task &&
     Boolean(projectId && description.trim()) &&
@@ -1351,7 +1894,7 @@ export function App() {
           <button
             className={showTaskSearch ? "icon-button active" : "icon-button"}
             type="button"
-            title="搜索任务"
+            title="搜索任务 (Ctrl+K)"
             aria-label="搜索任务"
             onClick={() => setShowTaskSearch((current) => !current)}
           >
@@ -1363,6 +1906,7 @@ export function App() {
           <button
             className={activeView === "task" && !task ? "active" : ""}
             type="button"
+            title="新建任务 (Ctrl+N)"
             onClick={beginNewTask}
           >
             <ChatCircle size={18} />
@@ -1393,6 +1937,7 @@ export function App() {
           <div className="task-search">
             <MagnifyingGlass size={15} />
             <input
+              ref={taskSearchRef}
               value={taskQuery}
               onChange={(event) => setTaskQuery(event.target.value)}
               placeholder="搜索任务"
@@ -1513,11 +2058,11 @@ export function App() {
         <header className="workspace-header">
           <div className="workspace-identity">
             <FolderOpen size={18} />
-            <strong>{currentProject?.display_name ?? "选择本地项目"}</strong>
+            <strong title={currentProject?.display_name ?? "选择本地项目"}>{currentProject?.display_name ?? "选择本地项目"}</strong>
             {task && (
               <>
                 <span>/</span>
-                <small>{compactTaskLabel(task)}</small>
+                <small title={compactTaskLabel(task)}>{compactTaskLabel(task)}</small>
               </>
             )}
           </div>
@@ -1541,12 +2086,39 @@ export function App() {
                 {!task && (
                   <div className="new-task-state">
                     <p className="new-task-kicker">当前工作区</p>
-                    <h2>{operation === "research" ? "研究当前代码库" : "准备开始代码任务"}</h2>
+                    <h2>{operation === "research" ? "制定代码计划" : "准备开始代码任务"}</h2>
                     <p>
                       {currentProject
                         ? currentProject.display_name + "  ·  " + projectStatusLabel
                         : "从左侧选择或注册一个本地项目"}
                     </p>
+                    {projectReadinessItems.length > 0 && (
+                      <dl className="project-readiness" aria-label="当前项目就绪状态">
+                        {projectReadinessItems.map((item) => (
+                          <div key={item.label}>
+                            <dt>{item.label}</dt>
+                            <dd>{item.value}</dd>
+                          </div>
+                        ))}
+                      </dl>
+                    )}
+                    {currentProject && (
+                      <div className="task-starters" aria-label="常用任务起点">
+                        <span>常用起点</span>
+                        <div>
+                          {taskStarters.map((starter) => (
+                            <button
+                              key={starter.label}
+                              type="button"
+                              onClick={() => applyTaskStarter(starter.value)}
+                            >
+                              {starter.label}
+                              <ArrowRight size={14} />
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -1556,7 +2128,7 @@ export function App() {
                       <header>
                         <strong>任务</strong>
                         <div className="task-metadata">
-                          <span>{activeTaskOperation === "research" ? "仅研究" : "修改代码"}</span>
+                          <span>{activeTaskOperation === "research" ? "计划模式" : "修改代码"}</span>
                           <span>{activeTaskMode === "safe-isolated" ? "安全隔离修复" : "完全本机控制"}</span>
                         </div>
                       </header>
@@ -1585,6 +2157,30 @@ export function App() {
                               <p>{taskOutcome.detail}</p>
                             </div>
                           </div>
+                        )}
+                        {task.progress && task.progress.stages.length > 0 && (
+                          <section className="task-progress" aria-label="Agent 任务阶段">
+                            <div className="task-progress-heading">
+                              <span>任务阶段</span>
+                              <small>{task.progress.summary}</small>
+                            </div>
+                            <ol>
+                              {task.progress.stages.map((stage) => (
+                                <li key={stage.id} className={`progress-${stage.state}`}>
+                                  <span className="progress-marker" aria-hidden="true">
+                                    {stage.state === "completed" || stage.state === "passed"
+                                      ? <CheckCircle size={14} weight="fill" />
+                                      : stage.state === "current"
+                                        ? <CircleNotch className={taskIsRunning ? "spin" : ""} size={14} />
+                                        : stage.state === "failed" || stage.state === "blocked"
+                                          ? <WarningCircle size={14} weight="fill" />
+                                          : <i />}
+                                  </span>
+                                  <span>{stage.label}</span>
+                                </li>
+                              ))}
+                            </ol>
+                          </section>
                         )}
                         {visibleEvents.length === 0 && taskIsRunning && (
                           <div className="activity-loading" aria-label="任务正在初始化"><span /><span /><span /></div>
@@ -1633,7 +2229,7 @@ export function App() {
                       <div>
                         <strong>
                           {researchPlanApproval
-                            ? "研究结论等待确认"
+                            ? "计划结论等待确认"
                             : interrupt?.type === "EXECUTION_APPROVAL_REQUIRED"
                             ? "执行前需要你的批准"
                             : "修改计划等待审阅"}
@@ -1641,20 +2237,45 @@ export function App() {
                         <p>{interrupt?.message ?? "审阅计划后决定是否继续。"}</p>
                       </div>
                     </div>
+                    <div className="approval-scope" aria-label="本次审批范围">
+                      <div className="approval-scope-facts">
+                        <span><b>{executionApproval ? "执行范围" : "计划范围"}</b>{executionApproval ? "仅允许受控补丁写入候选文件" : "本次确认不写入代码"}</span>
+                        <span><b>Maven Recipe</b><code>{approvalRecipe}</code></span>
+                        {approvalTargetTest && <span><b>目标测试</b><code>{approvalTargetTest}</code></span>}
+                      </div>
+                      {approvalCandidateFiles.length > 0 && (
+                        <div className="approval-file-list">
+                          <span>候选文件</span>
+                          <ul>
+                            {approvalCandidateFiles.slice(0, 5).map((path) => <li key={path}><code>{path}</code></li>)}
+                          </ul>
+                          {approvalCandidateFiles.length > 5 && <small>另有 {approvalCandidateFiles.length - 5} 个候选文件</small>}
+                        </div>
+                      )}
+                      {!executionApproval && approvalSteps.length > 0 && (
+                        <details className="approval-steps">
+                          <summary>查看计划步骤（{approvalSteps.length}）</summary>
+                          <ol>{approvalSteps.map((step, index) => <li key={index}>{step}</li>)}</ol>
+                        </details>
+                      )}
+                      {executionApproval && (
+                        <p className="execution-approval-note">批准后才会生成并校验结构化补丁；补丁、Maven 执行和真实 Diff 都将写入审计证据。</p>
+                      )}
+                    </div>
                     {interrupt?.type === "PLAN_APPROVAL_REQUIRED" && (
                       <textarea value={revisionComment} onChange={(event) => setRevisionComment(event.target.value)} placeholder="填写需要调整的地方" aria-label="计划修改意见" />
                     )}
                     <div className="approval-buttons">
                       {interrupt?.type === "PLAN_APPROVAL_REQUIRED" && (
-                        <button className="secondary-button" type="button" onClick={() => void approve("revise")} disabled={!revisionComment.trim()}>
+                        <button className="secondary-button" type="button" onClick={() => void approve("revise")} disabled={!revisionComment.trim() || approvalBusy}>
                           <ArrowClockwise size={16} />要求调整
                         </button>
                       )}
-                      <button className="primary-button" type="button" onClick={() => void approve("approve")}>
+                      <button className="primary-button" type="button" onClick={() => void approve("approve")} disabled={approvalBusy}>
                         <CheckCircle size={16} weight="bold" />
-                        {researchPlanApproval ? "确认并生成报告" : "批准继续"}
+                        {approvalBusy ? "正在提交" : researchPlanApproval ? "确认并生成报告" : executionApproval ? "批准执行" : "确认计划"}
                       </button>
-                      <button className="danger-button" type="button" onClick={() => void approve("reject")}>
+                      <button className="danger-button" type="button" onClick={() => void approve("reject")} disabled={approvalBusy}>
                         <XCircle size={16} />拒绝
                       </button>
                     </div>
@@ -1731,18 +2352,85 @@ export function App() {
                         <span><b>确认完全本机访问</b>Agent 将直接在当前项目目录中执行已实现的高风险操作。</span>
                       </label>
                     )}
-                    {(documentPath || documentResult) && (
+                    {(documentPath || attachedDocuments.length > 0) && (
                       <div className="attachment-row">
                         <FileArrowUp size={16} />
-                        <span>{documentPath || documentResult?.document?.display_name || "研发文档"}</span>
+                        <span className="attachment-label">{documentPath || "已绑定研发文档"}</span>
                         {documentPath && (
-                          <button type="button" onClick={() => void indexDocument()} disabled={documentBusy || !projectId}>
+                          <button type="button" onClick={() => void indexDocument(true)} disabled={documentBusy || !projectId || attachedDocumentIds.length >= 4}>
                             {documentBusy ? "正在索引" : "加入上下文"}
                           </button>
                         )}
+                        {attachedDocuments.map((document) => (
+                          <span className="attachment-chip" key={document.document_id}>
+                            <FileCode size={14} />
+                            {document.display_name}
+                            <button
+                              type="button"
+                              title="从当前任务移除此文档"
+                              aria-label={`移除 ${document.display_name}`}
+                              onClick={() => setAttachedDocumentIds((current) => current.filter((id) => id !== document.document_id))}
+                            >
+                              <XCircle size={15} />
+                            </button>
+                          </span>
+                        ))}
                       </div>
                     )}
+                    {showDocumentPicker && (
+                      <section className="attachment-picker" aria-label="任务研发文档附件">
+                        <header>
+                          <div><strong>任务附件</strong><span>{attachedDocumentIds.length}/4</span></div>
+                          <button
+                            className="icon-button"
+                            type="button"
+                            title="关闭任务附件面板"
+                            aria-label="关闭任务附件面板"
+                            onClick={() => setShowDocumentPicker(false)}
+                          >
+                            <XCircle size={17} />
+                          </button>
+                        </header>
+                        <div className="attachment-document-list">
+                          {documents.length === 0 ? (
+                            <p>当前项目还没有已索引研发文档。</p>
+                          ) : documents.map((document) => (
+                            <label key={document.document_id}>
+                              <input
+                                type="checkbox"
+                                checked={attachedDocumentIds.includes(document.document_id)}
+                                onChange={(event) => toggleTaskDocument(document.document_id, event.target.checked)}
+                                disabled={!attachedDocumentIds.includes(document.document_id) && attachedDocumentIds.length >= 4}
+                              />
+                              <FileCode size={15} />
+                              <span>{document.display_name}</span>
+                              {attachedDocumentIds.includes(document.document_id) && <CheckCircle size={15} />}
+                            </label>
+                          ))}
+                        </div>
+                        <div className="attachment-import">
+                          <input
+                            value={documentPath}
+                            onChange={(event) => setDocumentPath(event.target.value)}
+                            placeholder="MD/TXT 本地路径"
+                            aria-label="研发文档本地路径"
+                          />
+                          <button className="icon-button" type="button" title="选择 MD 或 TXT 文档" onClick={() => void chooseDocument()}>
+                            <FolderOpen size={17} />
+                          </button>
+                          <button
+                            className="secondary-button"
+                            type="button"
+                            onClick={() => void indexDocument(true)}
+                            disabled={!projectId || !documentPath.trim() || documentBusy || attachedDocumentIds.length >= 4}
+                          >
+                            {documentBusy ? "导入中" : "导入并绑定"}
+                          </button>
+                        </div>
+                      </section>
+                    )}
                     <textarea
+                      ref={taskDescriptionRef}
                       value={description}
                       onChange={(event) => setDescription(event.target.value)}
                       onKeyDown={(event) => {
@@ -1758,7 +2446,7 @@ export function App() {
                     />
                     <div className="composer-toolbar">
                       <div className="composer-tools">
-                        <button className="icon-button" type="button" title="添加 MD 或 TXT 研发文档" onClick={() => void chooseDocument()} disabled={!projectId}>
+                        <button className="icon-button" type="button" title="管理任务研发文档附件" onClick={() => setShowDocumentPicker((current) => !current)} disabled={!projectId}>
                           <Paperclip size={19} />
                         </button>
                         <div className="operation-control" role="group" aria-label="任务类型">
@@ -1779,12 +2467,12 @@ export function App() {
                             type="button"
                             disabled={!allowedOperations.includes("research")}
                             onClick={() => setOperation("research")}
-                            aria-label="仅研究"
+                            aria-label="计划模式"
                             aria-pressed={operation === "research"}
-                            title="只研究代码并输出证据化计划，不写入文件"
+                            title="只研究代码并输出证据化计划，不写入文件、不运行 Maven"
                           >
                             <ListMagnifyingGlass size={15} />
-                            <span>仅研究</span>
+                            <span>计划模式</span>
                           </button>
                         </div>
                         <label className={"permission-control mode-" + mode}>
@@ -1833,6 +2521,54 @@ export function App() {
 
             <section className="settings-section">
               <div className="settings-title">
+                <SlidersHorizontal size={19} />
+                <div><h3>运行配置</h3><p>仅保存到桌面应用自己的本地配置文件，密钥不会回显或写入任务证据。</p></div>
+              </div>
+              <div className="settings-content runtime-configuration">
+                {!runtimeConfiguration && (
+                  <p className="configuration-notice">当前本地 API 尚未支持应用内运行配置。重启 RepoPilot Desktop 后重试。</p>
+                )}
+                {runtimeConfiguration && (
+                  <>
+                    <div className="runtime-configuration-status">
+                      <span className={runtimeConfiguration.writable ? "ready" : "blocked"}>
+                        {runtimeConfiguration.writable ? "可保存到桌面配置" : "当前连接只读"}
+                      </span>
+                      <p>{runtimeConfiguration.message ?? "保存后需要重启 RepoPilot Desktop，正在运行的任务不会读取新配置。"}</p>
+                    </div>
+                    <div className="runtime-config-grid">
+                      <label>Chat Base URL<input value={chatBaseUrl} onChange={(event) => setChatBaseUrl(event.target.value)} placeholder="https://api.deepseek.com" disabled={!runtimeConfiguration.writable} /></label>
+                      <label>Chat Model<input value={chatModel} onChange={(event) => setChatModel(event.target.value)} placeholder="deepseek-chat" disabled={!runtimeConfiguration.writable} /></label>
+                      <label className="runtime-secret-field">
+                        Chat API Key
+                        <input type="password" value={chatApiKey} onChange={(event) => { setChatApiKey(event.target.value); setClearChatApiKey(false); }} placeholder={runtimeConfiguration.chat?.api_key_configured ? "已配置，输入新值才会替换" : "未配置"} autoComplete="off" disabled={!runtimeConfiguration.writable || clearChatApiKey} />
+                        <small>{runtimeConfiguration.chat?.api_key_configured ? "已配置，值不会显示。" : "尚未配置。"}</small>
+                      </label>
+                      <label>Embedding Base URL<input value={embeddingBaseUrl} onChange={(event) => setEmbeddingBaseUrl(event.target.value)} placeholder="OpenAI-compatible embedding endpoint" disabled={!runtimeConfiguration.writable} /></label>
+                      <label>Embedding Model<input value={embeddingModel} onChange={(event) => setEmbeddingModel(event.target.value)} placeholder="text-embedding-3-small" disabled={!runtimeConfiguration.writable} /></label>
+                      <label>Embedding Dimensions<input inputMode="numeric" value={embeddingDimensions} onChange={(event) => setEmbeddingDimensions(event.target.value)} placeholder="1536" disabled={!runtimeConfiguration.writable} /></label>
+                      <label className="runtime-secret-field">
+                        Embedding API Key
+                        <input type="password" value={embeddingApiKey} onChange={(event) => { setEmbeddingApiKey(event.target.value); setClearEmbeddingApiKey(false); }} placeholder={runtimeConfiguration.embedding?.api_key_configured ? "已配置，输入新值才会替换" : "未配置"} autoComplete="off" disabled={!runtimeConfiguration.writable || clearEmbeddingApiKey} />
+                        <small>{runtimeConfiguration.embedding?.api_key_configured ? "已配置，值不会显示。" : "尚未配置。"}</small>
+                      </label>
+                      <label className="runtime-config-wide">Qdrant URL<input value={qdrantUrl} onChange={(event) => setQdrantUrl(event.target.value)} placeholder="http://127.0.0.1:6333" disabled={!runtimeConfiguration.writable} /></label>
+                    </div>
+                    <div className="runtime-configuration-actions">
+                      <label className="checkbox-row"><input type="checkbox" checked={clearChatApiKey} onChange={(event) => setClearChatApiKey(event.target.checked)} disabled={!runtimeConfiguration.writable} />清除 Chat API Key</label>
+                      <label className="checkbox-row"><input type="checkbox" checked={clearEmbeddingApiKey} onChange={(event) => setClearEmbeddingApiKey(event.target.checked)} disabled={!runtimeConfiguration.writable} />清除 Embedding API Key</label>
+                      <button className="secondary-button" type="button" onClick={() => void saveRuntimeConfiguration()} disabled={!runtimeConfiguration.writable || runtimeConfigurationBusy}>
+                        {runtimeConfigurationBusy ? "正在保存" : "保存配置"}
+                      </button>
+                    </div>
+                    {runtimeConfigurationMessage && <p className="configuration-notice success">{runtimeConfigurationMessage}</p>}
+                  </>
+                )}
+              </div>
+            </section>
+
+            <section className="settings-section">
+              <div className="settings-title">
                 <FileArrowUp size={19} />
                 <div><h3>研发文档</h3><p>MD / TXT · {documents.length} 份已索引文档</p></div>
               </div>
@@ -1840,7 +2576,7 @@ export function App() {
                 <div className="inline-form">
                   <input value={documentPath} onChange={(event) => setDocumentPath(event.target.value)} placeholder="本地文档路径" />
                   <button className="icon-button" type="button" title="选择文档" onClick={() => void chooseDocument()}><FolderOpen size={17} /></button>
-                  <button className="secondary-button" type="button" onClick={() => void indexDocument()} disabled={!projectId || !documentPath.trim() || documentBusy}>
+                  <button className="secondary-button" type="button" onClick={() => void indexDocument(false)} disabled={!projectId || !documentPath.trim() || documentBusy}>
                     {documentBusy ? "索引中" : "添加"}
                   </button>
                 </div>
@@ -1911,7 +2647,7 @@ export function App() {
               </div>
             </section>
 
-            {(contextSnapshot || telemetry) && (
+            {(contextSnapshot || telemetry || taskAttachments.length > 0) && (
               <section className="settings-section">
                 <div className="settings-title">
                   <Stack size={19} />
@@ -1927,6 +2663,20 @@ export function App() {
                         ))}
                       </div>
                     </>
+                  )}
+                  {taskAttachments.length > 0 && (
+                    <div className="task-attachment-summary">
+                      <span>本次任务附件</span>
+                      <ul>
+                        {taskAttachments.map((document) => (
+                          <li key={document.document_id}>
+                            <FileCode size={15} />
+                            <b>{document.display_name}</b>
+                            <code>{document.content_sha256.slice(0, 12)}</code>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
                   )}
                   {telemetry && (
                     <div className="telemetry-row">
@@ -1967,16 +2717,41 @@ export function App() {
                   <h2>{selectedArtifact ? artifactLabels[selectedArtifact] ?? selectedArtifact : "选择任务产物"}</h2>
                   <p>{task ? compactTaskLabel(task) + " · " + (task.verdict ?? task.status) : "尚未选择任务"}</p>
                 </div>
-                {artifactVersions.length > 0 && (
-                  <select value={selectedArtifactVersion ?? ""} onChange={(event) => setSelectedArtifactVersion(Number(event.target.value))} aria-label="产物版本">
-                    {artifactVersions.map((version) => (
-                      <option key={version.version} value={version.version}>
-                        v{version.version} · {version.created_at.slice(0, 19).replace("T", " ")}
-                      </option>
-                    ))}
-                  </select>
-                )}
+                <div className="review-header-actions">
+                  {artifactVersions.length > 0 && (
+                    <select value={selectedArtifactVersion ?? ""} onChange={(event) => setSelectedArtifactVersion(Number(event.target.value))} aria-label="产物版本">
+                      {artifactVersions.map((version) => (
+                        <option key={version.version} value={version.version}>
+                          v{version.version} · {version.created_at.slice(0, 19).replace("T", " ")}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                  {taskCanExportEvidence && (
+                    <button className="secondary-button" type="button" onClick={() => void exportEvidence()} disabled={exportingEvidence}>
+                      <Archive size={16} />{exportingEvidence ? "正在导出" : "导出证据包"}
+                    </button>
+                  )}
+                </div>
               </header>
+              {taskCanExportEvidence && (
+                <div className="evidence-export-control">
+                  <input
+                    value={exportPath}
+                    onChange={(event) => setExportPath(event.target.value)}
+                    placeholder="浏览器预览可填写 ZIP 绝对路径"
+                    aria-label="审计证据包导出路径"
+                  />
+                  {evidenceExport && (
+                    <span>已导出 {evidenceExport.artifact_count} 份产物 · {evidenceExport.size_bytes.toLocaleString()} B · {evidenceExport.sha256.slice(0, 12)}</span>
+                  )}
+                </div>
+              )}
+              {taskEvidenceExportRequiresApiRestart && (
+                <p className="export-capability-warning">
+                  本机 API 尚未加载审计导出能力。重启预览或 RepoPilot Desktop 后重试。
+                </p>
+              )}
               {selectedArtifact ? (
                 <>
                   <p className="artifact-hash">
@@ -1990,9 +2765,29 @@ export function App() {
               )}
             </article>
             <aside className="evidence-pane">
-              <div className="review-pane-heading"><span>证据</span><b>{events.length}</b></div>
-              {events.length === 0 && <p>暂无证据事件</p>}
-              {events.map((event) => (
+              <div className="review-pane-heading">
+                <span>证据</span>
+                <div className="evidence-filter" aria-label="证据显示范围">
+                  <button
+                    className={evidenceScope === "key" ? "active" : ""}
+                    type="button"
+                    aria-pressed={evidenceScope === "key"}
+                    onClick={() => setEvidenceScope("key")}
+                  >
+                    关键 {keyEvidenceEvents.length}
+                  </button>
+                  <button
+                    className={evidenceScope === "all" ? "active" : ""}
+                    type="button"
+                    aria-pressed={evidenceScope === "all"}
+                    onClick={() => setEvidenceScope("all")}
+                  >
+                    全部 {events.length}
+                  </button>
+                </div>
+              </div>
+              {reviewEvents.length === 0 && <p>暂无符合当前范围的证据事件</p>}
+              {reviewEvents.map((event) => (
                 <article key={event.id}>
                   <b>{eventLabels[event.type] ?? event.type}</b>
                   <p>{eventSummary(event)}</p>

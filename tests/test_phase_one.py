@@ -120,6 +120,37 @@ class AppSettingsTests(unittest.TestCase):
         self.assertFalse(check.ready)
         self.assertIn("REPOPILOT_CHAT_API_KEY", check.missing_fields)
 
+    def test_blank_embedding_dimensions_are_treated_as_missing_configuration(self) -> None:
+        with patch.dict(os.environ, {"REPOPILOT_EMBEDDING_DIMENSIONS": ""}, clear=True):
+            settings = AppSettings(_env_file=None)
+
+        check = settings.embedding_check()
+        self.assertFalse(check.ready)
+        self.assertIn("REPOPILOT_EMBEDDING_DIMENSIONS", check.missing_fields)
+
+    def test_explicit_desktop_config_file_is_loaded_without_reading_working_dotenv(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            config_file = Path(temporary_directory) / "settings.env"
+            config_file.write_text(
+                "\n".join(
+                    (
+                        "REPOPILOT_CHAT_BASE_URL=https://api.example.invalid/v1",
+                        "REPOPILOT_CHAT_API_KEY=desktop-secret",
+                        "REPOPILOT_CHAT_MODEL=desktop-model",
+                        "REPOPILOT_STATE_DB_PATH=desktop-state.sqlite",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"REPOPILOT_CONFIG_FILE": str(config_file)}, clear=True):
+                settings = AppSettings()
+
+        self.assertTrue(settings.chat_check().ready)
+        self.assertEqual("https://api.example.invalid/v1", settings.chat_base_url)
+        self.assertEqual("desktop-model", settings.chat_model)
+        self.assertEqual(Path("desktop-state.sqlite"), settings.state_db_path)
+        self.assertNotIn("desktop-secret", str(settings.chat_check().to_dict()))
+
     def test_invalid_embedding_dimensions_is_sanitized_as_blocked(self) -> None:
         with patch.dict(os.environ, {"REPOPILOT_EMBEDDING_DIMENSIONS": "invalid"}, clear=True):
             with self.assertRaises(ValidationError):

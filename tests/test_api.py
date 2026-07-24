@@ -1,20 +1,24 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import tempfile
 import time
 import unittest
+import zipfile
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 from repopilot_guard.api import create_app
-from repopilot_guard.config import ComponentCheck
+from repopilot_guard.api import _desktop_allowed_origins
+from repopilot_guard.config import ComponentCheck, RuntimeConfigurationManager
 from repopilot_guard.context import ManagedDocumentStore
 from repopilot_guard.mcp import McpServerConfig, McpToolDescriptor
 from repopilot_guard.mcp_runtime import (
@@ -145,6 +149,149 @@ class FakeApiMcpConnector:
 
 
 class ApiTests(unittest.TestCase):
+    def test_preview_origin_accepts_only_explicit_loopback_url(self) -> None:
+        with patch.dict(os.environ, {"REPOPILOT_DESKTOP_PREVIEW_ORIGIN": "http://127.0.0.1:1427"}, clear=True):
+            self.assertIn("http://127.0.0.1:1427", _desktop_allowed_origins())
+        for invalid in ("https://127.0.0.1:1427", "http://example.com:1427", "http://127.0.0.1:1427/api"):
+            with patch.dict(os.environ, {"REPOPILOT_DESKTOP_PREVIEW_ORIGIN": invalid}, clear=True):
+                self.assertNotIn(invalid, _desktop_allowed_origins())
+
+    def test_task_snapshot_exposes_sanitized_stage_progress(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repository = root / "repo"
+            repository.mkdir()
+            _initialize_git_repository(repository)
+            registry = ProjectRegistry(root / "state.sqlite")
+            project = registry.add(repository, "进度快照项目")
+            try:
+                runner = FakeRunner(delay=0)
+                with TestClient(create_app(runner, registry, root / "runs")) as client:
+                    created = client.post(
+                        "/api/tasks",
+                        json={
+                            "project_id": project.project_id,
+                            "description": "生成只读研究计划",
+                            "operation": "research",
+                            "thread_id": "thread-1",
+                        },
+                    )
+                    self.assertEqual(200, created.status_code)
+                    snapshot = client.get("/api/tasks/thread-1")
+                    self.assertEqual(200, snapshot.status_code)
+                    progress = snapshot.json()["progress"]
+                    self.assertEqual("plan_approval", progress["current_stage"])
+                    self.assertIsNone(progress["terminal_kind"])
+                    self.assertEqual(
+                        ["workspace", "preflight", "context", "research", "plan_approval", "report"],
+                        [stage["id"] for stage in progress["stages"]],
+                    )
+                    self.assertNotIn("生成只读研究计划", json.dumps(progress, ensure_ascii=False))
+            finally:
+                registry.close()
+
+    def test_runtime_configuration_persists_managed_values_without_echoing_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config_file = root / "settings.env"
+            config_file.write_text("# managed\nREPOPILOT_QDRANT_URL=http://127.0.0.1:6333\n", encoding="utf-8")
+            registry = ProjectRegistry(root / "state.sqlite")
+            environment = {
+                "REPOPILOT_CONFIG_FILE": str(config_file),
+                "REPOPILOT_DESKTOP_CONFIG_WRITE_ENABLED": "1",
+            }
+            try:
+                with patch.dict(os.environ, environment, clear=True):
+                    manager = RuntimeConfigurationManager()
+                    with TestClient(
+                        create_app(
+                            FakeRunner(),
+                            registry,
+                            root / "runs",
+                            runtime_configuration_manager=manager,
+                        )
+                    ) as client:
+                        before = client.get("/api/runtime/configuration")
+                        self.assertEqual(200, before.status_code)
+                        self.assertTrue(before.json()["writable"])
+                        self.assertFalse(before.json()["chat"]["api_key_configured"])
+
+                        api_key = "desktop-secret-must-not-return"
+                        saved = client.post(
+                            "/api/runtime/configuration",
+                            json={
+                                "chat_base_url": "https://api.deepseek.com",
+                                "chat_api_key": api_key,
+                                "chat_model": "deepseek-chat",
+                                "embedding_base_url": "https://embedding.example/v1",
+                                "embedding_api_key": "embedding-secret-must-not-return",
+                                "embedding_model": "embed-test",
+                                "embedding_dimensions": 1536,
+                            },
+                        )
+
+                        self.assertEqual(200, saved.status_code)
+                        self.assertEqual("CONFIGURATION_SAVED", saved.json()["code"])
+                        self.assertTrue(saved.json()["restart_required"])
+                        self.assertTrue(saved.json()["chat"]["api_key_configured"])
+                        self.assertNotIn(api_key, json.dumps(saved.json(), ensure_ascii=False))
+                        self.assertNotIn("embedding-secret-must-not-return", json.dumps(saved.json(), ensure_ascii=False))
+                        listed = client.get("/api/runtime/configuration")
+                        self.assertNotIn(api_key, json.dumps(listed.json(), ensure_ascii=False))
+                        self.assertTrue(listed.json()["embedding"]["api_key_configured"])
+
+                    persisted = config_file.read_text(encoding="utf-8")
+                    self.assertIn('REPOPILOT_CHAT_API_KEY="desktop-secret-must-not-return"', persisted)
+                    self.assertIn('REPOPILOT_EMBEDDING_DIMENSIONS="1536"', persisted)
+                    self.assertNotIn("\nREPOPILOT_UNTRUSTED=", persisted)
+            finally:
+                registry.close()
+
+    def test_runtime_configuration_rejects_unmanaged_paths_and_newline_injection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            registry = ProjectRegistry(root / "state.sqlite")
+            try:
+                with TestClient(
+                    create_app(
+                        FakeRunner(),
+                        registry,
+                        root / "runs",
+                        runtime_configuration_manager=RuntimeConfigurationManager(environment={}),
+                    )
+                ) as client:
+                    blocked = client.post(
+                        "/api/runtime/configuration",
+                        json={"chat_model": "deepseek-chat"},
+                    )
+                    self.assertEqual(409, blocked.status_code)
+                    self.assertEqual("CONFIGURATION_WRITE_NOT_MANAGED", blocked.json()["detail"]["code"])
+
+                config_file = root / "settings.env"
+                config_file.write_text("# managed\n", encoding="utf-8")
+                environment = {
+                    "REPOPILOT_CONFIG_FILE": str(config_file),
+                    "REPOPILOT_DESKTOP_CONFIG_WRITE_ENABLED": "1",
+                }
+                with patch.dict(os.environ, environment, clear=True):
+                    with TestClient(
+                        create_app(
+                            FakeRunner(),
+                            registry,
+                            root / "runs",
+                            runtime_configuration_manager=RuntimeConfigurationManager(),
+                        )
+                    ) as client:
+                        injected = client.post(
+                            "/api/runtime/configuration",
+                            json={"chat_model": "safe\nREPOPILOT_UNTRUSTED=1"},
+                        )
+                    self.assertEqual(400, injected.status_code)
+                    self.assertEqual("INVALID_CONFIGURATION_VALUE", injected.json()["detail"]["code"])
+                self.assertEqual("# managed\n", config_file.read_text(encoding="utf-8"))
+            finally:
+                registry.close()
+
     def test_task_context_is_not_an_http_error_before_snapshot_is_ready(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -161,6 +308,40 @@ class ApiTests(unittest.TestCase):
                 self.assertFalse(response.json()["available"])
                 self.assertIsNone(response.json()["context_snapshot"])
                 self.assertEqual([], response.json()["references"])
+                self.assertEqual([], response.json()["attached_documents"])
+            finally:
+                registry.close()
+
+    def test_task_context_exposes_attachment_metadata_without_paths_or_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            registry = ProjectRegistry(root / "state.sqlite")
+            runner = FakeRunner()
+            runner.ran = True
+            document_id = "a" * 64
+            content_sha256 = "b" * 64
+            runner.result.state["attached_documents"] = [
+                {
+                    "document_id": document_id,
+                    "display_name": "requirements.md",
+                    "content_sha256": content_sha256,
+                    "managed_path": "C:/private/repopilot/documents/requirements.md",
+                    "content": "不得出现在任务上下文接口中",
+                },
+                {"document_id": "invalid", "display_name": "bad", "content_sha256": "bad"},
+            ]
+            try:
+                with TestClient(create_app(runner, registry, root / "runs")) as client:
+                    response = client.get("/api/tasks/thread-1/context")
+
+                self.assertEqual(200, response.status_code)
+                self.assertEqual(
+                    [{"document_id": document_id, "display_name": "requirements.md", "content_sha256": content_sha256}],
+                    response.json()["attached_documents"],
+                )
+                encoded = json.dumps(response.json(), ensure_ascii=False)
+                self.assertNotIn("C:/private", encoded)
+                self.assertNotIn("不得出现在任务上下文接口中", encoded)
             finally:
                 registry.close()
 
@@ -286,6 +467,7 @@ class ApiTests(unittest.TestCase):
                 self.assertEqual(200, response.status_code)
                 self.assertEqual("READY", response.json()["status"])
                 self.assertEqual("BLOCKED", response.json()["agent_status"])
+                self.assertIn("task_evidence_export", response.json()["capabilities"])
                 self.assertEqual("QDRANT_UNAVAILABLE", response.json()["dependencies"][0]["code"])
             finally:
                 registry.close()
@@ -383,6 +565,56 @@ class ApiTests(unittest.TestCase):
                     blocked = client.post(f"/api/projects/{project.project_id}/documents", json={"file": str(root / "blocked.txt")})
                     self.assertEqual(409, blocked.status_code)
                     self.assertEqual("DOCUMENT_UNREADABLE", blocked.json()["detail"]["code"])
+            finally:
+                registry.close()
+
+    def test_task_attachment_requires_current_project_controlled_document(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            first_repository = root / "first-repo"
+            second_repository = root / "second-repo"
+            first_repository.mkdir()
+            second_repository.mkdir()
+            _initialize_git_repository(first_repository)
+            _initialize_git_repository(second_repository)
+            source = root / "outside-requirements.md"
+            source.write_text("# 订单需求\n必须隔离租户。\n", encoding="utf-8")
+            registry = ProjectRegistry(root / "state.sqlite")
+            first = registry.add(first_repository, "项目一")
+            second = registry.add(second_repository, "项目二")
+            managed = ManagedDocumentStore(registry.database_path).import_document(source, project_id=first.project_id)
+            runner = FakeRunner(delay=0)
+            try:
+                with TestClient(create_app(runner, registry, root / "runs")) as client:
+                    created = client.post(
+                        "/api/tasks",
+                        json={
+                            "project_id": first.project_id,
+                            "description": "依据研发文档分析订单权限",
+                            "operation": "research",
+                            "thread_id": "attachment-thread",
+                            "attached_document_ids": [managed.document_id],
+                        },
+                    )
+                    self.assertEqual(200, created.status_code)
+                    deadline = time.monotonic() + 1
+                    while not runner.requests and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertEqual((managed.document_id,), runner.requests[0].attached_document_ids)
+                    self.assertNotIn(str(source), json.dumps(created.json(), ensure_ascii=False))
+
+                    cross_project = client.post(
+                        "/api/tasks",
+                        json={
+                            "project_id": second.project_id,
+                            "description": "错误绑定跨项目文档",
+                            "operation": "research",
+                            "attached_document_ids": [managed.document_id],
+                        },
+                    )
+                    self.assertEqual(409, cross_project.status_code)
+                    self.assertEqual("TASK_ATTACHMENT_NOT_FOUND", cross_project.json()["detail"]["code"])
+                    self.assertNotIn(str(source), json.dumps(cross_project.json(), ensure_ascii=False))
             finally:
                 registry.close()
 
@@ -518,6 +750,66 @@ class ApiTests(unittest.TestCase):
                     self.assertEqual(["read_file"], context.json()["context_snapshot"]["bound_tool_ids"])
                     self.assertEqual(200, telemetry.status_code)
                     self.assertEqual(0, telemetry.json()["model"]["total_tokens"])
+            finally:
+                registry.close()
+
+    def test_final_task_evidence_export_uses_server_side_integrity_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repository = root / "repo"
+            repository.mkdir()
+            _initialize_git_repository(repository)
+            registry = ProjectRegistry(root / "state.sqlite")
+            project = registry.add(repository, "导出项目")
+            try:
+                runner = FakeRunner()
+                runner.result.status = "REPORT"
+                runner.result.pending_approval = False
+                runner.result.verdict = "UNVERIFIED"
+                target = root / "exports" / "task-evidence.zip"
+                with TestClient(create_app(runner, registry, root / "runs")) as client:
+                    created = client.post(
+                        "/api/tasks",
+                        json={
+                            "project_id": project.project_id,
+                            "description": "导出审计包",
+                            "task_mode": "safe-isolated",
+                            "operation": "research",
+                            "thread_id": "thread-1",
+                        },
+                    )
+                    self.assertEqual(200, created.status_code)
+                    for _ in range(20):
+                        snapshot = client.get("/api/tasks/thread-1")
+                        if snapshot.json().get("status") == "REPORT":
+                            break
+                        time.sleep(0.02)
+                    self.assertEqual("REPORT", snapshot.json()["status"])
+
+                    exported = client.post(
+                        "/api/tasks/thread-1/export",
+                        json={"output": str(target)},
+                    )
+                    self.assertEqual(200, exported.status_code)
+                    self.assertTrue(target.is_file())
+                    self.assertGreater(exported.json()["export"]["artifact_count"], 0)
+                    with zipfile.ZipFile(target) as archive:
+                        self.assertIn("manifest.json", archive.namelist())
+                        self.assertIn("evidence.jsonl", archive.namelist())
+                        self.assertNotIn(str(repository), archive.read("manifest.json").decode("utf-8"))
+
+                    duplicate = client.post(
+                        "/api/tasks/thread-1/export",
+                        json={"output": str(target)},
+                    )
+                    relative = client.post(
+                        "/api/tasks/thread-1/export",
+                        json={"output": "task-evidence.zip"},
+                    )
+                    self.assertEqual(409, duplicate.status_code)
+                    self.assertEqual("TASK_EXPORT_OUTPUT_EXISTS", duplicate.json()["detail"])
+                    self.assertEqual(422, relative.status_code)
+                    self.assertEqual("TASK_EXPORT_OUTPUT_MUST_BE_ABSOLUTE", relative.json()["detail"])
             finally:
                 registry.close()
 

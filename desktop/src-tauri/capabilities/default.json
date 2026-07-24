@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "RepoPilot Desktop 的最小本机权限。",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open"]
+  "permissions": ["core:default", "dialog:allow-open", "dialog:allow-save"]
 }

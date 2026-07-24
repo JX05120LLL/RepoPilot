@@ -60,7 +60,7 @@ class _Result:
             "status": status,
             "pending_approval": pending_approval,
             "verdict": None,
-            "interrupts": [{"type": "PLAN_APPROVAL_REQUIRED", "message": "请审阅计划。"}] if pending_approval else [],
+            "interrupts": [{"type": "PLAN_APPROVAL_REQUIRED", "message": "原始中断文案不得出现在摘要中"}] if pending_approval else [],
             "state": {
                 "workspace_mode": "worktree",
                 "workspace_path": "C:/temp/worktree",
@@ -70,9 +70,10 @@ class _Result:
                 "tool_events": [{"type": "PLAN_GENERATED", "arguments": {"secret": "不得输出"}}],
                 "plan": {
                     "summary": "修复订单租户过滤。",
-                    "candidate_files": ["OrderService.java"],
-                    "steps": ["补充租户过滤。"],
-                    "verification": ["运行 Maven 测试。"],
+                "candidate_files": ["OrderService.java"],
+                "steps": ["补充租户过滤。"],
+                "verification": ["运行 Maven 测试。"],
+                "verification_recipe": "test",
                 },
                 "verification_result": None,
             },
@@ -83,6 +84,41 @@ class _Result:
 
 
 class CliProductTests(unittest.TestCase):
+    def test_desktop_preview_uses_fixed_powershell_arguments(self) -> None:
+        completed = SimpleNamespace(returncode=0)
+        with (
+            patch("repopilot_guard.cli.shutil.which", side_effect=lambda value: "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe" if value == "powershell.exe" else None),
+            patch("repopilot_guard.cli.subprocess.run", return_value=completed) as run,
+            patch("sys.stdout", StringIO()),
+        ):
+            exit_code = main(["desktop", "preview", "--port", "8767", "--ui-port", "1427"])
+
+        self.assertEqual(0, exit_code)
+        arguments = run.call_args.args[0]
+        self.assertEqual("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe", arguments[0])
+        self.assertEqual(("-NoProfile", "-ExecutionPolicy", "Bypass", "-File"), arguments[1:5])
+        self.assertEqual(("-ApiPort", "8767", "-UiPort", "1427"), arguments[-4:])
+        self.assertNotIn("shell", run.call_args.kwargs)
+
+    def test_desktop_preview_rejects_invalid_port_before_launching_process(self) -> None:
+        with patch("repopilot_guard.cli.subprocess.run") as run, self.assertRaises(SystemExit):
+            main(["desktop", "preview", "--port", "70000"])
+
+        run.assert_not_called()
+
+    def test_preview_script_rejects_occupied_ports_and_requires_repopilot_health_contract(self) -> None:
+        repository_root = Path(__file__).resolve().parents[1]
+        script = (repository_root / "scripts" / "start-desktop-preview.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("Get-NetTCPConnection -LocalPort $ApiPort -State Listen", script)
+        self.assertIn("Get-NetTCPConnection -LocalPort $UiPort -State Listen", script)
+        self.assertIn("Test-RepoPilotHealth", script)
+        self.assertIn("/api/health", script)
+        self.assertIn('scope -eq "127.0.0.1-only"', script)
+        self.assertIn('VITE_REPOPILOT_API_URL = "http://127.0.0.1:${ApiPort}/api"', script)
+        self.assertIn('REPOPILOT_DESKTOP_PREVIEW_ORIGIN = "http://127.0.0.1:${UiPort}"', script)
+        self.assertNotIn("Test-NetConnection", script)
+
     def test_welcome_guides_first_time_user_to_register_a_project(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             state_path = Path(temporary_directory) / "state.sqlite"
@@ -176,6 +212,10 @@ class CliProductTests(unittest.TestCase):
         self.assertEqual(["nsis"], config["bundle"]["targets"])
         self.assertTrue((repository_root / "desktop" / "src-tauri" / "icons" / "icon.ico").is_file())
 
+        package = json.loads((repository_root / "desktop" / "package.json").read_text(encoding="utf-8"))
+        self.assertIn("build-desktop-backend-sidecar.ps1", package["scripts"]["sidecar:build"])
+        self.assertIn("npm run sidecar:build", package["scripts"]["tauri:build"])
+
         rust_source = (repository_root / "desktop" / "src-tauri" / "src" / "main.rs").read_text(encoding="utf-8")
         self.assertIn("app_data_dir", rust_source)
         self.assertIn("REPOPILOT_STATE_DB_PATH", rust_source)
@@ -187,12 +227,36 @@ class CliProductTests(unittest.TestCase):
         self.assertIn("get_webview_window(\"main\")", rust_source)
 
     def test_task_summary_excludes_raw_messages_and_tool_arguments(self) -> None:
-        encoded = json.dumps(_task_summary(_Result()), ensure_ascii=False)
+        result = _Result()
+        result._payload["state"]["attached_documents"] = [
+            {
+                "document_id": "a" * 64,
+                "display_name": "requirements.md",
+                "content_sha256": "b" * 64,
+                "source_path": "C:/private/requirements.md",
+                "content": "不得输出的研发文档正文",
+            }
+        ]
+        summary = _task_summary(result)
+        encoded = json.dumps(summary, ensure_ascii=False)
 
         self.assertIn("PLAN_GENERATED", encoded)
         self.assertIn("OrderService.java", encoded)
         self.assertNotIn("敏感任务正文不得出现在摘要中", encoded)
         self.assertNotIn("不得输出", encoded)
+        self.assertNotIn("原始中断文案不得出现在摘要中", encoded)
+        self.assertNotIn("C:/private", encoded)
+        self.assertNotIn("不得输出的研发文档正文", encoded)
+        self.assertNotIn("interrupts", summary)
+        self.assertEqual("plan_approval", summary["progress"]["current_stage"])
+        self.assertEqual("current", summary["progress"]["stages"][4]["state"])
+        self.assertEqual("requirements.md", summary["attached_documents"][0]["display_name"])
+        self.assertEqual("PLAN_REVIEW", summary["approval"]["stage"])
+        self.assertEqual(["OrderService.java"], summary["approval"]["candidate_files"])
+        self.assertEqual("test", summary["approval"]["verification_recipe"])
+        self.assertFalse(summary["approval"]["write_after_approval"])
+        self.assertEqual(["approve", "revise", "reject"], summary["approval"]["allowed_decisions"])
+        self.assertEqual("请审阅计划范围；确认计划本身不会写入代码。", summary["approval"]["summary"])
 
     def test_task_start_uses_safe_isolated_defaults_and_prints_next_action(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -246,6 +310,52 @@ class CliProductTests(unittest.TestCase):
             self.assertEqual("WAITING_APPROVAL", stored.status)
             self.assertIsNone(stored.lease_expires_at)
             self.assertIn("plan_json", artifacts)
+
+    def test_task_start_binds_only_registered_project_document(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "state.sqlite"
+            repository = root / "repository"
+            repository.mkdir()
+            _initialize_git_repository(repository)
+            source = root / "requirements.md"
+            source.write_text("# 订单需求\n按租户隔离。\n", encoding="utf-8")
+            registry = ProjectRegistry(state_path)
+            project = registry.add(repository, "订单项目")
+            registry.close()
+            managed = ManagedDocumentStore(state_path).import_document(source, project_id=project.project_id)
+            checkpoint = SimpleNamespace(checkpointer=object(), close=Mock())
+            runner = Mock()
+            runner.run.side_effect = lambda _request, thread_id, _permission: _Result(thread_id=thread_id)
+            settings = SimpleNamespace(task_budget=lambda: TaskBudget())
+            output = StringIO()
+            with (
+                patch("repopilot_guard.cli.AppSettings", return_value=settings),
+                patch("repopilot_guard.cli.SqliteCheckpointStore", return_value=checkpoint),
+                patch("repopilot_guard.cli.create_live_graph", return_value=object()),
+                patch("repopilot_guard.cli.GraphRunner", return_value=runner),
+                patch("sys.stdout", output),
+            ):
+                exit_code = main(
+                    [
+                        "task",
+                        "start",
+                        "--project-id",
+                        project.project_id,
+                        "--task",
+                        "依据研发文档分析订单权限",
+                        "--document-id",
+                        managed.document_id,
+                        "--state-db",
+                        str(state_path),
+                        "--output",
+                        str(root / "runs"),
+                    ]
+                )
+
+            self.assertEqual(0, exit_code)
+            self.assertEqual((managed.document_id,), runner.run.call_args.args[0].attached_document_ids)
+            self.assertNotIn(str(source), output.getvalue())
 
     def test_task_start_is_visible_with_lease_before_runner_returns(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -669,7 +779,7 @@ class CliProductTests(unittest.TestCase):
             expected = app_data / "com.repopilot.desktop"
             self.assertEqual(0, exit_code)
             self.assertEqual(str(expected), payload["runtime_dir"])
-            self.assertEqual(str(expected / ".env"), payload["config_file"])
+            self.assertEqual(str(expected / "settings.env"), payload["config_file"])
             self.assertEqual(str(expected / "state.sqlite"), payload["state_db"])
             self.assertFalse(expected.exists())
 
@@ -686,9 +796,39 @@ class CliProductTests(unittest.TestCase):
             payload = json.loads(output.getvalue())
             self.assertEqual(0, exit_code)
             self.assertEqual(str(runtime_dir.resolve()), payload["runtime_dir"])
-            self.assertEqual(str(runtime_dir.resolve() / ".env"), payload["config_file"])
+            self.assertEqual(str(runtime_dir.resolve() / "settings.env"), payload["config_file"])
             self.assertEqual(str(runtime_dir.resolve() / "state.sqlite"), payload["state_db"])
             self.assertFalse(runtime_dir.exists())
+
+    def test_desktop_init_config_creates_template_once_without_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            runtime_dir = Path(temporary_directory) / "repopilot-runtime"
+            output = StringIO()
+            with (
+                patch.dict(os.environ, {"REPOPILOT_DESKTOP_DATA_DIR": str(runtime_dir)}, clear=True),
+                patch("sys.stdout", output),
+            ):
+                exit_code = main(["desktop", "init-config"])
+
+            payload = json.loads(output.getvalue())
+            config_file = runtime_dir / "settings.env"
+            self.assertEqual(0, exit_code)
+            self.assertEqual("DESKTOP_CONFIG_TEMPLATE_CREATED", payload["code"])
+            self.assertEqual(str(config_file.resolve()), payload["config_file"])
+            self.assertIn("REPOPILOT_CHAT_API_KEY=", config_file.read_text(encoding="utf-8"))
+
+            original = config_file.read_text(encoding="utf-8")
+            output = StringIO()
+            with (
+                patch.dict(os.environ, {"REPOPILOT_DESKTOP_DATA_DIR": str(runtime_dir)}, clear=True),
+                patch("sys.stdout", output),
+            ):
+                repeated_exit_code = main(["desktop", "init-config"])
+
+            repeated = json.loads(output.getvalue())
+            self.assertEqual(2, repeated_exit_code)
+            self.assertEqual("DESKTOP_CONFIG_FILE_EXISTS", repeated["code"])
+            self.assertEqual(original, config_file.read_text(encoding="utf-8"))
 
     def test_task_artifact_commands_list_and_verify_persisted_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -966,6 +1106,108 @@ class CliProductTests(unittest.TestCase):
             with patch("sys.stdout", output):
                 main(["task", "list", "--include-archived", "--state-db", str(state_path)])
             self.assertEqual(1, json.loads(output.getvalue())["count"])
+
+    def test_task_watch_streams_sanitized_events_and_finishes_for_terminal_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "state.sqlite"
+            repository = root / "private-repository"
+            output_root = root / "private-runs"
+            store = TaskStore(state_path)
+            try:
+                store.create(
+                    thread_id="thread-watch-terminal",
+                    task_id="task-watch-terminal",
+                    project_id="project-1",
+                    repository=repository,
+                    output_root=output_root,
+                    task_mode="safe-isolated",
+                    permission_mode="safe",
+                    workspace_mode="worktree",
+                )
+                store.sync_graph_result(
+                    {
+                        "thread_id": "thread-watch-terminal",
+                        "status": "REPORT",
+                        "pending_approval": False,
+                        "verdict": "PASSED",
+                        "state": {
+                            "tool_events": [
+                                {"type": "PLAN_GENERATED", "token": "never-print-this"}
+                            ],
+                        },
+                    }
+                )
+            finally:
+                store.close()
+
+            output = StringIO()
+            with patch("sys.stdout", output):
+                exit_code = main(
+                    [
+                        "task",
+                        "watch",
+                        "--thread-id",
+                        "thread-watch-terminal",
+                        "--timeout-seconds",
+                        "0",
+                        "--state-db",
+                        str(state_path),
+                    ]
+                )
+
+            lines = [json.loads(line) for line in output.getvalue().splitlines()]
+            encoded = json.dumps(lines, ensure_ascii=False)
+            self.assertEqual(0, exit_code)
+            self.assertEqual("TASK_WATCH_STARTED", lines[0]["code"])
+            self.assertIn("TASK_WATCH_EVENT", [line["code"] for line in lines])
+            self.assertEqual("TASK_WATCH_FINISHED", lines[-1]["code"])
+            self.assertEqual("PASSED", lines[-1]["task"]["verdict"])
+            self.assertNotIn(str(repository), encoded)
+            self.assertNotIn(str(output_root), encoded)
+            self.assertNotIn("never-print-this", encoded)
+
+    def test_task_watch_timeout_reports_a_resumable_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "state.sqlite"
+            store = TaskStore(state_path)
+            try:
+                store.create(
+                    thread_id="thread-watch-running",
+                    task_id="task-watch-running",
+                    project_id="project-1",
+                    repository=root / "repo",
+                    output_root=root / "runs",
+                    task_mode="safe-isolated",
+                    permission_mode="safe",
+                    workspace_mode="worktree",
+                )
+            finally:
+                store.close()
+
+            output = StringIO()
+            with patch("sys.stdout", output):
+                exit_code = main(
+                    [
+                        "task",
+                        "watch",
+                        "--thread-id",
+                        "thread-watch-running",
+                        "--timeout-seconds",
+                        "0",
+                        "--state-db",
+                        str(state_path),
+                    ]
+                )
+
+            lines = [json.loads(line) for line in output.getvalue().splitlines()]
+            timeout = lines[-1]
+            self.assertEqual(0, exit_code)
+            self.assertEqual("TASK_WATCH_TIMEOUT", timeout["code"])
+            self.assertGreater(timeout["next_sequence"], 0)
+            self.assertIn("--after-sequence", timeout["next_action"]["command"])
+            self.assertIn(str(timeout["next_sequence"]), timeout["next_action"]["command"])
 
     def test_task_list_only_loads_local_state_configuration(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

@@ -10,7 +10,7 @@ import httpx
 from openai import APIConnectionError
 from pydantic import ValidationError
 
-from repopilot_guard.context import IndexResult, ProjectMemoryResult, RetrievalResult, RetrievedContext
+from repopilot_guard.context import AttachedDocumentContextResult, IndexResult, ProjectMemoryResult, RetrievalResult, RetrievedContext
 from repopilot_guard.cancellation import TaskCancellationRegistry
 from repopilot_guard.graph import (
     ChangePlan,
@@ -26,11 +26,13 @@ from repopilot_guard.graph import (
     ResearchDecision,
     SqliteCheckpointStore,
     ToolCall,
+    _allows_non_git_local_research,
     _validation_issue_summary,
 )
 from repopilot_guard.execution import PatchProposal
 from repopilot_guard.config import ComponentCheck
-from repopilot_guard.models import TaskBudget, TaskOperation, TaskRequest, VerificationContract
+from repopilot_guard.models import TaskBudget, TaskOperation, TaskRequest, VerificationContract, WorkspaceMode, WorkspaceSelection
+from repopilot_guard.permissions import FULL_ACCESS_CONFIRMATION, PermissionGrant, PermissionMode
 from repopilot_guard.workspace import WorkspaceManager
 
 
@@ -53,6 +55,24 @@ class ReadyChecker(GraphPreflightChecker):
         return PhaseOnePreflightResult(True, (ComponentCheck("all", True, "READY", "测试预检通过。"),))
 
 
+class NonGitDirectoryChecker(GraphPreflightChecker):
+    """模拟存在但不是 Git/Maven 工程的本地目录预检结果。"""
+
+    def check(self, repository: Path) -> PhaseOnePreflightResult:
+        return PhaseOnePreflightResult(
+            False,
+            (
+                ComponentCheck(
+                    "repository",
+                    False,
+                    "REPOSITORY_PREFLIGHT_FAILED",
+                    "仓库预检失败。",
+                    ("Repository is not a Git working tree.", "Maven pom.xml was not found."),
+                ),
+            ),
+        )
+
+
 class FakeContextService:
     def ingest(self, workspace: object, project_id: str, permission: object) -> IndexResult:
         return IndexResult("READY", "CONTEXT_INDEXED", "测试索引完成。", indexed_chunks=1)
@@ -63,6 +83,34 @@ class FakeContextService:
             "CONTEXT_RETRIEVED",
             "测试检索完成。",
             (RetrievedContext("class OrderService {}", 0.9, "src/main/java/com/example/OrderService.java", 1, 2, "code", "code"),),
+        )
+
+
+class AttachmentAwareFakeContextService(FakeContextService):
+    def task_attachments(
+        self,
+        project_id: str,
+        repo_commit: str,
+        document_ids: tuple[str, ...],
+    ) -> AttachedDocumentContextResult:
+        if project_id != "orders" or document_ids != ("a" * 64,):
+            return AttachedDocumentContextResult("BLOCKED", "TASK_ATTACHMENT_NOT_FOUND", "测试附件不存在。")
+        return AttachedDocumentContextResult(
+            "READY",
+            "TASK_ATTACHMENTS_READY",
+            "测试附件已冻结。",
+            (
+                RetrievedContext(
+                    "需求规定订单查询必须按租户过滤。",
+                    1.0,
+                    "uploaded_documents/requirements.md",
+                    1,
+                    1,
+                    "task_attachment",
+                    "a" * 64,
+                ),
+            ),
+            ({"document_id": "a" * 64, "display_name": "requirements.md", "content_sha256": "b" * 64},),
         )
 
 
@@ -543,10 +591,80 @@ class PhaseFourGraphTests(unittest.TestCase):
         self.assertIn('"field": "changes"', model.calls[1][-1]["content"])
         self.assertNotIn("无效补丁", model.calls[1][-1]["content"])
 
-    def _runner(self, database: Path, model: PlannedResearchModel) -> tuple[GraphRunner, SqliteCheckpointStore]:
+    def _runner(
+        self,
+        database: Path,
+        model: PlannedResearchModel,
+        context_service: object | None = None,
+    ) -> tuple[GraphRunner, SqliteCheckpointStore]:
         store = SqliteCheckpointStore(database)
-        graph = CodingGraphFactory(ReadyChecker(), context_service=FakeContextService(), research_model=model).create(store.checkpointer)
+        graph = CodingGraphFactory(
+            ReadyChecker(),
+            context_service=context_service or FakeContextService(),
+            research_model=model,
+        ).create(store.checkpointer)
         return GraphRunner(graph), store
+
+    def test_full_local_research_allows_existing_non_git_non_maven_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            directory = root / "notes"
+            directory.mkdir()
+            (directory / "README.md").write_text("# 产品说明\n", encoding="utf-8")
+            store = SqliteCheckpointStore(root / "state.sqlite")
+            graph = CodingGraphFactory(
+                NonGitDirectoryChecker(),
+                context_service=FakeContextService(),
+                research_model=PlannedResearchModel(),
+            ).create(store.checkpointer)
+            runner = GraphRunner(graph)
+            try:
+                result = runner.run(
+                    TaskRequest(
+                        directory,
+                        "介绍这个目录中的项目结构",
+                        root / "runs",
+                        operation=TaskOperation.RESEARCH,
+                        workspace_selection=WorkspaceSelection(mode=WorkspaceMode.LOCAL),
+                    ),
+                    "non-git-research-thread",
+                    PermissionGrant(PermissionMode.FULL, FULL_ACCESS_CONFIRMATION),
+                )
+            finally:
+                store.close()
+
+        self.assertEqual("WAITING_APPROVAL", result.status)
+        preflight = next(event for event in result.state["tool_events"] if event["type"] == "PREFLIGHT_COMPLETED")
+        repository_check = next(check for check in preflight["checks"] if check["component"] == "repository")
+        self.assertEqual("NON_GIT_LOCAL_READY", repository_check["code"])
+        self.assertEqual("READY", repository_check["status"])
+
+    def test_non_git_preflight_bypass_requires_research_operation(self) -> None:
+        result = PhaseOnePreflightResult(
+            False,
+            (
+                ComponentCheck(
+                    "repository",
+                    False,
+                    "REPOSITORY_PREFLIGHT_FAILED",
+                    "仓库预检失败。",
+                    ("Repository is not a Git working tree.", "Maven pom.xml was not found."),
+                ),
+            ),
+        )
+        base_state = {
+            "workspace_mode": WorkspaceMode.LOCAL.value,
+            "permission_mode": PermissionMode.FULL.value,
+            "task_operation": TaskOperation.RESEARCH.value,
+        }
+
+        self.assertTrue(_allows_non_git_local_research(base_state, result))
+        self.assertFalse(
+            _allows_non_git_local_research(
+                {**base_state, "task_operation": TaskOperation.CHANGE.value},
+                result,
+            )
+        )
 
     def test_graph_runs_read_only_research_then_pauses_and_recovers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -571,6 +689,42 @@ class PhaseFourGraphTests(unittest.TestCase):
             store.close()
         self.assertEqual("WAITING_APPROVAL", completed.status)
         self.assertEqual("EXECUTION_REVIEW", completed.state["pending_approval_action"])
+
+    def test_task_attachment_is_frozen_into_context_and_survives_approval_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repository = create_java_repository(root)
+            runner, store = self._runner(
+                root / "state.sqlite",
+                PlannedResearchModel(),
+                AttachmentAwareFakeContextService(),
+            )
+            try:
+                initial = runner.run(
+                    TaskRequest(
+                        repository,
+                        "依据需求文档分析订单权限",
+                        root / "runs",
+                        project_id="orders",
+                        attached_document_ids=("a" * 64,),
+                    ),
+                    "attachment-thread",
+                )
+                resumed = runner.resume("attachment-thread", approved=True)
+            finally:
+                store.close()
+
+        self.assertEqual(["a" * 64], initial.state["attached_document_ids"])
+        self.assertEqual("requirements.md", initial.state["attached_documents"][0]["display_name"])
+        self.assertIn(
+            "task_attachment",
+            {item["source_type"] for item in initial.state["context_snapshot"]["sources"]},
+        )
+        self.assertIn(
+            "TASK_ATTACHMENTS_RESOLVED",
+            {str(event.get("type")) for event in initial.state["tool_events"]},
+        )
+        self.assertEqual(["a" * 64], resumed.state["attached_document_ids"])
 
     def test_research_operation_reports_after_plan_approval_without_patch_or_maven(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

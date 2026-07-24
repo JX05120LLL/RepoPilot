@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from time import monotonic, sleep
 import os
 import shutil
 import sqlite3
@@ -43,6 +44,7 @@ from repopilot_guard.providers import OpenAICompatibleProvider
 from repopilot_guard.qdrant_bootstrap import QdrantBootstrapper, check_qdrant_health
 from repopilot_guard.skills import SkillError, SkillRegistry
 from repopilot_guard.task_store import StoredTask, TaskStore
+from repopilot_guard.task_progress import build_task_progress
 from repopilot_guard.task_export import TaskEvidenceExporter
 from repopilot_guard.workspace import GitClient, GitCommandError, WorkspaceManager
 
@@ -88,6 +90,10 @@ def build_parser() -> argparse.ArgumentParser:
     desktop_subparsers = desktop_parser.add_subparsers(dest="desktop_command", required=True)
     desktop_subparsers.add_parser("doctor", help="只读检查 Vite/Tauri、Rust 和 Windows 链接器依赖")
     desktop_subparsers.add_parser("paths", help="只读显示桌面端配置和状态目录")
+    desktop_subparsers.add_parser("init-config", help="在桌面端应用数据目录创建不含密钥的 settings.env 模板")
+    desktop_preview = desktop_subparsers.add_parser("preview", help="以前台方式启动本机 FastAPI 与 Vite 桌面预览")
+    desktop_preview.add_argument("--port", type=_valid_local_port, default=8765, help="本机 API 端口，默认 8765")
+    desktop_preview.add_argument("--ui-port", type=_valid_local_port, default=1420, help="Vite 预览端口，默认 1420")
 
     project_parser = subparsers.add_parser("project", help="管理已授权的本地项目目录")
     project_subparsers = project_parser.add_subparsers(dest="project_command", required=True)
@@ -232,6 +238,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_start.add_argument("--start-ref", default="HEAD", help="安全隔离修复使用的 Git 起始分支或提交")
     task_start.add_argument("--include-uncommitted-changes", action="store_true", help="显式将未提交改动带入隔离工作区")
     task_start.add_argument("--approve-mcp-tool", action="append", default=[], help="显式授权本任务使用的只读 MCP capability ID，可重复提供")
+    task_start.add_argument("--document-id", action="append", default=[], help="显式绑定一份已导入的 MD/TXT 研发文档到本任务，可重复提供，最多 4 份")
     task_start.add_argument("--thread-id", help="用于恢复和审计的稳定任务线程 ID")
     task_start.add_argument("--output", type=Path, default=default_output_root(), help="任务证据与报告产物目录")
     task_start.add_argument("--state-db", type=Path, help="SQLite checkpoint 路径")
@@ -243,6 +250,12 @@ def build_parser() -> argparse.ArgumentParser:
     task_events.add_argument("--after-sequence", type=int, default=0, help="只返回该序号之后的事件")
     task_events.add_argument("--limit", type=int, default=100, help="返回 1-500 个事件，默认 100")
     task_events.add_argument("--state-db", type=Path)
+    task_watch = task_subparsers.add_parser("watch", help="持续输出新增脱敏证据，任务终态后自动结束")
+    task_watch.add_argument("--thread-id", required=True)
+    task_watch.add_argument("--after-sequence", type=int, default=0, help="从该序号之后开始读取，默认 0")
+    task_watch.add_argument("--interval-ms", type=int, default=750, help="轮询间隔 100-10000 毫秒，默认 750")
+    task_watch.add_argument("--timeout-seconds", type=int, default=300, help="最多等待 0-86400 秒；0 只读取当前快照")
+    task_watch.add_argument("--state-db", type=Path)
     task_decide = task_subparsers.add_parser("decide", help="批准、要求重写或拒绝当前审批关卡")
     task_decide.add_argument("--thread-id", required=True)
     task_decide.add_argument("--decision", choices=["approve", "revise", "reject"], required=True)
@@ -602,7 +615,7 @@ def _welcome_next_action(project: dict[str, object]) -> dict[str, str]:
 
 
 def _run_desktop(args: argparse.Namespace) -> int:
-    """检查桌面开发和打包前置条件，不启动子进程或修改本机环境。"""
+    """检查桌面开发与配置路径；仅 init-config 会显式创建配置模板。"""
 
     if args.desktop_command == "paths":
         runtime_dir = _desktop_runtime_dir()
@@ -611,11 +624,15 @@ def _run_desktop(args: argparse.Namespace) -> int:
                 "status": "READY",
                 "code": "DESKTOP_RUNTIME_PATHS_READY",
                 "runtime_dir": str(runtime_dir),
-                "config_file": str(runtime_dir / ".env"),
+                "config_file": str(_desktop_config_file(runtime_dir)),
                 "state_db": str(runtime_dir / "state.sqlite"),
                 "message": "本命令只计算路径，不创建目录、读取配置或输出密钥。",
             }
         )
+    if args.desktop_command == "init-config":
+        return _initialize_desktop_config()
+    if args.desktop_command == "preview":
+        return _run_desktop_preview(args.port, args.ui_port)
     if args.desktop_command != "doctor":
         return 2
     repository_root = Path(__file__).resolve().parents[2]
@@ -657,6 +674,61 @@ def _run_desktop(args: argparse.Namespace) -> int:
     return _print_json_result(payload, 0 if package_ready else 2)
 
 
+def _valid_local_port(value: str) -> int:
+    """限制预览启动器只接收单个合法端口，绝不把用户输入拼进 Shell 命令。"""
+
+    try:
+        port = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("端口必须是整数。") from error
+    if not 1 <= port <= 65_535:
+        raise argparse.ArgumentTypeError("端口必须在 1 到 65535 之间。")
+    return port
+
+
+def _run_desktop_preview(port: int, ui_port: int = 1420) -> int:
+    """以固定 PowerShell 参数启动开发预览，不使用 shell 或拼接用户字符串。"""
+
+    script = Path(__file__).resolve().parents[2] / "scripts" / "start-desktop-preview.ps1"
+    powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+    if not script.is_file() or not powershell:
+        return _print_json_result(
+            {
+                "status": "BLOCKED",
+                "code": "DESKTOP_PREVIEW_LAUNCHER_UNAVAILABLE",
+                "message": "未找到桌面预览脚本或 Windows PowerShell；未启动任何进程。",
+            },
+            2,
+        )
+    try:
+        completed = subprocess.run(
+            (
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(script),
+                "-ApiPort",
+                str(port),
+                "-UiPort",
+                str(ui_port),
+            ),
+            cwd=script.parents[1],
+            check=False,
+        )
+    except OSError:
+        return _print_json_result(
+            {
+                "status": "BLOCKED",
+                "code": "DESKTOP_PREVIEW_START_FAILED",
+                "message": "桌面预览未启动；请检查 uv、Node.js 与端口占用。",
+            },
+            2,
+        )
+    return completed.returncode
+
+
 def _desktop_runtime_dir() -> Path:
     override = os.environ.get("REPOPILOT_DESKTOP_DATA_DIR")
     if override:
@@ -668,6 +740,49 @@ def _desktop_runtime_dir() -> Path:
         return (Path.home() / "Library" / "Application Support" / identifier).resolve()
     data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
     return (data_home / identifier).expanduser().resolve()
+
+
+def _desktop_config_file(runtime_dir: Path | None = None) -> Path:
+    return (runtime_dir or _desktop_runtime_dir()) / "settings.env"
+
+
+def _initialize_desktop_config() -> int:
+    """显式生成桌面端配置模板，不复制用户现有 `.env` 或覆盖既有文件。"""
+
+    runtime_dir = _desktop_runtime_dir()
+    config_file = _desktop_config_file(runtime_dir)
+    template = Path(__file__).resolve().parents[2] / ".env.example"
+    if config_file.exists():
+        return _print_json_result(
+            {
+                "status": "BLOCKED",
+                "code": "DESKTOP_CONFIG_FILE_EXISTS",
+                "config_file": str(config_file),
+                "message": "桌面端配置文件已存在，未读取或覆盖其内容。",
+            },
+            2,
+        )
+    try:
+        content = template.read_text(encoding="utf-8")
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        config_file.write_text(content, encoding="utf-8", newline="\n")
+    except OSError:
+        return _print_json_result(
+            {
+                "status": "BLOCKED",
+                "code": "DESKTOP_CONFIG_TEMPLATE_CREATE_FAILED",
+                "message": "无法创建桌面端配置模板；未输出或读取任何密钥。",
+            },
+            2,
+        )
+    return _print_json_result(
+        {
+            "status": "READY",
+            "code": "DESKTOP_CONFIG_TEMPLATE_CREATED",
+            "config_file": str(config_file),
+            "message": "已创建不含密钥的桌面端配置模板；填写后重启 RepoPilot Desktop。",
+        }
+    )
 
 
 def _desktop_file_check(component: str, path: Path, ready_message: str) -> ComponentCheck:
@@ -1142,7 +1257,7 @@ def _run_task(args: argparse.Namespace) -> int:
 
     registry: ProjectRegistry | None = None
     try:
-        if args.task_command in {"list", "events", "archive"}:
+        if args.task_command in {"list", "events", "watch", "archive"}:
             return _run_task_store_command(args)
         if args.task_command in {"artifacts", "artifact", "export"}:
             return _run_task_artifact_command(args)
@@ -1206,6 +1321,14 @@ def _run_task(args: argparse.Namespace) -> int:
                 assert permission is not None and workspace_mode is not None
                 assert start_repository is not None
                 repository = start_repository
+                attached_document_ids = tuple(args.document_id)
+                if attached_document_ids:
+                    if registry is None or not args.project_id:
+                        raise ValueError("TASK_ATTACHMENTS_REQUIRE_PROJECT")
+                    ManagedDocumentStore(registry.database_path).require_documents(
+                        project_id=args.project_id,
+                        document_ids=attached_document_ids,
+                    )
                 request = TaskRequest(
                     repository=repository,
                     description=args.task,
@@ -1217,6 +1340,7 @@ def _run_task(args: argparse.Namespace) -> int:
                         include_uncommitted_changes=args.include_uncommitted_changes,
                     ),
                     approved_mcp_tools=tuple(args.approve_mcp_tool),
+                    attached_document_ids=attached_document_ids,
                     operation=TaskOperation(args.operation),
                 )
                 thread_id = args.thread_id or str(uuid4())
@@ -1368,6 +1492,8 @@ def _run_task_store_command(args: argparse.Namespace) -> int:
                     "tasks": tasks,
                 }
             )
+        if args.task_command == "watch":
+            return _run_task_watch(store, args)
         if args.task_command == "events":
             if args.after_sequence < 0:
                 raise ValueError("TASK_EVENT_CURSOR_INVALID")
@@ -1397,6 +1523,8 @@ def _run_task_store_command(args: argparse.Namespace) -> int:
             "TASK_LIST_LIMIT_INVALID",
             "TASK_EVENT_CURSOR_INVALID",
             "TASK_EVENT_LIMIT_INVALID",
+            "TASK_WATCH_INTERVAL_INVALID",
+            "TASK_WATCH_TIMEOUT_INVALID",
         }
         return _print_json_result(
             {
@@ -1408,6 +1536,84 @@ def _run_task_store_command(args: argparse.Namespace) -> int:
         )
     finally:
         store.close()
+
+
+def _run_task_watch(store: TaskStore, args: argparse.Namespace) -> int:
+    """以 JSONL 跟随任务事件，不构造 Agent 依赖或改变任务状态。"""
+
+    if args.after_sequence < 0:
+        raise ValueError("TASK_EVENT_CURSOR_INVALID")
+    if not 100 <= args.interval_ms <= 10_000:
+        raise ValueError("TASK_WATCH_INTERVAL_INVALID")
+    if not 0 <= args.timeout_seconds <= 86_400:
+        raise ValueError("TASK_WATCH_TIMEOUT_INVALID")
+
+    cursor = args.after_sequence
+    deadline = monotonic() + args.timeout_seconds
+    _print_json_line(
+        {
+            "status": "READY",
+            "code": "TASK_WATCH_STARTED",
+            "thread_id": args.thread_id,
+            "after_sequence": cursor,
+            "timeout_seconds": args.timeout_seconds,
+        }
+    )
+    try:
+        while True:
+            events = store.events_after(args.thread_id, cursor, limit=500)
+            for event in events:
+                cursor = event.sequence
+                _print_json_line(
+                    {
+                        "status": "READY",
+                        "code": "TASK_WATCH_EVENT",
+                        "thread_id": args.thread_id,
+                        "event": event.to_dict(),
+                    }
+                )
+
+            task = store.get(args.thread_id)
+            if task.status in {"REPORT", "BLOCKED", "CANCELLED", "FAILED"}:
+                _print_json_line(
+                    {
+                        "status": "READY",
+                        "code": "TASK_WATCH_FINISHED",
+                        "thread_id": args.thread_id,
+                        "next_sequence": cursor,
+                        "task": _stored_task_summary(task),
+                    }
+                )
+                return 0
+            if args.timeout_seconds == 0 or monotonic() >= deadline:
+                _print_json_line(
+                    {
+                        "status": "READY",
+                        "code": "TASK_WATCH_TIMEOUT",
+                        "thread_id": args.thread_id,
+                        "next_sequence": cursor,
+                        "task": _stored_task_summary(task),
+                        "next_action": {
+                            "type": "RESUME_TASK_WATCH",
+                            "command": (
+                                "repopilot-guard task watch --thread-id "
+                                f"{args.thread_id} --after-sequence {cursor}"
+                            ),
+                        },
+                    }
+                )
+                return 0
+            sleep(args.interval_ms / 1000)
+    except KeyboardInterrupt:
+        _print_json_line(
+            {
+                "status": "READY",
+                "code": "TASK_WATCH_INTERRUPTED",
+                "thread_id": args.thread_id,
+                "next_sequence": cursor,
+            }
+        )
+        return 130
 
 
 def _run_task_status(args: argparse.Namespace) -> int:
@@ -1498,6 +1704,12 @@ def _indexed_task_status(task: StoredTask) -> dict[str, object]:
         "plan": None,
         "verification": None,
         "evidence": None,
+        "progress": build_task_progress(
+            status=task.status,
+            pending_approval=task.pending_approval,
+            verdict=task.verdict,
+            task_operation=task.task_operation,
+        ),
         "next_action": next_action,
         "message": "已从本机任务索引读取状态；Graph 详情因配置或 checkpoint 不可用而省略。",
     }
@@ -1587,7 +1799,6 @@ def _task_summary(result: object) -> dict[str, object]:
         "task_operation": state.get("task_operation", TaskOperation.CHANGE.value),
         "verdict": raw.get("verdict"),
         "pending_approval": raw.get("pending_approval", False),
-        "interrupts": raw.get("interrupts", []),
         "workspace": {
             "mode": state.get("workspace_mode"),
             "path": state.get("workspace_path"),
@@ -1595,8 +1806,19 @@ def _task_summary(result: object) -> dict[str, object]:
             "permission": state.get("permission_mode"),
         },
         "plan": _task_plan_summary(plan),
+        "approval": _task_approval_summary(raw, state, plan),
+        "attached_documents": _task_attachment_summary(state.get("attached_documents")),
         "verification": verification if isinstance(verification, dict) else None,
         "evidence": {"event_count": len(event_types), "recent_event_types": event_types[-12:]},
+        "progress": build_task_progress(
+            status=raw.get("status"),
+            pending_approval=raw.get("pending_approval", False),
+            pending_approval_action=state.get("pending_approval_action"),
+            verdict=raw.get("verdict"),
+            task_operation=state.get("task_operation", TaskOperation.CHANGE.value),
+            tool_events=events,
+            verification=verification,
+        ),
         "next_action": _task_next_action(raw, state),
     }
 
@@ -1616,6 +1838,83 @@ def _task_plan_summary(plan: object) -> dict[str, object] | None:
         return None
     allowed = ("summary", "candidate_files", "steps", "verification", "assumptions", "risks", "verification_recipe", "target_test_class")
     return {key: plan[key] for key in allowed if key in plan}
+
+
+def _task_attachment_summary(value: object) -> list[dict[str, str]]:
+    """CLI 仅展示冻结附件的可审计元数据，避免输出本机路径或研发文档正文。"""
+
+    if not isinstance(value, list):
+        return []
+    result: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        document_id = item.get("document_id")
+        display_name = item.get("display_name")
+        content_sha256 = item.get("content_sha256")
+        if not (
+            isinstance(document_id, str)
+            and len(document_id) == 64
+            and all(character in "0123456789abcdef" for character in document_id)
+            and isinstance(display_name, str)
+            and 0 < len(display_name) <= 128
+            and all(character.isascii() and (character.isalnum() or character in "._-") for character in display_name)
+            and isinstance(content_sha256, str)
+            and len(content_sha256) == 64
+            and all(character in "0123456789abcdef" for character in content_sha256)
+        ):
+            continue
+        result.append(
+            {
+                "document_id": document_id,
+                "display_name": display_name,
+                "content_sha256": content_sha256,
+            }
+        )
+    return result[:4]
+
+
+def _task_approval_summary(
+    raw: dict[str, object],
+    state: dict[str, object],
+    plan: object,
+) -> dict[str, object] | None:
+    """输出可供人工决策的审批边界，避免复述模型消息或工具原文。"""
+
+    if not raw.get("pending_approval"):
+        return None
+    interrupts = raw.get("interrupts")
+    interrupt = (
+        interrupts[0]
+        if isinstance(interrupts, list) and interrupts and isinstance(interrupts[0], dict)
+        else {}
+    )
+    plan_data = plan if isinstance(plan, dict) else {}
+    raw_candidate_files = interrupt.get("candidate_files", plan_data.get("candidate_files", []))
+    candidate_files = (
+        [item for item in raw_candidate_files if isinstance(item, str)][:50]
+        if isinstance(raw_candidate_files, list)
+        else []
+    )
+    recipe = interrupt.get("recipe", plan_data.get("verification_recipe"))
+    target_test_class = interrupt.get("target_test_class", plan_data.get("target_test_class"))
+    interrupt_type = str(interrupt.get("type", "APPROVAL_REQUIRED"))
+    execution_review = interrupt_type == "EXECUTION_APPROVAL_REQUIRED"
+    return {
+        "stage": state.get("pending_approval_action")
+        or ("EXECUTION_REVIEW" if execution_review else "PLAN_REVIEW"),
+        "type": interrupt_type,
+        "candidate_files": candidate_files,
+        "verification_recipe": recipe if isinstance(recipe, str) else None,
+        "target_test_class": target_test_class if isinstance(target_test_class, str) else None,
+        "write_after_approval": execution_review,
+        "allowed_decisions": ["approve", "reject"] if execution_review else ["approve", "revise", "reject"],
+        "summary": (
+            "批准后才会生成受控补丁并执行固定 Maven 配方。"
+            if execution_review
+            else "请审阅计划范围；确认计划本身不会写入代码。"
+        ),
+    }
 
 
 def _task_next_action(raw: dict[str, object], state: dict[str, object]) -> dict[str, str]:
@@ -1695,6 +1994,12 @@ def _mode_context(args: argparse.Namespace) -> tuple[PermissionGrant, WorkspaceM
 def _print_json_result(payload: dict[str, object], exit_code: int = 0) -> int:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return exit_code
+
+
+def _print_json_line(payload: dict[str, object]) -> None:
+    """流式 CLI 输出保持单行 JSON，便于终端和自动化消费者逐条处理。"""
+
+    print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
 def _run_doctor() -> int:

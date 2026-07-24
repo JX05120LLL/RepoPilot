@@ -3,20 +3,22 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from threading import Event, Thread
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 
 from repopilot_guard import __version__
-from repopilot_guard.config import ComponentCheck
+from repopilot_guard.config import ComponentCheck, RuntimeConfigurationError, RuntimeConfigurationManager
 from repopilot_guard.context import ManagedDocumentStore
 from repopilot_guard.document_indexing import index_uploaded_document
 from repopilot_guard.graph import GraphRunner
@@ -27,6 +29,8 @@ from repopilot_guard.permissions import FULL_ACCESS_CONFIRMATION, PermissionGran
 from repopilot_guard.plugins import PluginError, PluginRegistry
 from repopilot_guard.project_diagnostics import assess_task_admission, diagnose_project
 from repopilot_guard.project_registry import ProjectRegistry
+from repopilot_guard.task_export import TaskEvidenceExporter
+from repopilot_guard.task_progress import build_task_progress
 from repopilot_guard.task_store import StoredTaskEvent, TaskStore
 
 
@@ -40,6 +44,7 @@ class CreateTaskBody(BaseModel):
     thread_id: str | None = None
     output_root: str | None = None
     approved_mcp_tools: list[str] = Field(default_factory=list, max_length=64)
+    attached_document_ids: list[str] = Field(default_factory=list, max_length=4)
 
 
 class ApprovalBody(BaseModel):
@@ -81,6 +86,78 @@ class DocumentIndexBody(BaseModel):
     file: str = Field(min_length=1, max_length=1024)
 
 
+class RuntimeConfigurationBody(BaseModel):
+    """桌面端可编辑字段。密钥只用于本次写入，不会出现在响应中。"""
+
+    chat_base_url: str | None = Field(default=None, max_length=1024)
+    chat_api_key: SecretStr | None = Field(default=None, max_length=1024)
+    chat_model: str | None = Field(default=None, max_length=256)
+    embedding_base_url: str | None = Field(default=None, max_length=1024)
+    embedding_api_key: SecretStr | None = Field(default=None, max_length=1024)
+    embedding_model: str | None = Field(default=None, max_length=256)
+    embedding_dimensions: int | None = Field(default=None, ge=1, le=65_536)
+    qdrant_url: str | None = Field(default=None, max_length=1024)
+
+    def update_values(self) -> dict[str, object]:
+        values = self.model_dump(exclude_unset=True)
+        mapping = {
+            "chat_base_url": "REPOPILOT_CHAT_BASE_URL",
+            "chat_api_key": "REPOPILOT_CHAT_API_KEY",
+            "chat_model": "REPOPILOT_CHAT_MODEL",
+            "embedding_base_url": "REPOPILOT_EMBEDDING_BASE_URL",
+            "embedding_api_key": "REPOPILOT_EMBEDDING_API_KEY",
+            "embedding_model": "REPOPILOT_EMBEDDING_MODEL",
+            "embedding_dimensions": "REPOPILOT_EMBEDDING_DIMENSIONS",
+            "qdrant_url": "REPOPILOT_QDRANT_URL",
+        }
+        return {
+            mapping[name]: value.get_secret_value() if isinstance(value, SecretStr) else value
+            for name, value in values.items()
+        }
+
+
+class TaskExportBody(BaseModel):
+    """导出路径必须由用户显式提供，服务端不猜测或覆盖既有文件。"""
+
+    output: str = Field(min_length=1, max_length=1024)
+
+
+def _desktop_allowed_origins() -> list[str]:
+    """仅允许 Tauri 和开发预览显式声明的 loopback 来源。"""
+
+    origins = [
+        "http://127.0.0.1:1420",
+        "http://localhost:1420",
+        "http://tauri.localhost",
+        "https://tauri.localhost",
+    ]
+    configured = os.environ.get("REPOPILOT_DESKTOP_PREVIEW_ORIGIN")
+    if not configured:
+        return origins
+    try:
+        parsed = urlparse(configured)
+        port = parsed.port
+    except ValueError:
+        return origins
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "localhost"}
+        or port is None
+        or not 1 <= port <= 65_535
+        or parsed.path not in {"", "/"}
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or parsed.username
+        or parsed.password
+    ):
+        return origins
+    origin = f"{parsed.scheme}://{parsed.hostname}:{port}"
+    if origin not in origins:
+        origins.append(origin)
+    return origins
+
+
 def create_app(
     runner: GraphRunner,
     registry: ProjectRegistry,
@@ -90,6 +167,7 @@ def create_app(
     plugin_registry: PluginRegistry | None = None,
     document_indexer: Callable[[str, Path], dict[str, object]] | None = None,
     runtime_health_checks: Callable[[], tuple[ComponentCheck, ...]] | None = None,
+    runtime_configuration_manager: RuntimeConfigurationManager | None = None,
 ) -> FastAPI:
     """创建 API；调用者负责复用 SQLite graph runner 与项目注册表。"""
 
@@ -100,6 +178,7 @@ def create_app(
     create_mcp_runtime = mcp_runtime_factory or (lambda configuration, root: McpRuntime(configuration, workspace_root=root))
     index_document = document_indexer or (lambda project_id, source: index_uploaded_document(registry, project_id, source))
     check_runtime = runtime_health_checks or (lambda: ())
+    runtime_configuration = runtime_configuration_manager or RuntimeConfigurationManager()
     # 当前 FastAPI/Starlette 版本通过 Router 生命周期关闭 SQLite 连接。
     app.router.on_shutdown.append(store.close)
     if plugin_registry is None:
@@ -107,13 +186,7 @@ def create_app(
     # 开发期前端运行在 Vite 的独立本机端口，生产权限仍由 Python 后端裁决。
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[
-            "http://127.0.0.1:1420",
-            "http://localhost:1420",
-            # Tauri 2 在生产桌面壳中以本机自定义协议加载页面。
-            "http://tauri.localhost",
-            "https://tauri.localhost",
-        ],
+        allow_origins=_desktop_allowed_origins(),
         allow_credentials=False,
         allow_methods=["GET", "POST", "DELETE"],
         allow_headers=["Content-Type"],
@@ -137,8 +210,27 @@ def create_app(
             "agent_status": "READY" if all(check.ready for check in checks) else "BLOCKED",
             "version": __version__,
             "scope": "127.0.0.1-only",
+            # 前端按能力而非包版本启用可选操作，避免开发预览前后端热更新不同步。
+            "capabilities": ["task_artifacts", "task_artifact_versions", "task_evidence_export", "runtime_configuration"],
             "dependencies": [check.to_dict() for check in checks],
         }
+
+    @app.get("/api/runtime/configuration")
+    def runtime_configuration_snapshot() -> dict[str, object]:
+        """仅返回非敏感配置与密钥是否已设置。"""
+
+        return runtime_configuration.snapshot()
+
+    @app.post("/api/runtime/configuration")
+    def update_runtime_configuration(body: RuntimeConfigurationBody) -> dict[str, object]:
+        """保存到 Tauri 托管的应用数据目录；开发仓库 `.env` 始终拒绝。"""
+
+        try:
+            return runtime_configuration.update(body.update_values())
+        except RuntimeConfigurationError as error:
+            code = str(error)
+            status = 409 if code.startswith("CONFIGURATION_WRITE_") or code == "CONFIGURATION_DIRECTORY_UNAVAILABLE" else 400
+            raise HTTPException(status, {"code": code, "message": "运行配置未保存。"}) from error
 
     @app.get("/api/projects")
     def list_projects() -> dict[str, object]:
@@ -255,6 +347,22 @@ def create_app(
         try:
             repository = registry.get(body.project_id).root_path if body.project_id else Path(str(body.repository))
             grant = _grant_for_mode(body.task_mode, body.confirmation)
+            attached_document_ids = tuple(body.attached_document_ids)
+            if attached_document_ids:
+                try:
+                    ManagedDocumentStore(registry.database_path).require_documents(
+                        project_id=body.project_id or "",
+                        document_ids=attached_document_ids,
+                    )
+                except ValueError as error:
+                    raise HTTPException(
+                        409,
+                        {
+                            "status": "BLOCKED",
+                            "code": str(error),
+                            "message": "任务附件必须是当前项目中已经受控导入的 MD/TXT 文档。",
+                        },
+                    ) from error
             admission = assess_task_admission(repository, body.task_mode, body.operation)
             if not admission.ready:
                 raise HTTPException(409, admission.to_dict())
@@ -265,6 +373,7 @@ def create_app(
                 project_id=body.project_id,
                 workspace_selection=WorkspaceSelection(mode=body.task_mode.workspace_mode),
                 approved_mcp_tools=tuple(body.approved_mcp_tools),
+                attached_document_ids=attached_document_ids,
                 operation=body.operation,
             )
             thread_id = body.thread_id or str(uuid4())
@@ -441,6 +550,7 @@ def create_app(
             "available": available,
             "context_snapshot": snapshot if available else None,
             "references": (result.state.get("context_references") or []) if available else [],
+            "attached_documents": _safe_attached_documents(result.state.get("attached_documents")),
         }
 
     @app.get("/api/tasks/{thread_id}/artifacts")
@@ -450,6 +560,19 @@ def create_app(
             return {"artifacts": [item.to_dict() for item in store.artifacts(thread_id)]}
         except (KeyError, ValueError) as error:
             raise HTTPException(404, "TASK_ARTIFACTS_NOT_FOUND") from error
+
+    @app.post("/api/tasks/{thread_id}/export")
+    def export_task_evidence(thread_id: str, body: TaskExportBody) -> dict[str, object]:
+        """导出终态任务的审计包，完整性检查始终在服务端执行。"""
+
+        output = Path(body.output).expanduser()
+        if not output.is_absolute():
+            raise HTTPException(422, "TASK_EXPORT_OUTPUT_MUST_BE_ABSOLUTE")
+        try:
+            exported = TaskEvidenceExporter(store).export(thread_id, output)
+            return {"export": exported.to_dict()}
+        except ValueError as error:
+            _raise_task_export_error(str(error))
 
     @app.get("/api/tasks/{thread_id}/artifacts/{kind}/versions")
     def list_task_artifact_versions(thread_id: str, kind: str) -> dict[str, object]:
@@ -574,6 +697,61 @@ def _project_relative_path(project_root: Path, requested: str) -> Path:
     return target
 
 
+def _raise_task_export_error(code: str) -> None:
+    """把可预期的导出失败转换成稳定、无路径泄露的 HTTP 语义。"""
+
+    if code == "TASK_NOT_FOUND":
+        raise HTTPException(404, code)
+    if code in {
+        "TASK_EXPORT_NOT_FINALIZED",
+        "TASK_EXPORT_OUTPUT_EXISTS",
+        "TASK_EXPORT_ARTIFACT_INVALID",
+        "TASK_ARTIFACT_INTEGRITY_MISMATCH",
+    }:
+        raise HTTPException(409, code)
+    if code in {
+        "TASK_EXPORT_ARTIFACT_TOO_LARGE",
+        "TASK_EXPORT_EVIDENCE_TOO_LARGE",
+        "TASK_EXPORT_TOO_LARGE",
+    }:
+        raise HTTPException(413, code)
+    raise HTTPException(422, code if code.startswith("TASK_EXPORT_") else "TASK_EXPORT_FAILED")
+
+
+def _safe_attached_documents(value: object) -> list[dict[str, str]]:
+    """仅投影用于审阅的任务附件元数据，拒绝 checkpoint 中的路径或内容字段。"""
+
+    if not isinstance(value, list):
+        return []
+    safe: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        document_id = item.get("document_id")
+        display_name = item.get("display_name")
+        content_sha256 = item.get("content_sha256")
+        if not (
+            isinstance(document_id, str)
+            and len(document_id) == 64
+            and all(character in "0123456789abcdef" for character in document_id)
+            and isinstance(display_name, str)
+            and 0 < len(display_name) <= 128
+            and all(character.isascii() and (character.isalnum() or character in "._-") for character in display_name)
+            and isinstance(content_sha256, str)
+            and len(content_sha256) == 64
+            and all(character in "0123456789abcdef" for character in content_sha256)
+        ):
+            continue
+        safe.append(
+            {
+                "document_id": document_id,
+                "display_name": display_name,
+                "content_sha256": content_sha256,
+            }
+        )
+    return safe[:4]
+
+
 def _task_snapshot(
     runner: GraphRunner,
     task_store: TaskStore,
@@ -585,7 +763,7 @@ def _task_snapshot(
     persisted = task_store.get(thread_id)
     runtime_failed = (persisted.error_summary or "").startswith("TASK_RUNTIME_FAILED")
     if persisted.lease_expires_at or persisted.cancellation_requested_at or persisted.error_summary == "TASK_LEASE_EXPIRED":
-        return persisted.to_dict()
+        return _with_task_progress(persisted.to_dict(), task_store)
     if runtime_failed:
         try:
             result = runner.get(thread_id).to_dict()
@@ -600,7 +778,7 @@ def _task_snapshot(
             snapshot = persisted.to_dict()
             snapshot["task_operation"] = persisted.task_operation
             snapshot["task_description"] = persisted.display_title or ""
-        return snapshot
+        return _with_task_progress(snapshot, task_store)
     try:
         result = runner.get(thread_id).to_dict()
         indexed = task_store.sync_graph_result(result, execution_finished=False)
@@ -620,9 +798,33 @@ def _task_snapshot(
                 "archived_at": indexed.archived_at,
             }
         )
-        return result
+        return _with_task_progress(result, task_store)
     except (KeyError, ValueError):
-        return task_store.get(thread_id).to_dict()
+        return _with_task_progress(task_store.get(thread_id).to_dict(), task_store)
+
+
+def _with_task_progress(snapshot: dict[str, object], task_store: TaskStore) -> dict[str, object]:
+    """仅以状态、节点名称和验证结论生成进度，不把事件正文暴露给任务摘要。"""
+
+    state = snapshot.get("state")
+    graph_state = state if isinstance(state, dict) else {}
+    raw_events = graph_state.get("tool_events")
+    if not isinstance(raw_events, list):
+        try:
+            raw_events = [event.payload for event in task_store.events_after(str(snapshot.get("thread_id", "")), 0)]
+        except (ValueError, sqlite3.Error):
+            raw_events = []
+    enriched = dict(snapshot)
+    enriched["progress"] = build_task_progress(
+        status=snapshot.get("status"),
+        pending_approval=snapshot.get("pending_approval", False),
+        pending_approval_action=graph_state.get("pending_approval_action"),
+        verdict=snapshot.get("verdict"),
+        task_operation=graph_state.get("task_operation", snapshot.get("task_operation", TaskOperation.CHANGE.value)),
+        tool_events=raw_events,
+        verification=graph_state.get("verification_result"),
+    )
+    return enriched
 
 
 def _event_cursor(after_sequence: int, last_event_id: str | None) -> int:
