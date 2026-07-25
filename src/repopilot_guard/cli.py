@@ -46,6 +46,7 @@ from repopilot_guard.skills import SkillError, SkillRegistry
 from repopilot_guard.task_store import StoredTask, TaskStore
 from repopilot_guard.task_progress import build_task_progress
 from repopilot_guard.task_export import TaskEvidenceExporter
+from repopilot_guard.terminal import run_terminal
 from repopilot_guard.workspace import GitClient, GitCommandError, WorkspaceManager
 
 
@@ -56,6 +57,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     welcome_parser = subparsers.add_parser("welcome", help="查看本机项目状态和推荐下一步，不调用模型或修改仓库")
     welcome_parser.add_argument("--state-db", type=Path, help="SQLite 项目状态库路径")
+    terminal_parser = subparsers.add_parser("terminal", help="启动受控的交互式 Coding Agent 终端")
+    terminal_parser.add_argument("--state-db", type=Path, help="SQLite 项目状态库路径")
     subparsers.add_parser("doctor", help="检查配置、Qdrant 与本地状态库")
     subparsers.add_parser("bootstrap-qdrant", help="幂等创建 Qdrant Collection 和 Payload 索引")
     evaluate_parser = subparsers.add_parser("evaluate", help="准备并校验可重放 Java/Maven 评测 fixture")
@@ -331,6 +334,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "welcome":
         return _run_welcome(args)
+    if args.command == "terminal":
+        return run_terminal(main, state_db=args.state_db)
     if args.command == "doctor":
         return _run_doctor()
     if args.command == "bootstrap-qdrant":

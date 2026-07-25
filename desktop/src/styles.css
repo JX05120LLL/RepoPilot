@@ -78,7 +78,7 @@ button:active:not(:disabled) {
 
 .product-shell {
   display: grid;
-  grid-template-columns: 320px minmax(0, 1fr);
+  grid-template-columns: 276px minmax(0, 1fr);
   height: 100dvh;
   min-height: 620px;
   overflow: hidden;
@@ -98,8 +98,9 @@ button:active:not(:disabled) {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  min-height: 58px;
-  padding: 10px 12px 6px 20px;
+  min-height: 54px;
+  padding: 10px 12px 8px 16px;
+  border-bottom: 1px solid var(--line);
 }
 
 .brand-menu {
@@ -110,8 +111,15 @@ button:active:not(:disabled) {
 }
 
 .brand-menu strong {
-  font-size: 17px;
-  font-weight: 660;
+  font-size: 16px;
+  font-weight: 680;
+  letter-spacing: 0;
+}
+
+.brand-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
 }
 
 .product-brand .icon-button.active {
@@ -209,8 +217,7 @@ button:active:not(:disabled) {
   flex: 1 1 auto;
   min-height: 0;
   overflow: auto;
-  padding-top: 5px;
-  border-top: 1px solid var(--line);
+  padding-top: 3px;
   scrollbar-width: thin;
 }
 
@@ -218,7 +225,7 @@ button:active:not(:disabled) {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 14px 12px 8px 20px;
+  padding: 14px 12px 8px 16px;
 }
 
 .navigation-heading > span {
@@ -230,7 +237,7 @@ button:active:not(:disabled) {
 .project-tree {
   display: grid;
   gap: 3px;
-  padding: 0 10px;
+  padding: 0 8px;
 }
 
 .sidebar-empty,

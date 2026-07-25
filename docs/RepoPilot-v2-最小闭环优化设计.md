@@ -218,7 +218,7 @@ README、PRD 和开发计划中仍同时存在“阶段五至八已形成骨架�
 
 | 组件 | 职责 | 不负责什么 |
 |---|---|---|
-| Desktop/CLI | 创建任务、展示状态、提交审批 | 不做权限裁决、不拼接命令 |
+| Desktop/CLI/Terminal | 创建任务、展示状态、提交审批；Terminal 只路由注册命令 | 不做权限裁决、不拼接或透传 Shell 命令 |
 | Task Service | 任务记录、状态机、恢复、取消、产物索引 | 不直接调用模型工具 |
 | Agent Coordinator | LangGraph 节点、模型决策、重试边界 | 不直接写文件或执行 Maven |
 | Context Broker | 项目规则、RAG、搜索、上下文预算、来源引用 | 不改变权限 |

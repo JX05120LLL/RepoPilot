@@ -6,7 +6,7 @@ RepoPilot 面向已有代码仓库的维护场景：用户选择一个本地项�
 
 项目的产品体验参考 [OpenAI Codex](https://openai.com/codex/) 与 [xAI grok-build](https://github.com/xai-org/grok-build) 的项目工作区、Agent 工作流和工具扩展思路，但 RepoPilot **不是对上述项目的源码二次开发**。当前代码从零实现，重点探索 Java/Spring Boot 仓库维护中的安全边界、证据闭环、RAG、Skills、MCP 和本地桌面交互。
 
-当前版本：`0.1.1 / Pre-Alpha`。第一版 MVP 的后端闭环已经跑通；Windows x64 release 与 NSIS 安装包已成功构建，并完成隔离目录中的安装、启动、sidecar 退出和卸载烟雾测试。当前代码版本的 15 项端到端评测已一次性执行并全部符合预期，升级迁移等交付验收仍在进行，尚不建议用于生产仓库。
+当前版本：`0.1.2 / Pre-Alpha`。第一版 MVP 的后端闭环已经跑通；Windows x64 release 与 NSIS 安装包已成功构建，并完成隔离目录中的安装、启动、sidecar 退出和卸载烟雾测试。当前代码版本的 15 项端到端评测已一次性执行并全部符合预期，升级迁移等交付验收仍在进行，尚不建议用于生产仓库。
 
 ## 目录
 
@@ -90,7 +90,7 @@ RepoPilot 不是一个只会返回代码片段的聊天机器人，也不把“�
 - Token/成本遥测、任务预算门禁、协作式取消和敏感信息脱敏；
 - 评测报告自动记录代码版本、Git 脏状态、任务目录、fixture 集合、运行环境和脱敏 Provider 指纹；
 - 旧任务元数据恢复：从 checkpoint 只补回缺失的脱敏标题，不覆盖用户已有标题或运行失败强状态；
-- 213 项 Python 自动化测试和前端生产构建验证。
+- 222 项 Python 自动化测试和前端生产构建验证。
 
 ### 已完成的真实闭环
 
@@ -357,6 +357,25 @@ uv run repopilot-guard task start `
 
 ### 6. 启动任务
 
+希望像 Coding Agent 终端一样连续操作时，可以先启动受控交互入口：
+
+```powershell
+uv run repopilot-guard terminal
+```
+
+进入终端后可使用 `projects`、`tasks`、`start`、`status`、`watch`、`approve`、`revise`、`reject`、`artifacts` 和 `artifact`。例如：
+
+```text
+repopilot> projects
+repopilot> start project-xxxx safe change 修复订单查询缺少租户过滤的问题
+repopilot> status <上一条结果中的 thread_id>
+repopilot> approve <上一条结果中的 thread_id>
+```
+
+`terminal` 是现有任务服务的交互式适配层，不是系统 Shell。未知命令不会传给 PowerShell、CMD 或 Bash；`full` 模式仍会要求输入固定的完全权限确认语句，实际操作继续经过 `PolicyGuard`、审批、工具参数校验和 Evidence 审计。自动化和 CI 场景仍推荐使用下面的非交互命令。
+
+终端默认输出适合人工阅读的摘要。输入 `json on` 可切换到机器可读 JSON，输入 `json off` 恢复摘要模式；`watch <thread_id>` 始终输出实时 JSONL 事件流，便于长任务追踪和外部工具消费，按 `Ctrl+C` 可中断查看而不取消后台任务。
+
 默认使用安全隔离修复：
 
 ```powershell
@@ -543,7 +562,7 @@ npm.cmd run build
 
 ```text
 RepoPilot/
-├─ src/repopilot_guard/       Python 核心、Agent、策略、RAG、API 与 CLI
+├─ src/repopilot_guard/       Python 核心、Agent、策略、RAG、API、CLI 与受控 Terminal
 ├─ desktop/                   React + Tauri 桌面端
 ├─ tests/                     unittest 单元与集成测试
 ├─ evaluation/                15 项评测任务定义和说明
@@ -568,7 +587,7 @@ RepoPilot/
 | `execution.py` / `recipes.py` | 结构化补丁和 Maven 验证 |
 | `skills.py` / `mcp_runtime.py` / `plugins.py` | 扩展能力与信任边界 |
 | `task_store.py` / `task_export.py` / `evidence.py` | 持久任务、事件、哈希校验产物、可移交审计包和审计证据 |
-| `api.py` / `cli.py` | FastAPI/SSE 与命令行入口 |
+| `api.py` / `cli.py` / `terminal.py` | FastAPI/SSE、非交互命令与受控终端入口 |
 
 ## 最终规划
 

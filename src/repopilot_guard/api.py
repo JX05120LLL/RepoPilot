@@ -171,7 +171,7 @@ def create_app(
 ) -> FastAPI:
     """创建 API；调用者负责复用 SQLite graph runner 与项目注册表。"""
 
-    app = FastAPI(title="RepoPilot Guard", version="0.1.0")
+    app = FastAPI(title="RepoPilot Guard", version="0.1.2")
     store = task_store or TaskStore(registry.database_path)
     plugins = plugin_registry or PluginRegistry(registry.database_path)
     app.state.task_store = store
