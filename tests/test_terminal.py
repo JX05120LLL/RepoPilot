@@ -6,7 +6,12 @@ from pathlib import Path
 import unittest
 
 from repopilot_guard.permissions import FULL_ACCESS_CONFIRMATION
-from repopilot_guard.terminal import TerminalCommandRouter, TerminalRenderer, run_terminal
+from repopilot_guard.terminal import (
+    TerminalCommandRouter,
+    TerminalRenderer,
+    TerminalSessionContext,
+    run_terminal,
+)
 
 
 class TerminalCommandRouterTests(unittest.TestCase):
@@ -65,6 +70,93 @@ class TerminalCommandRouterTests(unittest.TestCase):
             [["task", "status", "--thread-id", "thread-1"]],
         )
 
+    def test_router_uses_current_project_and_task_without_relaxing_cli_contract(self) -> None:
+        router = TerminalCommandRouter()
+        session = TerminalSessionContext(
+            project_id="project-1",
+            thread_id="thread-1",
+        )
+
+        start = router.route("start safe research 分析当前项目", session)
+        status = router.route("status", session)
+        artifact = router.route("artifact report", session)
+
+        self.assertIn("project-1", start.argv)
+        self.assertIn("safe-isolated", start.argv)
+        self.assertEqual(
+            status.argv,
+            ("task", "status", "--thread-id", "thread-1"),
+        )
+        self.assertEqual(
+            artifact.argv,
+            (
+                "task",
+                "artifact",
+                "--thread-id",
+                "thread-1",
+                "--kind",
+                "report",
+            ),
+        )
+
+    def test_terminal_validates_context_and_remembers_started_task(self) -> None:
+        commands: list[list[str]] = []
+        answers = iter(
+            (
+                "use project project-1",
+                "start safe research 分析当前项目",
+                "current",
+                "status",
+                "quit",
+            )
+        )
+        output = StringIO()
+
+        def execute(argv: list[str]) -> int:
+            commands.append(argv)
+            if argv[:2] == ["project", "doctor"]:
+                print('{"status":"READY","code":"PROJECT_READY"}')
+            elif argv[:2] == ["task", "start"]:
+                print(
+                    '{"status":"WAITING_APPROVAL","verdict":"UNVERIFIED",'
+                    '"thread_id":"thread-2","display_title":"分析当前项目"}'
+                )
+            else:
+                print(
+                    '{"status":"WAITING_APPROVAL","verdict":"UNVERIFIED",'
+                    '"thread_id":"thread-2"}'
+                )
+            return 0
+
+        run_terminal(
+            execute,
+            input_func=lambda _prompt: next(answers),
+            output=output,
+        )
+
+        self.assertEqual(commands[0][:4], ["project", "doctor", "--project-id", "project-1"])
+        self.assertIn("project-1", commands[1])
+        self.assertEqual(commands[2], ["task", "status", "--thread-id", "thread-2"])
+        self.assertIn("项目  project-1", output.getvalue())
+        self.assertIn("任务  thread-2", output.getvalue())
+
+    def test_failed_context_validation_does_not_change_session(self) -> None:
+        answers = iter(("use project missing", "current", "quit"))
+        output = StringIO()
+
+        def execute(_argv: list[str]) -> int:
+            print('{"status":"BLOCKED","code":"PROJECT_NOT_FOUND"}')
+            return 2
+
+        run_terminal(
+            execute,
+            input_func=lambda _prompt: next(answers),
+            output=output,
+        )
+
+        self.assertIn("项目  未选择", output.getvalue())
+        self.assertNotIn("项目  missing", output.getvalue())
+
     def test_terminal_renders_project_json_as_human_readable_summary(self) -> None:
         answers = iter(("projects", "quit"))
         output = StringIO()
@@ -109,6 +201,34 @@ class TerminalCommandRouterTests(unittest.TestCase):
 
         self.assertIn("已切换为原始 JSON 输出", output.getvalue())
         self.assertIn('{"status":"READY","tasks":[]}', output.getvalue())
+
+    def test_json_mode_still_remembers_started_thread(self) -> None:
+        answers = iter(
+            (
+                "use project project-1",
+                "json on",
+                "start safe research 分析项目",
+                "json off",
+                "current",
+                "quit",
+            )
+        )
+        output = StringIO()
+
+        def execute(argv: list[str]) -> int:
+            if argv[:2] == ["project", "doctor"]:
+                print('{"status":"READY"}')
+            else:
+                print('{"status":"WAITING_APPROVAL","thread_id":"thread-json"}')
+            return 0
+
+        run_terminal(
+            execute,
+            input_func=lambda _prompt: next(answers),
+            output=output,
+        )
+
+        self.assertIn("任务  thread-json", output.getvalue())
 
     def test_watch_keeps_streaming_jsonl_contract(self) -> None:
         router = TerminalCommandRouter()

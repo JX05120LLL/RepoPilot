@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { ArtifactContent } from "./components/ArtifactContent";
+import { CommandPalette, type CommandPaletteItem } from "./components/CommandPalette";
 import { TaskProgressTrail } from "./components/TaskProgressTrail";
 import { API } from "./lib/api";
 import { asRecord, readString, readStringList } from "./lib/values";
@@ -12,6 +13,7 @@ import {
   CheckCircle,
   ChatCircle,
   CircleNotch,
+  Command,
   FileArrowUp,
   FileCode,
   FolderOpen,
@@ -450,6 +452,7 @@ export function App() {
   const [showArchived, setShowArchived] = useState(false);
   const [showTaskSearch, setShowTaskSearch] = useState(false);
   const [taskQuery, setTaskQuery] = useState("");
+  const [showCommandPalette, setShowCommandPalette] = useState(false);
   const [events, setEvents] = useState<TimelineEvent[]>([]);
   const [evidenceScope, setEvidenceScope] = useState<EvidenceScope>("key");
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
@@ -652,27 +655,6 @@ export function App() {
       checkApiHealth(),
     ]).catch(() => setRequestError(API_UNAVAILABLE_MESSAGE));
   }, [showArchived]);
-
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      const shortcut = event.ctrlKey || event.metaKey;
-      if (shortcut && event.key.toLowerCase() === "k") {
-        event.preventDefault();
-        setShowTaskSearch(true);
-        window.requestAnimationFrame(() => taskSearchRef.current?.focus());
-        return;
-      }
-      if (shortcut && event.key.toLowerCase() === "n") {
-        event.preventDefault();
-        beginNewTask();
-        window.requestAnimationFrame(() => taskDescriptionRef.current?.focus());
-        return;
-      }
-      if (event.key === "Escape") setShowTaskSearch(false);
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, []);
 
   useEffect(() => {
     const timer = window.setInterval(() => void checkApiHealth(), 5_000);
@@ -933,8 +915,12 @@ export function App() {
       const key = event.key.toLowerCase();
       if ((event.ctrlKey || event.metaKey) && key === "k") {
         event.preventDefault();
-        setShowTaskSearch(true);
-        window.requestAnimationFrame(() => taskSearchRef.current?.focus());
+        setShowCommandPalette(true);
+        return;
+      }
+      if (event.key === "Escape" && showCommandPalette) {
+        event.preventDefault();
+        setShowCommandPalette(false);
         return;
       }
       if (event.key === "Escape" && showTaskSearch) {
@@ -974,6 +960,7 @@ export function App() {
     mode,
     projectId,
     runtimeHealth.status,
+    showCommandPalette,
     showTaskSearch,
     task,
   ]);
@@ -1418,6 +1405,13 @@ export function App() {
     setActiveView("task");
   }
 
+  function switchProject(nextProjectId: string) {
+    if (task?.project_id && task.project_id !== nextProjectId) beginNewTask();
+    setProjectId(nextProjectId);
+    setApprovedMcpTools([]);
+    setConfirmed(false);
+  }
+
   function applyTaskStarter(value: string) {
     setDescription(value);
     setRequestError("");
@@ -1607,6 +1601,98 @@ export function App() {
     operationAllowed &&
     !(safeModeBlockedByProject && mode === "safe-isolated") &&
     !(mode === "full-local" && !confirmed);
+  const commandItems: CommandPaletteItem[] = [
+    {
+      id: "new-task",
+      group: "操作",
+      label: "新建任务",
+      description: currentProject ? `在 ${currentProject.display_name} 中开始` : "先选择一个项目",
+      icon: <Plus size={16} />,
+      shortcut: "Ctrl+N",
+      disabled: !currentProject,
+      keywords: "new task 新建会话",
+      onSelect: () => {
+        beginNewTask();
+        window.requestAnimationFrame(() => taskDescriptionRef.current?.focus());
+      },
+    },
+    {
+      id: "search-tasks",
+      group: "操作",
+      label: "搜索历史任务",
+      description: "在左侧项目树中筛选任务",
+      icon: <MagnifyingGlass size={16} />,
+      keywords: "find history 搜索历史",
+      onSelect: () => {
+        setShowTaskSearch(true);
+        window.requestAnimationFrame(() => taskSearchRef.current?.focus());
+      },
+    },
+    {
+      id: "view-task",
+      group: "视图",
+      label: "Agent 会话",
+      description: "返回任务进度、审批和输入区",
+      icon: <ChatCircle size={16} />,
+      onSelect: () => setActiveView("task"),
+    },
+    {
+      id: "view-context",
+      group: "视图",
+      label: "上下文与扩展",
+      description: "查看文档、MCP、Skills、插件和运行配置",
+      icon: <Stack size={16} />,
+      onSelect: () => setActiveView("context"),
+    },
+    {
+      id: "view-review",
+      group: "视图",
+      label: "证据与产物",
+      description: task ? "审阅计划、Diff、验证和审计证据" : "选择任务后可用",
+      icon: <FileCode size={16} />,
+      disabled: !task,
+      onSelect: () => setActiveView("review"),
+    },
+    {
+      id: "refresh-runtime",
+      group: "系统",
+      label: "刷新本机状态",
+      description: "重新读取项目、任务与 Agent 依赖",
+      icon: <ArrowClockwise size={16} />,
+      keywords: "refresh reload doctor 状态",
+      onSelect: () => {
+        void Promise.all([loadProjects(), loadTasks(), checkApiHealth()]).catch(() =>
+          setRequestError(API_UNAVAILABLE_MESSAGE),
+        );
+      },
+    },
+    {
+      id: "toggle-archive",
+      group: "系统",
+      label: showArchived ? "隐藏归档任务" : "显示归档任务",
+      description: "切换左侧任务树的归档可见性",
+      icon: <Archive size={16} />,
+      onSelect: () => setShowArchived((current) => !current),
+    },
+    ...projects.map((project) => ({
+      id: `project-${project.project_id}`,
+      group: "项目",
+      label: project.display_name,
+      description: project.is_git_repository ? "Git 项目" : "非 Git 项目，仅支持完整本机研究",
+      icon: <FolderOpen size={16} />,
+      keywords: project.project_id,
+      onSelect: () => switchProject(project.project_id),
+    })),
+    ...tasks.slice(0, 20).map((item) => ({
+      id: `task-${item.thread_id}`,
+      group: "最近任务",
+      label: compactTaskLabel(item),
+      description: `${item.status} · ${item.task_mode === "full-local" ? "完全本机" : "安全隔离"}`,
+      icon: <TerminalWindow size={16} />,
+      keywords: `${item.thread_id} ${item.project_id ?? ""}`,
+      onSelect: () => void selectTask(item),
+    })),
+  ];
 
   return (
     <main className="product-shell">
@@ -1681,9 +1767,7 @@ export function App() {
                     className={selected ? "project-row selected" : "project-row"}
                     type="button"
                     onClick={() => {
-                      setProjectId(project.project_id);
-                      setApprovedMcpTools([]);
-                      setConfirmed(false);
+                      switchProject(project.project_id);
                     }}
                   >
                     <FolderOpen size={16} weight={selected ? "fill" : "regular"} />
@@ -1771,6 +1855,9 @@ export function App() {
             )}
           </div>
           <div className="workspace-actions" aria-label="工作区视图">
+            <button className={showCommandPalette ? "active" : ""} type="button" title="命令面板 (Ctrl+K)" onClick={() => setShowCommandPalette(true)}>
+              <Command size={18} />
+            </button>
             <button className={activeView === "task" ? "active" : ""} type="button" title="Agent 会话" onClick={() => setActiveView("task")}>
               <ChatCircle size={18} />
             </button>
@@ -2485,6 +2572,11 @@ export function App() {
           </section>
         )}
       </section>
+      <CommandPalette
+        open={showCommandPalette}
+        items={commandItems}
+        onClose={() => setShowCommandPalette(false)}
+      />
     </main>
   );
 }

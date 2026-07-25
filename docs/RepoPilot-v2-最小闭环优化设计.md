@@ -91,9 +91,9 @@ RepoPilot 的 SQLite checkpoint 已经能恢复 LangGraph 状态，但 v2 不能
 | 工具 | 研究期只注册文件列表、搜索、读取、构建检查和上下文检索；未知工具不会变成 Shell | `ResearchToolExecutor`、`ToolRuntime` |
 | 写入与验证 | 已有结构化文本替换、原子校验、Git diff、Maven Recipe 执行器和两级审批节点 | `execution.py`、`graph.py` |
 | 本地接口 | FastAPI、SSE、后台运行任务、项目/任务/审批/Diff/报告接口存在，且只监听本机 | `api.py` |
-| 桌面端 | 有 React/Vite 页面，可选择项目和两种模式、提交任务、显示事件并审批；尚不是完成打包验证的 Tauri 产品 | `desktop/src/App.tsx` |
+| 桌面端 | React/Vite/Tauri 已形成项目任务树、Agent 会话、上下文扩展、产物审阅与命令面板，并完成 Windows NSIS 安装、启动和卸载烟雾测试 | `desktop/src/App.tsx`、`desktop/src-tauri/` |
 | 真实联调 | 已使用真实 Embedding/Qdrant/聊天模型完成一次代码理解任务并到达计划审批 | 本地 SQLite checkpoint 与 SSE 运行记录 |
-| 自动测试 | 当前全量 `unittest` 为 88 项；前端 `npm run build` 可通过 | 本地测试运行结果 |
+| 自动测试 | 当前全量 `unittest` 为 226 项；TypeScript 类型检查与 Vite 生产构建可通过 | 本地测试运行结果 |
 | 评测 | 有 15 条任务定义 JSON、独立 Java/Maven Git 基线生成器和实际结果 JSON/CSV/Markdown 报告执行器；尚未运行真实模型全量报告 | `evaluation/tasks.json`、`evaluation.py` |
 
 ### 3.1 当前状态的正确解释
@@ -225,6 +225,8 @@ README、PRD 和开发计划中仍同时存在“阶段五至八已形成骨架�
 | Tool Gateway | 工具定义、参数校验、策略裁决、审批检查、审计 | 不负责 UI 状态 |
 | Workspace Service | Git 基线、Worktree、补丁、Maven、Diff | 不接受模型任意 Shell 字符串 |
 | Artifact Store | 计划、补丁、报告、日志、Diff 文件 | 不推断业务结论 |
+
+交互层可以维护不可信的“当前项目 / 当前任务”选择，以减少桌面导航和 Terminal 重复输入；选择必须先经项目诊断或任务状态读取确认，最终命令仍显式展开为稳定的 `project/task` 参数。该会话选择不能替代 `PermissionSnapshot`、审批记录或工作区基线。
 
 ### 5.2 任务状态机
 

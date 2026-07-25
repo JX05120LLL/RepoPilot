@@ -17,16 +17,21 @@ TERMINAL_HELP = """可用命令：
   welcome                              查看本机就绪状态与推荐下一步
   projects                             列出已注册项目
   tasks                                列出最近任务
+  use project <项目ID>                 校验并切换当前项目
+  use task <线程ID>                    校验并切换当前任务
+  current                              查看当前会话上下文
   start <项目ID> <safe|full> <change|research> <任务描述>
                                        启动 Coding Agent 任务
-  status <线程ID>                      查看任务状态和下一步
-  events <线程ID>                      查看脱敏证据事件
-  watch <线程ID>                       持续追踪任务事件
-  approve <线程ID>                     批准当前审批关卡
+  start <safe|full> <change|research> <任务描述>
+                                       使用当前项目启动任务
+  status [线程ID]                      查看任务状态和下一步
+  events [线程ID]                      查看脱敏证据事件
+  watch [线程ID]                       持续追踪任务事件
+  approve [线程ID]                     批准当前审批关卡
   revise <线程ID> <修改意见>           要求重写当前计划
-  reject <线程ID>                      拒绝当前审批关卡
-  artifacts <线程ID>                   列出任务产物
-  artifact <线程ID> <产物类型>         读取经哈希校验的产物
+  reject [线程ID]                      拒绝当前审批关卡
+  artifacts [线程ID]                   列出任务产物
+  artifact [线程ID] <产物类型>         读取经哈希校验的产物
   json <on|off>                        切换原始 JSON 输出，默认 off
   help                                 显示本帮助
   quit                                 退出终端
@@ -42,6 +47,30 @@ class TerminalAction:
     confirmation_required: bool = False
     stream_output: bool = False
     output_mode: str | None = None
+    project_context: str | None = None
+    thread_context: str | None = None
+    show_context: bool = False
+
+
+@dataclass
+class TerminalSessionContext:
+    """当前 Terminal 进程内的便捷上下文，不参与权限授权。"""
+
+    project_id: str | None = None
+    thread_id: str | None = None
+
+    def prompt(self) -> str:
+        if self.thread_id:
+            return f"repopilot[t:{_short_id(self.thread_id)}]> "
+        if self.project_id:
+            return f"repopilot[p:{_short_id(self.project_id)}]> "
+        return "repopilot> "
+
+    def as_dict(self) -> dict[str, str | None]:
+        return {
+            "project_id": self.project_id,
+            "thread_id": self.thread_id,
+        }
 
 
 class TerminalRenderer:
@@ -241,7 +270,12 @@ def _truncate(value: str, limit: int) -> str:
 class TerminalCommandRouter:
     """把有限的交互命令映射到现有 CLI 契约。"""
 
-    def route(self, raw: str) -> TerminalAction:
+    def route(
+        self,
+        raw: str,
+        session: TerminalSessionContext | None = None,
+    ) -> TerminalAction:
+        context = session or TerminalSessionContext()
         line = raw.strip()
         if not line:
             return TerminalAction()
@@ -262,37 +296,61 @@ class TerminalCommandRouter:
             return TerminalAction(argv=("project", "list"))
         if command == "tasks":
             return TerminalAction(argv=("task", "list"))
+        if command == "current":
+            return TerminalAction(show_context=True)
+        if command == "use":
+            return self._route_use(line)
         if command == "start":
-            return self._route_start(line)
+            return self._route_start(line, context)
         if command == "revise":
             parts = line.split(maxsplit=2)
-            if len(parts) != 3 or not parts[2].strip():
-                return self._usage("用法：revise <线程ID> <修改意见>")
+            if context.thread_id and len(parts) >= 2:
+                if len(parts) == 3 and parts[1] == context.thread_id:
+                    thread_id = parts[1]
+                    comment = parts[2].strip()
+                else:
+                    thread_id = context.thread_id
+                    comment = line.split(maxsplit=1)[1].strip()
+            elif len(parts) == 3:
+                thread_id = parts[1]
+                comment = parts[2].strip()
+            else:
+                return self._usage("用法：revise <线程ID> <修改意见>；已选择任务后可省略线程 ID")
+            if not comment:
+                return self._usage("修改意见不能为空。")
             return TerminalAction(
                 argv=(
                     "task",
                     "decide",
                     "--thread-id",
-                    parts[1],
+                    thread_id,
                     "--decision",
                     "revise",
                     "--comment",
-                    parts[2].strip(),
-                )
+                    comment,
+                ),
+                thread_context=thread_id,
             )
         if command == "artifact":
             parts = line.split(maxsplit=2)
-            if len(parts) != 3:
-                return self._usage("用法：artifact <线程ID> <产物类型>")
+            if len(parts) == 2 and context.thread_id:
+                thread_id = context.thread_id
+                artifact_kind = parts[1]
+            elif len(parts) == 3:
+                thread_id = parts[1]
+                artifact_kind = parts[2]
+            else:
+                return self._usage("用法：artifact <线程ID> <产物类型>；已选择任务后可省略线程 ID")
             return TerminalAction(
                 argv=(
                     "task",
                     "artifact",
                     "--thread-id",
-                    parts[1],
+                    thread_id,
                     "--kind",
-                    parts[2],
-                )
+                    artifact_kind,
+                ),
+                thread_context=thread_id,
             )
         single_argument_commands = {
             "status": "status",
@@ -305,6 +363,7 @@ class TerminalCommandRouter:
                 line,
                 command,
                 single_argument_commands[command],
+                context,
             )
             if command == "watch" and action.argv:
                 return TerminalAction(
@@ -316,27 +375,45 @@ class TerminalCommandRouter:
         decisions = {"approve": "approve", "reject": "reject"}
         if command in decisions:
             parts = line.split()
-            if len(parts) != 2:
-                return self._usage(f"用法：{command} <线程ID>")
+            if len(parts) == 1 and context.thread_id:
+                thread_id = context.thread_id
+            elif len(parts) == 2:
+                thread_id = parts[1]
+            else:
+                return self._usage(f"用法：{command} [线程ID]；请先 use task 或显式传入 ID")
             return TerminalAction(
                 argv=(
                     "task",
                     "decide",
                     "--thread-id",
-                    parts[1],
+                    thread_id,
                     "--decision",
                     decisions[command],
-                )
+                ),
+                thread_context=thread_id,
             )
         return self._usage("未知命令。输入 help 查看受支持的命令。")
 
-    def _route_start(self, line: str) -> TerminalAction:
-        parts = line.split(maxsplit=4)
-        if len(parts) != 5:
+    def _route_start(
+        self,
+        line: str,
+        session: TerminalSessionContext,
+    ) -> TerminalAction:
+        explicit_parts = line.split(maxsplit=4)
+        if len(explicit_parts) == 5:
+            _, project_id, mode, operation, description = explicit_parts
+        else:
+            contextual_parts = line.split(maxsplit=3)
+            if len(contextual_parts) != 4 or not session.project_id:
+                return self._usage(
+                    "用法：start <项目ID> <safe|full> <change|research> <任务描述>；已选择项目后可省略项目 ID"
+                )
+            _, mode, operation, description = contextual_parts
+            project_id = session.project_id
+        if not description.strip():
             return self._usage(
-                "用法：start <项目ID> <safe|full> <change|research> <任务描述>"
+                "任务描述不能为空。"
             )
-        _, project_id, mode, operation, description = parts
         if mode not in {"safe", "full"}:
             return self._usage("任务模式必须是 safe 或 full。")
         if operation not in {"change", "research"}:
@@ -356,6 +433,22 @@ class TerminalCommandRouter:
                 description.strip(),
             ),
             confirmation_required=mode == "full",
+            project_context=project_id,
+        )
+
+    @staticmethod
+    def _route_use(line: str) -> TerminalAction:
+        parts = line.split()
+        if len(parts) != 3 or parts[1] not in {"project", "task"}:
+            return TerminalCommandRouter._usage("用法：use <project|task> <ID>")
+        if parts[1] == "project":
+            return TerminalAction(
+                argv=("project", "doctor", "--project-id", parts[2]),
+                project_context=parts[2],
+            )
+        return TerminalAction(
+            argv=("task", "status", "--thread-id", parts[2]),
+            thread_context=parts[2],
         )
 
     @staticmethod
@@ -363,12 +456,20 @@ class TerminalCommandRouter:
         line: str,
         command: str,
         task_subcommand: str,
+        session: TerminalSessionContext,
     ) -> TerminalAction:
         parts = line.split()
-        if len(parts) != 2:
-            return TerminalCommandRouter._usage(f"用法：{command} <线程ID>")
+        if len(parts) == 1 and session.thread_id:
+            thread_id = session.thread_id
+        elif len(parts) == 2:
+            thread_id = parts[1]
+        else:
+            return TerminalCommandRouter._usage(
+                f"用法：{command} [线程ID]；请先 use task 或显式传入 ID"
+            )
         return TerminalAction(
-            argv=("task", task_subcommand, "--thread-id", parts[1])
+            argv=("task", task_subcommand, "--thread-id", thread_id),
+            thread_context=thread_id,
         )
 
     @staticmethod
@@ -394,19 +495,20 @@ def run_terminal(
     stream = output or sys.stdout
     router = TerminalCommandRouter()
     renderer = TerminalRenderer()
+    session = TerminalSessionContext()
     raw_json = False
     print("RepoPilot Terminal", file=stream)
     print("本地 Coding Agent 会话。输入 help 查看命令，输入 quit 退出。", file=stream)
     while True:
         try:
-            raw = read("repopilot> ")
+            raw = read(session.prompt())
         except EOFError:
             print("\n终端输入已关闭。", file=stream)
             return 0
         except KeyboardInterrupt:
             print("\n已退出 RepoPilot Terminal。", file=stream)
             return 130
-        action = router.route(raw)
+        action = router.route(raw, session)
         if action.exit_requested:
             print("已退出 RepoPilot Terminal。", file=stream)
             return 0
@@ -416,6 +518,12 @@ def run_terminal(
                 "已切换为原始 JSON 输出。" if raw_json else "已切换为人类可读输出。",
                 file=stream,
             )
+            continue
+        if action.show_context:
+            if raw_json:
+                print(json.dumps(session.as_dict(), ensure_ascii=False), file=stream)
+            else:
+                _render_session_context(session, stream)
             continue
         if action.message:
             print(action.message, file=stream)
@@ -432,7 +540,8 @@ def run_terminal(
             argv.extend(("--confirm-full-access", confirmation))
         if state_db is not None:
             argv.extend(("--state-db", str(state_db)))
-        if raw_json or action.stream_output:
+        rendered = ""
+        if action.stream_output:
             with redirect_stdout(stream):
                 exit_code = execute(argv)
         else:
@@ -440,7 +549,62 @@ def run_terminal(
             with redirect_stdout(captured):
                 exit_code = execute(argv)
             rendered = captured.getvalue().strip()
-            if rendered:
+            if rendered and raw_json:
+                print(rendered, file=stream)
+            elif rendered:
                 renderer.render(rendered, argv, stream)
+        if exit_code == 0:
+            _update_session_context(session, action, argv, rendered)
         if exit_code != 0:
             print(f"命令返回非零状态：{exit_code}", file=stream)
+
+
+def _update_session_context(
+    session: TerminalSessionContext,
+    action: TerminalAction,
+    argv: list[str],
+    raw: str,
+) -> None:
+    if action.project_context:
+        session.thread_id = None
+        session.project_id = action.project_context
+    if action.thread_context:
+        session.thread_id = action.thread_context
+    if argv[:2] == ["task", "start"]:
+        project_id = _argument_value(argv, "--project-id")
+        if project_id:
+            session.project_id = project_id
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if isinstance(payload, dict):
+            thread_id = payload.get("thread_id")
+            if isinstance(thread_id, str) and thread_id.strip():
+                session.thread_id = thread_id.strip()
+
+
+def _render_session_context(session: TerminalSessionContext, stream: TextIO) -> None:
+    print("当前会话", file=stream)
+    print(f"  项目  {session.project_id or '未选择'}", file=stream)
+    print(f"  任务  {session.thread_id or '未选择'}", file=stream)
+    if session.project_id is None:
+        print("  下一步  use project <项目ID>", file=stream)
+    elif session.thread_id is None:
+        print("  下一步  start safe change <任务描述>", file=stream)
+    else:
+        print("  下一步  status", file=stream)
+
+
+def _argument_value(argv: list[str], name: str) -> str | None:
+    try:
+        value = argv[argv.index(name) + 1]
+    except (ValueError, IndexError):
+        return None
+    return value or None
+
+
+def _short_id(value: str) -> str:
+    if value.startswith("project-"):
+        return value.removeprefix("project-")[:8]
+    return value if len(value) <= 12 else value[:8]
