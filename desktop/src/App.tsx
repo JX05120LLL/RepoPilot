@@ -3,11 +3,17 @@ import { open, save } from "@tauri-apps/plugin-dialog";
 import { ArtifactContent } from "./components/ArtifactContent";
 import { CommandPalette, type CommandPaletteItem } from "./components/CommandPalette";
 import { TaskInspector } from "./components/TaskInspector";
+import { TaskTerminalDock, type TerminalCommand, type TerminalResult } from "./components/TaskTerminalDock";
 import { TaskProgressTrail } from "./components/TaskProgressTrail";
 import { ReviewDecisionSummary } from "./components/ReviewDecisionSummary";
 import { TaskDiagnosticPanel } from "./components/TaskDiagnosticPanel";
 import { API } from "./lib/api";
 import { asRecord, readString, readStringList } from "./lib/values";
+import {
+  loadWorkbenchPreferences,
+  saveWorkbenchPreferences,
+  type WorkbenchPreferences,
+} from "./lib/workbenchPreferences";
 import {
   Archive,
   ArrowRight,
@@ -474,14 +480,21 @@ function resolvedTaskOperation(item: Task): Operation {
 }
 
 export function App() {
+  const [savedWorkbenchPreferences] = useState<WorkbenchPreferences>(
+    loadWorkbenchPreferences,
+  );
   const [projects, setProjects] = useState<Project[]>([]);
-  const [projectId, setProjectId] = useState("");
+  const [projectId, setProjectId] = useState(
+    () => savedWorkbenchPreferences.projectId ?? "",
+  );
   const [projectPath, setProjectPath] = useState("");
   const [projectName, setProjectName] = useState("");
   const [description, setDescription] = useState("");
   const [mode, setMode] = useState<Mode>("safe-isolated");
   const [operation, setOperation] = useState<Operation>("change");
-  const [activeView, setActiveView] = useState<WorkspaceView>("task");
+  const [activeView, setActiveView] = useState<WorkspaceView>(
+    () => savedWorkbenchPreferences.activeView ?? "task",
+  );
   const [confirmed, setConfirmed] = useState(false);
   const [task, setTask] = useState<Task | null>(null);
   const [tasks, setTasks] = useState<Task[]>([]);
@@ -489,9 +502,17 @@ export function App() {
   const [showTaskSearch, setShowTaskSearch] = useState(false);
   const [taskQuery, setTaskQuery] = useState("");
   const [showCommandPalette, setShowCommandPalette] = useState(false);
-  const [showTaskInspector, setShowTaskInspector] = useState(() =>
-    window.matchMedia("(min-width: 1081px)").matches,
+  const [showTaskInspector, setShowTaskInspector] = useState(
+    () =>
+      savedWorkbenchPreferences.showTaskInspector ??
+      window.matchMedia("(min-width: 1081px)").matches,
   );
+  const [showTaskTerminal, setShowTaskTerminal] = useState(
+    () => savedWorkbenchPreferences.showTaskTerminal ?? false,
+  );
+  const [initialDataReady, setInitialDataReady] = useState(false);
+  const [workspaceRestored, setWorkspaceRestored] = useState(false);
+  const restoreStartedRef = useRef(false);
   const [events, setEvents] = useState<TimelineEvent[]>([]);
   const [eventStreamState, setEventStreamState] = useState<EventStreamState>("idle");
   const [evidenceScope, setEvidenceScope] = useState<EvidenceScope>("key");
@@ -560,7 +581,11 @@ export function App() {
     const data = (await response.json()) as { projects?: Project[] };
     const nextProjects = data.projects ?? [];
     setProjects(nextProjects);
-    setProjectId((current) => current || nextProjects[0]?.project_id || "");
+    setProjectId((current) =>
+      nextProjects.some((project) => project.project_id === current)
+        ? current
+        : nextProjects[0]?.project_id || "",
+    );
   }
 
   async function loadTasks(includeArchived = showArchived) {
@@ -711,6 +736,58 @@ export function App() {
     }
   }
 
+  async function runTerminalCommand(command: TerminalCommand): Promise<TerminalResult> {
+    if (!task) throw new Error("请先选择一个任务");
+    const threadId = encodeURIComponent(task.thread_id);
+    const taskResponse = await fetch(`${API}/tasks/${threadId}`);
+    if (!taskResponse.ok) throw new Error("任务状态不可读取，请检查本机 API");
+    const snapshot = (await taskResponse.json()) as Task;
+    setTask(snapshot);
+
+    const status = taskStateLabel(snapshot.status, snapshot.verdict, snapshot.pending_approval);
+    const progress = snapshot.progress?.summary ?? "尚未生成阶段摘要";
+    if (command.id === "status") {
+      return {
+        title: "任务状态",
+        lines: [
+          `状态  ${status}`,
+          `阶段  ${snapshot.progress?.current_stage ?? snapshot.status}`,
+          progress,
+        ],
+      };
+    }
+
+    const artifactResponse = await fetch(`${API}/tasks/${threadId}/artifacts`);
+    if (!artifactResponse.ok) throw new Error("任务产物目录不可读取");
+    const artifactPayload = (await artifactResponse.json()) as { artifacts?: Artifact[] };
+    const nextArtifacts = artifactPayload.artifacts ?? [];
+    setArtifacts(nextArtifacts);
+
+    if (command.id === "artifacts") {
+      return {
+        title: `任务产物 ${nextArtifacts.length}`,
+        lines: nextArtifacts.length
+          ? nextArtifacts.slice(0, 8).map((artifact) =>
+              `${artifactLabels[artifact.kind] ?? artifact.kind}  ${artifact.size_bytes.toLocaleString()} B  ${artifact.sha256.slice(0, 12)}`,
+            )
+          : ["当前任务尚未生成可读取产物。"],
+      };
+    }
+
+    const recentEvidence = events.slice(-3).reverse().map((event) =>
+      `${eventLabels[event.type] ?? event.type}  ${eventSummary(event)}`,
+    );
+    return {
+      title: "任务审阅",
+      lines: [
+        `状态  ${status}`,
+        snapshot.pending_approval ? "当前任务正在等待明确审批。" : "当前任务没有待处理审批。",
+        `已验证产物  ${nextArtifacts.length} 项`,
+        ...(recentEvidence.length ? recentEvidence : ["尚无可展示的关键证据事件。"]),
+      ],
+    };
+  }
+
   useEffect(() => {
     void Promise.all([
       loadProjects(),
@@ -718,8 +795,44 @@ export function App() {
       loadPlugins(),
       loadRuntimeConfiguration(),
       checkApiHealth(),
-    ]).catch(() => setRequestError(API_UNAVAILABLE_MESSAGE));
+    ])
+      .then(() => setInitialDataReady(true))
+      .catch(() => setRequestError(API_UNAVAILABLE_MESSAGE));
   }, [showArchived]);
+
+  useEffect(() => {
+    if (!initialDataReady || restoreStartedRef.current) return;
+    restoreStartedRef.current = true;
+    const savedTask = savedWorkbenchPreferences.threadId
+      ? tasks.find((item) => item.thread_id === savedWorkbenchPreferences.threadId)
+      : undefined;
+    if (!savedTask) {
+      setWorkspaceRestored(true);
+      return;
+    }
+    void selectTask(
+      savedTask,
+      savedWorkbenchPreferences.activeView ?? "task",
+    ).finally(() => setWorkspaceRestored(true));
+  }, [initialDataReady, savedWorkbenchPreferences, tasks]);
+
+  useEffect(() => {
+    if (!workspaceRestored) return;
+    saveWorkbenchPreferences({
+      projectId: projectId || undefined,
+      threadId: task?.thread_id,
+      activeView,
+      showTaskInspector,
+      showTaskTerminal,
+    });
+  }, [
+    activeView,
+    projectId,
+    showTaskInspector,
+    showTaskTerminal,
+    task?.thread_id,
+    workspaceRestored,
+  ]);
 
   useEffect(() => {
     const timer = window.setInterval(() => void checkApiHealth(), 5_000);
@@ -1028,6 +1141,17 @@ export function App() {
       }
       if (
         (event.ctrlKey || event.metaKey) &&
+        key === "j" &&
+        task &&
+        activeView === "task" &&
+        !isEditableTarget(event.target)
+      ) {
+        event.preventDefault();
+        setShowTaskTerminal((current) => !current);
+        return;
+      }
+      if (
+        (event.ctrlKey || event.metaKey) &&
         event.key === "Enter" &&
         event.target === taskDescriptionRef.current &&
         !task &&
@@ -1060,6 +1184,7 @@ export function App() {
     activeView,
     showCommandPalette,
     showTaskInspector,
+    showTaskTerminal,
     showTaskSearch,
     task,
   ]);
@@ -1503,6 +1628,7 @@ export function App() {
     setRevisionComment("");
     setRequestError("");
     setActiveView("task");
+    setShowTaskTerminal(false);
   }
 
   function openRuntimeConfiguration() {
@@ -1525,7 +1651,7 @@ export function App() {
     window.requestAnimationFrame(() => taskDescriptionRef.current?.focus());
   }
 
-  async function selectTask(selected: Task) {
+  async function selectTask(selected: Task, view: WorkspaceView = "task") {
     setRequestError("");
     setEvents([]);
     try {
@@ -1540,7 +1666,7 @@ export function App() {
         setConfirmed(merged.task_mode === "full-local");
       }
       setOperation(resolvedTaskOperation(merged));
-      setActiveView("task");
+      setActiveView(view);
     } catch (error) {
       setRequestError(
         error instanceof Error ? error.message : "任务详情不可恢复",
@@ -1789,6 +1915,20 @@ export function App() {
       },
     },
     {
+      id: "toggle-task-terminal",
+      group: "视图",
+      label: showTaskTerminal ? "关闭受控终端" : "打开受控终端",
+      description: task ? "在底部运行已注册的只读任务查询" : "选择任务后可用",
+      icon: <TerminalWindow size={16} />,
+      shortcut: "Ctrl+J",
+      disabled: !task,
+      keywords: "terminal cli status review artifacts 终端",
+      onSelect: () => {
+        setActiveView("task");
+        setShowTaskTerminal((current) => !current);
+      },
+    },
+    {
       id: "refresh-runtime",
       group: "系统",
       label: "刷新本机状态",
@@ -1837,7 +1977,7 @@ export function App() {
           .includes(taskQuery.trim().toLocaleLowerCase()),
     )
     .slice(0, 5);
-  const terminalCommands = task
+  const terminalCommands: TerminalCommand[] = task
     ? [
         {
           id: "status",
@@ -2067,6 +2207,18 @@ export function App() {
             </button>
             {task && activeView === "task" && (
               <button
+                className={showTaskTerminal ? "active" : ""}
+                type="button"
+                title="受控终端 (Ctrl+J)"
+                aria-label="切换受控终端"
+                aria-pressed={showTaskTerminal}
+                onClick={() => setShowTaskTerminal((current) => !current)}
+              >
+                <TerminalWindow size={18} />
+              </button>
+            )}
+            {task && activeView === "task" && (
+              <button
                 className={showTaskInspector ? "active" : ""}
                 type="button"
                 title="任务检查器 (Ctrl+Alt+I)"
@@ -2081,7 +2233,13 @@ export function App() {
         </header>
 
         {activeView === "task" && (
-          <div className={showTaskInspector && task ? "task-workspace inspector-open" : "task-workspace"}>
+          <div
+            className={[
+              "task-workspace",
+              showTaskInspector && task ? "inspector-open" : "",
+              showTaskTerminal && task ? "terminal-open" : "",
+            ].filter(Boolean).join(" ")}
+          >
             <section className="session-view">
             <div className="conversation-scroll">
               <div className="conversation-column">
@@ -2613,6 +2771,15 @@ export function App() {
                   onCopyTerminalCommand={copyTerminalCommand}
                 />
               </>
+            )}
+            {task && showTaskTerminal && (
+              <TaskTerminalDock
+                threadId={task.thread_id}
+                commands={terminalCommands}
+                onClose={() => setShowTaskTerminal(false)}
+                onCopy={copyTerminalCommand}
+                onRun={runTerminalCommand}
+              />
             )}
           </div>
         )}

@@ -76,6 +76,18 @@ button:active:not(:disabled) {
   transform: translateY(1px);
 }
 
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .product-shell {
   display: grid;
   grid-template-columns: 276px minmax(0, 1fr);
@@ -645,6 +657,211 @@ textarea::placeholder {
 
 .task-workspace.inspector-open {
   grid-template-columns: minmax(0, 1fr) 332px;
+}
+
+.task-workspace.terminal-open .session-view {
+  padding-bottom: 232px;
+}
+
+.task-terminal-dock {
+  position: absolute;
+  inset: auto 0 0 0;
+  z-index: 6;
+  display: grid;
+  grid-column: 1;
+  grid-row: 1;
+  grid-template-rows: 38px 42px minmax(0, 1fr);
+  align-self: end;
+  min-width: 0;
+  height: 232px;
+  overflow: hidden;
+  color: #dde3e9;
+  background: #171c23;
+  border-top: 1px solid #35404c;
+  box-shadow: 0 -10px 28px rgba(26, 31, 37, 0.18);
+}
+
+.task-terminal-header,
+.task-terminal-commandbar {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  padding: 0 14px;
+  border-bottom: 1px solid #303a45;
+}
+
+.task-terminal-header {
+  justify-content: space-between;
+  background: #1d242d;
+}
+
+.task-terminal-header > div {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  gap: 8px;
+}
+
+.task-terminal-header svg {
+  color: #9db8d8;
+}
+
+.task-terminal-header strong {
+  color: #eff3f7;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.task-terminal-header span {
+  padding: 2px 6px;
+  color: #9cb2ca;
+  background: #263340;
+  border-radius: 4px;
+  font: 9px var(--mono);
+}
+
+.task-terminal-header .icon-button {
+  color: #aab6c3;
+}
+
+.task-terminal-header .icon-button:hover:not(:disabled) {
+  color: #ffffff;
+  background: #2a3540;
+}
+
+.task-terminal-commandbar {
+  gap: 9px;
+  background: #151a21;
+}
+
+.task-terminal-prompt {
+  flex: 0 0 auto;
+  color: #9fc6a9;
+  font: 10px var(--mono);
+}
+
+.task-terminal-commandbar label {
+  position: relative;
+  display: grid;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.task-terminal-commandbar select {
+  width: 100%;
+  min-width: 0;
+  height: 28px;
+  padding: 0 28px 0 0;
+  overflow: hidden;
+  color: #d9e1e9;
+  background: transparent;
+  border: 0;
+  outline: 0;
+  font: 11px var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  appearance: none;
+}
+
+.task-terminal-commandbar label > svg {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  pointer-events: none;
+  color: #8e9aa7;
+}
+
+.terminal-copy,
+.terminal-run {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  gap: 5px;
+  min-height: 27px;
+  padding: 4px 8px;
+  color: #c5d0dc;
+  background: #222b35;
+  border: 1px solid #394654;
+  border-radius: 5px;
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.terminal-copy:hover:not(:disabled) {
+  color: #ffffff;
+  background: #2a3642;
+}
+
+.terminal-run {
+  color: #e8f3ea;
+  background: #236d43;
+  border-color: #368257;
+}
+
+.terminal-run:hover:not(:disabled) {
+  background: #2b7d4e;
+}
+
+.task-terminal-output {
+  min-height: 0;
+  overflow: auto;
+  padding: 10px 14px 14px;
+  scrollbar-color: #4a5663 transparent;
+  scrollbar-width: thin;
+}
+
+.task-terminal-output > p {
+  margin: 0;
+  color: #909eac;
+  font: 11px/1.65 var(--mono);
+}
+
+.task-terminal-output > p span {
+  color: #9fc6a9;
+}
+
+.terminal-entry {
+  display: grid;
+  gap: 4px;
+  padding: 0 0 10px;
+}
+
+.terminal-entry + .terminal-entry {
+  padding-top: 10px;
+  border-top: 1px solid #2d3741;
+}
+
+.terminal-entry code {
+  overflow: hidden;
+  color: #aebdcb;
+  font: 10px/1.5 var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminal-entry strong {
+  color: #eff3f7;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.terminal-entry p {
+  margin: 0;
+  overflow: hidden;
+  color: #bdc7d1;
+  font: 10px/1.5 var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminal-entry.terminal-running strong {
+  color: #e6c271;
+}
+
+.terminal-entry.terminal-failed strong,
+.terminal-entry.terminal-failed p {
+  color: #f29a95;
 }
 
 .task-inspector-backdrop {
