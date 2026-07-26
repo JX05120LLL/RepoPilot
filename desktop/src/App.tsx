@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { ArtifactContent } from "./components/ArtifactContent";
 import { CommandPalette, type CommandPaletteItem } from "./components/CommandPalette";
+import { TaskInspector } from "./components/TaskInspector";
 import { TaskProgressTrail } from "./components/TaskProgressTrail";
 import { API } from "./lib/api";
 import { asRecord, readString, readStringList } from "./lib/values";
@@ -23,6 +24,7 @@ import {
   Plus,
   PuzzlePiece,
   ShieldCheck,
+  SidebarSimple,
   SlidersHorizontal,
   Stack,
   TerminalWindow,
@@ -453,6 +455,9 @@ export function App() {
   const [showTaskSearch, setShowTaskSearch] = useState(false);
   const [taskQuery, setTaskQuery] = useState("");
   const [showCommandPalette, setShowCommandPalette] = useState(false);
+  const [showTaskInspector, setShowTaskInspector] = useState(() =>
+    window.matchMedia("(min-width: 1081px)").matches,
+  );
   const [events, setEvents] = useState<TimelineEvent[]>([]);
   const [evidenceScope, setEvidenceScope] = useState<EvidenceScope>("key");
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
@@ -929,6 +934,22 @@ export function App() {
         setTaskQuery("");
         return;
       }
+      if (event.key === "Escape" && showTaskInspector) {
+        event.preventDefault();
+        setShowTaskInspector(false);
+        return;
+      }
+      if (
+        (event.ctrlKey || event.metaKey) &&
+        event.altKey &&
+        key === "i" &&
+        task &&
+        activeView === "task"
+      ) {
+        event.preventDefault();
+        setShowTaskInspector((current) => !current);
+        return;
+      }
       if (
         (event.ctrlKey || event.metaKey) &&
         event.key === "Enter" &&
@@ -960,7 +981,9 @@ export function App() {
     mode,
     projectId,
     runtimeHealth.status,
+    activeView,
     showCommandPalette,
+    showTaskInspector,
     showTaskSearch,
     task,
   ]);
@@ -1569,6 +1592,11 @@ export function App() {
   const keyEvidenceEvents = events.filter(isKeyEvidenceEvent);
   const reviewEvents =
     evidenceScope === "key" ? keyEvidenceEvents : events;
+  const inspectorEvidence = keyEvidenceEvents.slice(-5).reverse().map((event) => ({
+    id: event.id,
+    label: eventLabels[event.type] ?? event.type,
+    summary: eventSummary(event),
+  }));
   const activeTaskOperation = task ? resolvedTaskOperation(task) : operation;
   const activeTaskMode: Mode =
     task?.task_mode === "full-local" ? "full-local" : "safe-isolated";
@@ -1652,6 +1680,20 @@ export function App() {
       icon: <FileCode size={16} />,
       disabled: !task,
       onSelect: () => setActiveView("review"),
+    },
+    {
+      id: "toggle-task-inspector",
+      group: "视图",
+      label: showTaskInspector ? "关闭任务检查器" : "打开任务检查器",
+      description: task ? "在会话右侧查看状态、上下文、证据和产物" : "选择任务后可用",
+      icon: <SidebarSimple size={16} />,
+      shortcut: "Ctrl+Alt+I",
+      disabled: !task,
+      keywords: "inspector sidebar 检查器 侧栏",
+      onSelect: () => {
+        setActiveView("task");
+        setShowTaskInspector((current) => !current);
+      },
     },
     {
       id: "refresh-runtime",
@@ -1867,11 +1909,24 @@ export function App() {
             <button className={activeView === "review" ? "active" : ""} type="button" title="证据与产物" onClick={() => setActiveView("review")} disabled={!task}>
               <FileCode size={18} />
             </button>
+            {task && activeView === "task" && (
+              <button
+                className={showTaskInspector ? "active" : ""}
+                type="button"
+                title="任务检查器 (Ctrl+Alt+I)"
+                aria-label="切换任务检查器"
+                aria-pressed={showTaskInspector}
+                onClick={() => setShowTaskInspector((current) => !current)}
+              >
+                <SidebarSimple size={18} />
+              </button>
+            )}
           </div>
         </header>
 
         {activeView === "task" && (
-          <section className="session-view">
+          <div className={showTaskInspector && task ? "task-workspace inspector-open" : "task-workspace"}>
+            <section className="session-view">
             <div className="conversation-scroll">
               <div className="conversation-column">
                 {!task && (
@@ -2283,7 +2338,60 @@ export function App() {
                 </>
               )}
             </div>
-          </section>
+            </section>
+            {task && showTaskInspector && (
+              <>
+                <button
+                  className="task-inspector-backdrop"
+                  type="button"
+                  aria-label="关闭任务检查器"
+                  onClick={() => setShowTaskInspector(false)}
+                />
+                <TaskInspector
+                  task={{
+                    title: compactTaskLabel(task),
+                    threadId: task.thread_id,
+                    status: taskStatus,
+                    verdict: task.verdict,
+                    pendingApproval: task.pending_approval,
+                    mode: activeTaskMode,
+                    operation: activeTaskOperation,
+                    currentStage: task.progress?.current_stage,
+                    progressSummary: task.progress?.summary,
+                  }}
+                  sources={(contextSnapshot?.sources ?? []).map((source) => ({
+                    sourceType: source.source_type,
+                    path: source.path,
+                    lineStart: source.line_start,
+                    lineEnd: source.line_end,
+                  }))}
+                  attachments={taskAttachments.map((attachment) => ({
+                    id: attachment.document_id,
+                    name: attachment.display_name,
+                    sha256: attachment.content_sha256,
+                  }))}
+                  evidence={inspectorEvidence}
+                  artifacts={artifacts.map((artifact) => ({
+                    kind: artifact.kind,
+                    label: artifactLabels[artifact.kind] ?? artifact.kind,
+                    sizeBytes: artifact.size_bytes,
+                  }))}
+                  selectedSkillCount={contextSnapshot?.selected_skills.length ?? 0}
+                  boundToolCount={contextSnapshot?.bound_tool_ids.length ?? 0}
+                  totalTokens={telemetry?.model.total_tokens}
+                  onClose={() => setShowTaskInspector(false)}
+                  onOpenContext={() => setActiveView("context")}
+                  onOpenArtifact={(kind) => {
+                    if (kind) {
+                      setSelectedArtifact(kind);
+                      setSelectedArtifactVersion(null);
+                    }
+                    setActiveView("review");
+                  }}
+                />
+              </>
+            )}
+          </div>
         )}
 
         {activeView === "context" && (
