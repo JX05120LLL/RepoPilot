@@ -30,6 +30,7 @@ from repopilot_guard.plugins import PluginError, PluginRegistry
 from repopilot_guard.project_diagnostics import assess_task_admission, diagnose_project
 from repopilot_guard.project_registry import ProjectRegistry
 from repopilot_guard.task_export import TaskEvidenceExporter
+from repopilot_guard.task_diagnostics import build_task_diagnostic, extract_diagnostic_codes
 from repopilot_guard.task_progress import build_task_progress
 from repopilot_guard.task_store import StoredTaskEvent, TaskStore
 
@@ -171,7 +172,7 @@ def create_app(
 ) -> FastAPI:
     """创建 API；调用者负责复用 SQLite graph runner 与项目注册表。"""
 
-    app = FastAPI(title="RepoPilot Guard", version="0.1.3")
+    app = FastAPI(title="RepoPilot Guard", version=__version__)
     store = task_store or TaskStore(registry.database_path)
     plugins = plugin_registry or PluginRegistry(registry.database_path)
     app.state.task_store = store
@@ -809,12 +810,17 @@ def _with_task_progress(snapshot: dict[str, object], task_store: TaskStore) -> d
     state = snapshot.get("state")
     graph_state = state if isinstance(state, dict) else {}
     raw_events = graph_state.get("tool_events")
+    persisted_events: list[StoredTaskEvent] = []
+    try:
+        persisted_events = task_store.events_after(str(snapshot.get("thread_id", "")), 0)
+    except (ValueError, sqlite3.Error):
+        persisted_events = []
     if not isinstance(raw_events, list):
-        try:
-            raw_events = [event.payload for event in task_store.events_after(str(snapshot.get("thread_id", "")), 0)]
-        except (ValueError, sqlite3.Error):
-            raw_events = []
+        raw_events = [event.payload for event in persisted_events]
     enriched = dict(snapshot)
+    error_summary = snapshot.get("error_summary")
+    if not isinstance(error_summary, str):
+        error_summary = graph_state.get("error_summary")
     enriched["progress"] = build_task_progress(
         status=snapshot.get("status"),
         pending_approval=snapshot.get("pending_approval", False),
@@ -824,7 +830,51 @@ def _with_task_progress(snapshot: dict[str, object], task_store: TaskStore) -> d
         tool_events=raw_events,
         verification=graph_state.get("verification_result"),
     )
+    enriched["diagnostic"] = build_task_diagnostic(
+        status=snapshot.get("status"),
+        verdict=snapshot.get("verdict"),
+        pending_approval=snapshot.get("pending_approval", False),
+        error_summary=error_summary,
+        evidence_codes=(
+            extract_diagnostic_codes(raw_events)
+            | extract_diagnostic_codes(persisted_events)
+        ),
+    )
+    if isinstance(snapshot.get("state"), dict):
+        enriched["state"] = _safe_task_state(graph_state)
     return enriched
+
+
+def _safe_task_state(state: dict[str, object]) -> dict[str, object]:
+    """任务详情只提供桌面端需要的状态，不回传 Graph checkpoint 的内部字段。"""
+
+    safe: dict[str, object] = {}
+    for key in ("task_operation", "task_description", "pending_approval_action"):
+        value = state.get(key)
+        if isinstance(value, str) and value:
+            safe[key] = value
+    plan = _safe_task_plan(state.get("plan"))
+    if plan is not None:
+        safe["plan"] = plan
+    return safe
+
+
+def _safe_task_plan(value: object) -> dict[str, object] | None:
+    """保留审批 UI 所需的计划字段，拒绝任意嵌套对象和模型附带数据。"""
+
+    if not isinstance(value, dict):
+        return None
+    safe: dict[str, object] = {}
+    for key in ("summary", "verification_recipe", "target_test_class"):
+        item = value.get(key)
+        if isinstance(item, str) and item:
+            safe[key] = item[:4_000]
+    for key in ("candidate_files", "steps", "verification", "assumptions", "risks"):
+        item = value.get(key)
+        if not isinstance(item, list):
+            continue
+        safe[key] = [entry[:2_000] for entry in item if isinstance(entry, str)][:100]
+    return safe
 
 
 def _event_cursor(after_sequence: int, last_event_id: str | None) -> int:
@@ -838,12 +888,15 @@ def _event_cursor(after_sequence: int, last_event_id: str | None) -> int:
 
 def _sse_event(event: StoredTaskEvent) -> str:
     event_name = "state" if event.event_type == "TASK_STATE" else "evidence"
+    public_event = event.to_public_dict()
+    public_payload = public_event["payload"]
+    assert isinstance(public_payload, dict)
     payload = {
         "sequence": event.sequence,
         "event_id": event.event_id,
         "trace_id": event.trace_id,
         "type": event.event_type,
-        **event.payload,
+        **public_payload,
     }
     return f"id: {event.event_id}\nevent: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 

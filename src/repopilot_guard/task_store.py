@@ -98,6 +98,18 @@ class StoredTaskEvent:
             "created_at": self.created_at,
         }
 
+    def to_public_dict(self) -> dict[str, object]:
+        """供 CLI、SSE 和桌面端使用的事件投影，不公开路径、命令、正文或输入参数。"""
+
+        return {
+            "sequence": self.sequence,
+            "event_id": self.event_id,
+            "trace_id": self.trace_id,
+            "type": self.event_type,
+            "payload": _public_event_payload(self.payload),
+            "created_at": self.created_at,
+        }
+
 
 @dataclass(frozen=True, slots=True)
 class StoredTaskArtifact:
@@ -1032,6 +1044,50 @@ def _redact(value: Any, key: str | None = None) -> Any:
     if isinstance(value, list):
         return [_redact(item) for item in value]
     return value
+
+
+def _public_event_payload(payload: dict[str, object]) -> dict[str, object]:
+    """将存储层事件缩减为产品界面所需的稳定审计字段。"""
+
+    safe: dict[str, object] = {}
+    scalar_keys = (
+        "code",
+        "status",
+        "node",
+        "tool_name",
+        "duration_ms",
+        "ready",
+        "configured",
+        "currency",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "estimated_cost",
+        "reported",
+        "source_count",
+        "artifact_count",
+    )
+    for key in scalar_keys:
+        value = payload.get(key)
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            if value is not None:
+                safe[key] = value
+    checks = payload.get("checks")
+    if isinstance(checks, list):
+        safe_checks: list[dict[str, str]] = []
+        for check in checks[:32]:
+            if not isinstance(check, dict):
+                continue
+            projected = {
+                key: value[:128]
+                for key in ("component", "status", "code")
+                if isinstance((value := check.get(key)), str) and value
+            }
+            if projected:
+                safe_checks.append(projected)
+        if safe_checks:
+            safe["checks"] = safe_checks
+    return safe
 
 
 def _atomic_write(path: Path, content: bytes) -> None:

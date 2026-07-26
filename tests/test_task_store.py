@@ -76,6 +76,7 @@ class TaskStoreTests(unittest.TestCase):
                 self.assertEqual({task.trace_id}, {event.trace_id for event in events})
                 self.assertEqual("TASK_STATE", events[1].event_type)
                 self.assertEqual("[REDACTED]", events[2].payload["arguments"]["api_key"])
+                self.assertNotIn("arguments", events[2].to_public_dict()["payload"])
                 last_sequence = events[-1].sequence
             finally:
                 store.close()

@@ -44,6 +44,7 @@ from repopilot_guard.providers import OpenAICompatibleProvider
 from repopilot_guard.qdrant_bootstrap import QdrantBootstrapper, check_qdrant_health
 from repopilot_guard.skills import SkillError, SkillRegistry
 from repopilot_guard.task_store import StoredTask, TaskStore
+from repopilot_guard.task_diagnostics import build_task_diagnostic, extract_diagnostic_codes
 from repopilot_guard.task_progress import build_task_progress
 from repopilot_guard.task_export import TaskEvidenceExporter
 from repopilot_guard.terminal import run_terminal
@@ -1517,7 +1518,7 @@ def _run_task_store_command(args: argparse.Namespace) -> int:
                     "after_sequence": args.after_sequence,
                     "next_sequence": events[-1].sequence if events else args.after_sequence,
                     "count": len(events),
-                    "events": [event.to_dict() for event in events],
+                    "events": [event.to_public_dict() for event in events],
                 }
             )
         if args.task_command == "review":
@@ -1531,7 +1532,14 @@ def _run_task_store_command(args: argparse.Namespace) -> int:
                     "status": "READY",
                     "code": "TASK_REVIEW_READY",
                     "task": _stored_task_summary(task),
-                    "recent_events": [event.to_dict() for event in events],
+                    "diagnostic": build_task_diagnostic(
+                        status=task.status,
+                        verdict=task.verdict,
+                        pending_approval=task.pending_approval,
+                        error_summary=task.error_summary,
+                        evidence_codes=extract_diagnostic_codes(events),
+                    ),
+                    "recent_events": [event.to_public_dict() for event in events],
                     "artifacts": [artifact.to_dict() for artifact in artifacts],
                     "next_action": _review_next_action(task, artifacts),
                 }
@@ -1634,7 +1642,7 @@ def _run_task_watch(store: TaskStore, args: argparse.Namespace) -> int:
                         "status": "READY",
                         "code": "TASK_WATCH_EVENT",
                         "thread_id": args.thread_id,
-                        "event": event.to_dict(),
+                        "event": event.to_public_dict(),
                     }
                 )
 

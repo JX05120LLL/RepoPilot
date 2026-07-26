@@ -11,6 +11,11 @@ type ReviewTask = {
   verdict?: string | null;
   pendingApproval: boolean;
   taskMode?: string | null;
+  diagnostic?: {
+    tone: "neutral" | "success" | "warning" | "danger";
+    title: string;
+    summary: string;
+  };
 };
 
 type ReviewArtifact = {
@@ -60,9 +65,9 @@ function resolveDecision(task: ReviewTask | null): ReviewDecision {
   }
   if (task.status === "BLOCKED" || task.verdict === "BLOCKED") {
     return {
-      tone: "danger",
-      title: "已被安全策略阻断",
-      detail: "RepoPilot 没有继续执行越权或不满足前置条件的操作。",
+      tone: task.diagnostic?.tone === "warning" ? "warning" : "danger",
+      title: task.diagnostic?.title ?? "已被安全策略阻断",
+      detail: task.diagnostic?.summary ?? "RepoPilot 没有继续执行越权或不满足前置条件的操作。",
     };
   }
   return {

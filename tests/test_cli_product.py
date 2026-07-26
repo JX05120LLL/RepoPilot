@@ -1058,7 +1058,10 @@ class CliProductTests(unittest.TestCase):
                         "pending_approval": False,
                         "verdict": "BLOCKED",
                         "state": {
-                            "tool_events": [{"type": "MODEL_BLOCKED", "api_key": "never-print-this"}],
+                            "tool_events": [
+                                {"type": "WORKSPACE_PREPARED", "code": "WORKSPACE_READY", "workspace_path": str(repository)},
+                                {"type": "MODEL_BLOCKED", "api_key": "never-print-this"},
+                            ],
                             "error_summary": "EXPECTED_BLOCK",
                             "verification_result": {
                                 "status": "FAILED",
@@ -1102,8 +1105,11 @@ class CliProductTests(unittest.TestCase):
             self.assertEqual(0, exit_code)
             self.assertEqual("TASK_EVENTS_READY", events["code"])
             self.assertGreater(events["next_sequence"], 0)
-            self.assertIn("[REDACTED]", encoded_events)
             self.assertNotIn("never-print-this", encoded_events)
+            self.assertNotIn(str(repository), encoded_events)
+            workspace_event = next(item for item in events["events"] if item["type"] == "WORKSPACE_PREPARED")
+            self.assertEqual("WORKSPACE_READY", workspace_event["payload"]["code"])
+            self.assertNotIn("workspace_path", workspace_event["payload"])
 
             output = StringIO()
             with patch("sys.stdout", output):
@@ -1124,6 +1130,7 @@ class CliProductTests(unittest.TestCase):
             self.assertEqual(0, exit_code)
             self.assertEqual("TASK_REVIEW_READY", review["code"])
             self.assertEqual("thread-management-cli", review["task"]["thread_id"])
+            self.assertEqual("TASK_BLOCKED", review["diagnostic"]["code"])
             self.assertLessEqual(len(review["recent_events"]), 2)
             self.assertEqual("READ_VERIFICATION_EVIDENCE", review["next_action"]["type"])
             self.assertIn("--kind verification", review["next_action"]["command"])

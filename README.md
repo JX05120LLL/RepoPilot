@@ -6,7 +6,7 @@ RepoPilot 面向已有代码仓库的维护场景：用户选择一个本地项�
 
 项目的产品体验参考 [OpenAI Codex](https://openai.com/codex/) 与 [xAI grok-build](https://github.com/xai-org/grok-build) 的项目工作区、Agent 工作流和工具扩展思路，但 RepoPilot **不是对上述项目的源码二次开发**。当前代码从零实现，重点探索 Java/Spring Boot 仓库维护中的安全边界、证据闭环、RAG、Skills、MCP 和本地桌面交互。
 
-当前版本：`0.1.5 / Pre-Alpha`。第一版 MVP 的后端闭环已经跑通；Windows x64 release 与 NSIS 安装包已成功构建，并完成隔离目录中的安装、启动、sidecar 退出和卸载烟雾测试。当前代码版本的 15 项端到端评测已一次性执行并全部符合预期，升级迁移等交付验收仍在进行，尚不建议用于生产仓库。
+当前发布版本：`0.1.7 / Pre-Alpha`。第一版 MVP 的后端闭环已经跑通；Windows x64 release 与 NSIS 安装包已成功构建，并完成隔离目录中的安装、启动、sidecar 退出和卸载烟雾测试。当前代码版本的 15 项端到端评测已一次性执行并全部符合预期，升级迁移等交付验收仍在进行，尚不建议用于生产仓库。
 
 ## 目录
 
@@ -86,11 +86,13 @@ RepoPilot 不是一个只会返回代码片段的聊天机器人，也不把“�
 - `compile`、`test`、`targeted_test` 三种 Maven 白名单 Recipe；
 - Git Diff、Surefire 摘要、Evidence 事件、任务产物和最终状态判定；桌面端会按产物类型展示结构化计划、统一 Diff、验证摘要与审计证据，而不是把所有内容降级为原始文本；
 - FastAPI 本机接口、SSE 事件流、React 任务审阅页面和 Tauri 工程；任务状态会转化为可读结论，结束任务只展示真实可执行的审阅、归档和新建操作；
+- API、CLI 和桌面端共用受控任务诊断投影：对预检、Git 工作区、运行配置、补丁或验证失败给出一致的脱敏结论与下一步，不回显原始异常；
+- 任务详情和常规事件流采用字段白名单投影，不向桌面端、SSE 或 CLI 审阅暴露 checkpoint 中的仓库路径、权限确认、工具参数或内部异常；
 - Skills 渐进加载、MCP STDIO/Streamable HTTP、插件完整性校验和统一能力目录；
 - Token/成本遥测、任务预算门禁、协作式取消和敏感信息脱敏；
 - 评测报告自动记录代码版本、Git 脏状态、任务目录、fixture 集合、运行环境和脱敏 Provider 指纹；
 - 旧任务元数据恢复：从 checkpoint 只补回缺失的脱敏标题，不覆盖用户已有标题或运行失败强状态；
-- 230 项 Python 自动化测试和前端生产构建验证。
+- 236 项 Python 自动化测试和前端生产构建验证。
 
 ### 已完成的真实闭环
 

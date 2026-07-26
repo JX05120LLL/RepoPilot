@@ -5,6 +5,7 @@ import { CommandPalette, type CommandPaletteItem } from "./components/CommandPal
 import { TaskInspector } from "./components/TaskInspector";
 import { TaskProgressTrail } from "./components/TaskProgressTrail";
 import { ReviewDecisionSummary } from "./components/ReviewDecisionSummary";
+import { TaskDiagnosticPanel } from "./components/TaskDiagnosticPanel";
 import { API } from "./lib/api";
 import { asRecord, readString, readStringList } from "./lib/values";
 import {
@@ -81,6 +82,13 @@ type Task = {
   status: string;
   pending_approval: boolean;
   verdict?: string | null;
+  diagnostic?: {
+    tone: "neutral" | "success" | "warning" | "danger";
+    code: string;
+    title: string;
+    summary: string;
+    recommended_action: string;
+  };
   progress?: TaskProgress;
   archived_at?: string | null;
   interrupts?: Interrupt[];
@@ -2082,6 +2090,16 @@ export function App() {
                             </div>
                           </div>
                         )}
+                        <TaskDiagnosticPanel
+                          diagnostic={task.diagnostic}
+                          artifacts={artifacts}
+                          onOpenArtifact={(kind) => {
+                            setSelectedArtifact(kind);
+                            setSelectedArtifactVersion(null);
+                            setActiveView("review");
+                          }}
+                          onOpenRuntimeConfiguration={openRuntimeConfiguration}
+                        />
                         {task.progress && task.progress.stages.length > 0 && (
                           <TaskProgressTrail
                             summary={task.progress.summary}
@@ -2700,6 +2718,7 @@ export function App() {
                   verdict: task.verdict,
                   pendingApproval: task.pending_approval,
                   taskMode: task.task_mode,
+                  diagnostic: task.diagnostic,
                 } : null}
                 artifacts={artifacts.map((artifact) => ({ kind: artifact.kind }))}
                 onOpenArtifact={(kind) => {

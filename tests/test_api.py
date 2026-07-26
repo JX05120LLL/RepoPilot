@@ -166,6 +166,8 @@ class ApiTests(unittest.TestCase):
             project = registry.add(repository, "进度快照项目")
             try:
                 runner = FakeRunner(delay=0)
+                runner.result.state["repository"] = "C:/private/repository"
+                runner.result.state["permission_confirmation"] = "不应出现在任务详情中"
                 with TestClient(create_app(runner, registry, root / "runs")) as client:
                     created = client.post(
                         "/api/tasks",
@@ -188,6 +190,11 @@ class ApiTests(unittest.TestCase):
                         time.sleep(0.01)
                     self.assertIsNotNone(progress)
                     self.assertEqual("plan_approval", progress["current_stage"])
+                    self.assertEqual("PENDING_APPROVAL", snapshot.json()["diagnostic"]["code"])
+                    self.assertEqual("生成只读研究计划", snapshot.json()["state"]["task_description"])
+                    self.assertNotIn("repository", snapshot.json()["state"])
+                    self.assertNotIn("permission_confirmation", snapshot.json()["state"])
+                    self.assertNotIn("tool_events", snapshot.json()["state"])
                     self.assertIsNone(progress["terminal_kind"])
                     self.assertEqual(
                         ["workspace", "preflight", "context", "research", "plan_approval", "report"],
