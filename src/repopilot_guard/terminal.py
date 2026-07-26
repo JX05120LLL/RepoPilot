@@ -38,6 +38,7 @@ _ARTIFACT_LABELS = {
 }
 _NEXT_ACTION_LABELS = {
     "DECIDE_PENDING_APPROVAL": "处理当前审批",
+    "REVIEW_PENDING_APPROVAL": "审阅当前审批范围",
     "READ_VERIFICATION_EVIDENCE": "核验 Maven 验证记录",
     "READ_DIFF_EVIDENCE": "核验真实代码 Diff",
     "READ_PLAN_EVIDENCE": "审阅修改计划",
@@ -333,6 +334,13 @@ class TerminalRenderer:
             )
             print(f"  下一步  {action_label}", file=stream)
             print(f"    {command}", file=stream)
+        message = next_action.get("message")
+        if isinstance(message, str) and message.strip():
+            print(f"  提示  {message}", file=stream)
+        decision_command = next_action.get("decision_command")
+        if isinstance(decision_command, str) and decision_command.strip():
+            print("  决定", file=stream)
+            print(f"    {decision_command}", file=stream)
 
 
 def _text(value: object, fallback: str) -> str:

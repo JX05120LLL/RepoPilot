@@ -313,6 +313,34 @@ class TerminalCommandRouterTests(unittest.TestCase):
         self.assertIn("task artifact --thread-id thread-1 --kind verification", rendered)
         self.assertNotIn("[REPORT]", rendered)
 
+    def test_renderer_requires_review_before_pending_approval_decision(self) -> None:
+        output = StringIO()
+
+        TerminalRenderer().render(
+            json.dumps(
+                {
+                    "status": "READY",
+                    "task": {"status": "WAITING_APPROVAL", "verdict": "UNVERIFIED"},
+                    "recent_events": [],
+                    "artifacts": [{"kind": "plan_markdown", "sha256": "c" * 64}],
+                    "next_action": {
+                        "type": "REVIEW_PENDING_APPROVAL",
+                        "command": "repopilot-guard task status --thread-id thread-1",
+                        "decision_command": "repopilot-guard task decide --thread-id thread-1 --decision <approve|revise|reject>",
+                        "message": "先审阅当前审批范围和产物，再显式选择批准、要求调整或拒绝。",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            ["task", "review"],
+            output,
+        )
+
+        rendered = output.getvalue()
+        self.assertIn("审阅当前审批范围", rendered)
+        self.assertIn("先审阅当前审批范围", rendered)
+        self.assertIn("--decision <approve|revise|reject>", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

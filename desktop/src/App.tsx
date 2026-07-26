@@ -688,6 +688,29 @@ export function App() {
     }
   }
 
+  async function copyTerminalCommand(command: string): Promise<boolean> {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(command);
+        return true;
+      }
+      const field = document.createElement("textarea");
+      field.value = command;
+      field.setAttribute("readonly", "");
+      field.style.position = "fixed";
+      field.style.opacity = "0";
+      document.body.append(field);
+      field.select();
+      const copied = document.execCommand("copy");
+      field.remove();
+      if (!copied) throw new Error("COPY_FAILED");
+      return true;
+    } catch {
+      setRequestError("无法复制受控终端命令，请手动选择后复制。");
+      return false;
+    }
+  }
+
   useEffect(() => {
     void Promise.all([
       loadProjects(),
@@ -1814,6 +1837,25 @@ export function App() {
           .includes(taskQuery.trim().toLocaleLowerCase()),
     )
     .slice(0, 5);
+  const terminalCommands = task
+    ? [
+        {
+          id: "status",
+          label: "查看状态",
+          command: `repopilot-guard task status --thread-id ${task.thread_id}`,
+        },
+        {
+          id: "review",
+          label: "审阅任务",
+          command: `repopilot-guard task review --thread-id ${task.thread_id}`,
+        },
+        {
+          id: "artifacts",
+          label: "查看产物",
+          command: `repopilot-guard task artifacts --thread-id ${task.thread_id}`,
+        },
+      ]
+    : [];
 
   return (
     <main className="product-shell">
@@ -2558,6 +2600,7 @@ export function App() {
                   selectedSkillCount={contextSnapshot?.selected_skills.length ?? 0}
                   boundToolCount={contextSnapshot?.bound_tool_ids.length ?? 0}
                   totalTokens={telemetry?.model.total_tokens}
+                  terminalCommands={terminalCommands}
                   onClose={() => setShowTaskInspector(false)}
                   onOpenContext={() => setActiveView("context")}
                   onOpenArtifact={(kind) => {
@@ -2567,6 +2610,7 @@ export function App() {
                     }
                     setActiveView("review");
                   }}
+                  onCopyTerminalCommand={copyTerminalCommand}
                 />
               </>
             )}

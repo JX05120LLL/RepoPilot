@@ -1,12 +1,15 @@
 import {
   CheckCircle,
+  CopySimple,
   FileCode,
   LinkSimple,
   Paperclip,
   Stack,
+  TerminalWindow,
   WarningCircle,
   X,
 } from "@phosphor-icons/react";
+import { useState } from "react";
 
 type InspectorTask = {
   title: string;
@@ -45,6 +48,12 @@ type InspectorArtifact = {
   sizeBytes: number;
 };
 
+type InspectorTerminalCommand = {
+  id: string;
+  label: string;
+  command: string;
+};
+
 type TaskInspectorProps = {
   task: InspectorTask;
   sources: InspectorSource[];
@@ -54,9 +63,11 @@ type TaskInspectorProps = {
   selectedSkillCount: number;
   boundToolCount: number;
   totalTokens?: number;
+  terminalCommands: InspectorTerminalCommand[];
   onClose: () => void;
   onOpenContext: () => void;
   onOpenArtifact: (kind?: string) => void;
+  onCopyTerminalCommand: (command: string) => Promise<boolean>;
 };
 
 const statusLabels: Record<string, string> = {
@@ -116,14 +127,24 @@ export function TaskInspector({
   selectedSkillCount,
   boundToolCount,
   totalTokens,
+  terminalCommands,
   onClose,
   onOpenContext,
   onOpenArtifact,
+  onCopyTerminalCommand,
 }: TaskInspectorProps) {
+  const [copiedCommandId, setCopiedCommandId] = useState<string | null>(null);
   const tone = statusTone(task.pendingApproval ? "WAITING_APPROVAL" : task.status, task.verdict);
   const statusLabel = task.pendingApproval
     ? "等待审批"
     : statusLabels[task.verdict || task.status] ?? task.verdict ?? task.status;
+
+  async function copyCommand(command: InspectorTerminalCommand) {
+    const copied = await onCopyTerminalCommand(command.command);
+    if (!copied) return;
+    setCopiedCommandId(command.id);
+    window.setTimeout(() => setCopiedCommandId(null), 1_800);
+  }
 
   return (
     <aside className="task-inspector" aria-label="任务检查器">
@@ -158,6 +179,26 @@ export function TaskInspector({
             <div><dt>阶段</dt><dd>{stageLabel(task.currentStage, statusLabels[task.status] ?? task.status)}</dd></div>
             <div><dt>线程</dt><dd title={task.threadId}>{task.threadId.slice(0, 12)}</dd></div>
           </dl>
+        </section>
+
+        <section className="inspector-section inspector-terminal">
+          <header><span>受控终端</span><TerminalWindow size={16} /></header>
+          <div className="inspector-terminal-commands">
+            {terminalCommands.map((command) => (
+              <article key={command.id}>
+                <span>{command.label}</span>
+                <code>{command.command}</code>
+                <button
+                  type="button"
+                  title={`复制${command.label}命令`}
+                  onClick={() => void copyCommand(command)}
+                >
+                  {copiedCommandId === command.id ? <CheckCircle size={15} weight="fill" /> : <CopySimple size={15} />}
+                  {copiedCommandId === command.id ? "已复制" : "复制"}
+                </button>
+              </article>
+            ))}
+          </div>
         </section>
 
         <section className="inspector-section">
@@ -231,6 +272,7 @@ export function TaskInspector({
             <p className="inspector-telemetry">本次模型用量 {totalTokens.toLocaleString()} tokens</p>
           )}
         </section>
+
       </div>
 
       <footer className="task-inspector-footer">
