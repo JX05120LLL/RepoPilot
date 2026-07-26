@@ -31,6 +31,7 @@ from repopilot_guard.mcp_runtime import (
 from repopilot_guard.plugins import PluginRegistry
 from repopilot_guard.permissions import FULL_ACCESS_CONFIRMATION
 from repopilot_guard.project_registry import ProjectRegistry
+from repopilot_guard.task_store import TaskStore
 
 
 def _initialize_git_repository(repository: Path) -> None:
@@ -106,6 +107,21 @@ class CheckpointThenFailingRunner(FakeRunner):
         raise RuntimeError("不得返回给客户端的内部错误")
 
 
+class FailedStatusRunner(FakeRunner):
+    """返回终态 FAILED，验证 SSE 不会继续占用连接。"""
+
+    def __init__(self) -> None:
+        super().__init__(delay=0)
+        self.get_calls = 0
+
+    def get(self, thread_id: str) -> object:
+        self.get_calls += 1
+        self.result.status = "FAILED"
+        self.result.pending_approval = False
+        self.result.verdict = "FAILED"
+        return self.result
+
+
 class FakeApiMcpSession:
     async def initialize(self) -> McpSessionInfo:
         return McpSessionInfo("API Test MCP", "1.0", "2025-11-25", False)
@@ -149,6 +165,46 @@ class FakeApiMcpConnector:
 
 
 class ApiTests(unittest.TestCase):
+    def test_sse_closes_immediately_for_failed_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repository = root / "repo"
+            repository.mkdir()
+            _initialize_git_repository(repository)
+            registry = ProjectRegistry(root / "state.sqlite")
+            project = registry.add(repository, "失败任务项目")
+            task_store = TaskStore(root / "state.sqlite")
+            runner = FailedStatusRunner()
+            try:
+                task_store.create(
+                    thread_id="thread-failed-sse",
+                    task_id="task-failed-sse",
+                    project_id=project.project_id,
+                    repository=repository,
+                    output_root=root / "runs",
+                    task_mode="safe-isolated",
+                    task_operation="research",
+                    permission_mode="safe",
+                    workspace_mode="worktree",
+                )
+                task_store.sync_graph_result(
+                    {
+                        "thread_id": "thread-failed-sse",
+                        "status": "FAILED",
+                        "pending_approval": False,
+                        "verdict": "FAILED",
+                        "state": {},
+                    }
+                )
+                with TestClient(create_app(runner, registry, root / "runs")) as client:
+                    with patch("repopilot_guard.api.time.sleep", return_value=None):
+                        stream = client.get("/api/tasks/thread-failed-sse/events")
+                    self.assertEqual(200, stream.status_code)
+                    self.assertEqual(1, runner.get_calls)
+            finally:
+                task_store.close()
+                registry.close()
+
     def test_preview_origin_accepts_only_explicit_loopback_url(self) -> None:
         with patch.dict(os.environ, {"REPOPILOT_DESKTOP_PREVIEW_ORIGIN": "http://127.0.0.1:1427"}, clear=True):
             self.assertIn("http://127.0.0.1:1427", _desktop_allowed_origins())

@@ -43,6 +43,7 @@ type Mode = "safe-isolated" | "full-local";
 type Operation = "change" | "research";
 type WorkspaceView = "task" | "context" | "review";
 type EvidenceScope = "key" | "all";
+type EventStreamState = "idle" | "connecting" | "connected" | "reconnecting" | "offline" | "closed";
 type Project = {
   project_id: string;
   display_name: string;
@@ -281,6 +282,14 @@ const taskStateLabels: Record<string, string> = {
   CANCELLED: "已取消",
   UNVERIFIED: "尚未验证",
 };
+const eventStreamLabels: Record<EventStreamState, string> = {
+  idle: "未连接证据流",
+  connecting: "正在连接证据流",
+  connected: "实时证据流",
+  reconnecting: "证据流重连中",
+  offline: "API 不可达，轮询保底",
+  closed: "证据流已结束",
+};
 
 function taskStateLabel(status: string, verdict?: string | null, pendingApproval = false): string {
   if (pendingApproval) return taskStateLabels.WAITING_APPROVAL;
@@ -484,6 +493,7 @@ export function App() {
     window.matchMedia("(min-width: 1081px)").matches,
   );
   const [events, setEvents] = useState<TimelineEvent[]>([]);
+  const [eventStreamState, setEventStreamState] = useState<EventStreamState>("idle");
   const [evidenceScope, setEvidenceScope] = useState<EvidenceScope>("key");
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [selectedArtifact, setSelectedArtifact] = useState("");
@@ -499,6 +509,7 @@ export function App() {
   const [evidenceExport, setEvidenceExport] = useState<TaskEvidenceExport | null>(null);
   const [revisionComment, setRevisionComment] = useState("");
   const [approvalBusy, setApprovalBusy] = useState(false);
+  const [executionApprovalConfirmation, setExecutionApprovalConfirmation] = useState(false);
   const [requestError, setRequestError] = useState("");
   const [mcpServer, setMcpServer] = useState("");
   const [mcpConfigPath, setMcpConfigPath] = useState(".repopilot/mcp.toml");
@@ -724,6 +735,7 @@ export function App() {
   useEffect(() => {
     if (!task) return;
     const source = new EventSource(`${API}/tasks/${task.thread_id}/events`);
+    setEventStreamState("connecting");
     let completed = false;
     const appendEvent = (event: MessageEvent<string>) => {
       try {
@@ -749,6 +761,10 @@ export function App() {
         ]);
       }
     };
+    source.onopen = () => {
+      setEventStreamState("connected");
+      setRequestError((current) => (current === EVIDENCE_STREAM_ERROR ? "" : current));
+    };
     source.addEventListener("evidence", appendEvent);
     source.addEventListener("state", (event) => {
       appendEvent(event as MessageEvent<string>);
@@ -757,8 +773,9 @@ export function App() {
           (event as MessageEvent<string>).data,
         ) as Pick<Task, "status" | "pending_approval" | "verdict">;
         setTask((current) => (current ? { ...current, ...snapshot } : current));
-        if (["REPORT", "BLOCKED", "CANCELLED"].includes(snapshot.status)) {
+        if (["REPORT", "BLOCKED", "FAILED", "CANCELLED"].includes(snapshot.status)) {
           completed = true;
+          setEventStreamState("closed");
           source.close();
         }
       } catch {
@@ -767,15 +784,17 @@ export function App() {
     });
     source.addEventListener("error", () => {
       if (completed) return;
-      // EventSource 会自动重连；仅在本机 API 也不可用时向用户报告故障。
+      setEventStreamState("reconnecting");
+      // EventSource 会自动重连；健康检查只用于区分 API 故障和短暂的连接抖动。
       void fetch(`${API}/health`)
         .then((response) => {
           if (!response.ok) throw new Error("API_UNAVAILABLE");
-          setRequestError((current) =>
-            current === EVIDENCE_STREAM_ERROR ? "" : current,
-          );
+          setRequestError((current) => current === EVIDENCE_STREAM_ERROR ? "" : current);
         })
-        .catch(() => setRequestError(EVIDENCE_STREAM_ERROR));
+        .catch(() => {
+          setEventStreamState("offline");
+          setRequestError(EVIDENCE_STREAM_ERROR);
+        });
     });
     return () => source.close();
   }, [task?.thread_id]);
@@ -783,6 +802,14 @@ export function App() {
   useEffect(() => {
     if (task?.pending_approval) setActiveView("task");
   }, [task?.pending_approval]);
+
+  useEffect(() => {
+    if (!task?.pending_approval) setExecutionApprovalConfirmation(false);
+  }, [task?.pending_approval]);
+
+  useEffect(() => {
+    setExecutionApprovalConfirmation(false);
+  }, [task?.thread_id]);
 
   useEffect(() => {
     if (!task) return;
@@ -1395,6 +1422,7 @@ export function App() {
         return;
       }
       if (decision === "revise") setRevisionComment("");
+      if (decision === "approve") setExecutionApprovalConfirmation(false);
       setTask(payload as Task);
     } catch {
       setRequestError("审批请求未送达本机 API，请检查服务状态后重试。");
@@ -2074,6 +2102,14 @@ export function App() {
                           <span className={"state-chip state-" + taskStatus.toLowerCase()}>
                             {taskStateLabel(taskStatus, task.verdict, task.pending_approval)}
                           </span>
+                          <span
+                            className={`event-stream-status stream-${eventStreamState}`}
+                            aria-label={eventStreamLabels[eventStreamState]}
+                            title="任务状态也会通过本机轮询恢复"
+                          >
+                            <i aria-hidden="true" />
+                            {eventStreamLabels[eventStreamState]}
+                          </span>
                         </div>
                         {taskOutcome && (
                           <div className={"task-outcome outcome-" + taskOutcome.tone} aria-live="polite">
@@ -2196,15 +2232,62 @@ export function App() {
                           <ArrowClockwise size={16} />要求调整
                         </button>
                       )}
-                      <button className="primary-button" type="button" onClick={() => void approve("approve")} disabled={approvalBusy}>
+                      <button
+                        className="primary-button"
+                        type="button"
+                        onClick={() => {
+                          if (executionApproval) {
+                            setExecutionApprovalConfirmation(true);
+                            return;
+                          }
+                          void approve("approve");
+                        }}
+                        disabled={approvalBusy}
+                      >
                         <CheckCircle size={16} weight="bold" />
-                        {approvalBusy ? "正在提交" : researchPlanApproval ? "确认并生成报告" : executionApproval ? "批准执行" : "确认计划"}
+                        {approvalBusy ? "正在提交" : researchPlanApproval ? "确认并生成报告" : executionApproval ? "核对并批准执行" : "确认计划"}
                       </button>
                       <button className="danger-button" type="button" onClick={() => void approve("reject")} disabled={approvalBusy}>
                         <XCircle size={16} />拒绝
                       </button>
                     </div>
                   </section>
+                )}
+                {executionApprovalConfirmation && task?.pending_approval && executionApproval && (
+                  <div className="approval-confirmation-backdrop" role="presentation">
+                    <section
+                      className="approval-confirmation"
+                      role="dialog"
+                      aria-modal="true"
+                      aria-labelledby="execution-approval-title"
+                      aria-describedby="execution-approval-description"
+                    >
+                      <header>
+                        <WarningCircle size={21} weight="fill" aria-hidden="true" />
+                        <div>
+                          <span>执行审批</span>
+                          <h2 id="execution-approval-title">确认允许受控执行</h2>
+                        </div>
+                      </header>
+                      <p id="execution-approval-description">
+                        RepoPilot 将只在当前任务工作区内应用结构化补丁，并按下方固定 Maven Recipe 验证。不会创建提交、推送代码或执行任意 Shell。
+                      </p>
+                      <dl>
+                        <div><dt>可写入范围</dt><dd>{approvalCandidateFiles.length ? `${approvalCandidateFiles.length} 个候选文件` : "计划中的候选文件"}</dd></div>
+                        <div><dt>Maven Recipe</dt><dd><code>{approvalRecipe}</code></dd></div>
+                        {approvalTargetTest && <div><dt>目标测试</dt><dd><code>{approvalTargetTest}</code></dd></div>}
+                      </dl>
+                      <p className="approval-confirmation-note">拒绝会停止本次任务并保留已生成的计划与证据，不会写入代码。</p>
+                      <footer>
+                        <button className="secondary-button" type="button" onClick={() => setExecutionApprovalConfirmation(false)} disabled={approvalBusy}>
+                          返回审阅
+                        </button>
+                        <button className="primary-button" type="button" onClick={() => void approve("approve")} disabled={approvalBusy}>
+                          <CheckCircle size={16} weight="bold" />{approvalBusy ? "正在提交" : "确认并执行"}
+                        </button>
+                      </footer>
+                    </section>
+                  </div>
                 )}
               </div>
             </div>

@@ -1579,8 +1579,13 @@ def _review_next_action(
 
     if task.pending_approval:
         return {
-            "type": "DECIDE_PENDING_APPROVAL",
+            "type": "REVIEW_PENDING_APPROVAL",
             "command": f"repopilot-guard task status --thread-id {task.thread_id}",
+            "decision_command": (
+                "repopilot-guard task decide --thread-id "
+                f"{task.thread_id} --decision <approve|revise|reject>"
+            ),
+            "message": "先审阅当前审批范围和产物，再显式选择批准、要求调整或拒绝。",
         }
     artifact_kinds = {
         getattr(artifact, "kind", None)

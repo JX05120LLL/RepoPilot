@@ -513,7 +513,7 @@ def create_app(
                 for event in store.events_after(thread_id, emitted):
                     yield _sse_event(event)
                     emitted = event.sequence
-                if snapshot.get("status") in {"REPORT", "BLOCKED", "CANCELLED"}:
+                if snapshot.get("status") in {"REPORT", "BLOCKED", "FAILED", "CANCELLED"}:
                     return
                 time.sleep(0.5)
 

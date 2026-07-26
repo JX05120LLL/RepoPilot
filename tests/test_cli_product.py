@@ -1157,6 +1157,48 @@ class CliProductTests(unittest.TestCase):
                 main(["task", "list", "--include-archived", "--state-db", str(state_path)])
             self.assertEqual(1, json.loads(output.getvalue())["count"])
 
+    def test_task_review_requires_explicit_decision_after_reviewing_pending_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "state.sqlite"
+            store = TaskStore(state_path)
+            try:
+                store.create(
+                    thread_id="thread-pending-review",
+                    task_id="task-pending-review",
+                    project_id="project-1",
+                    repository=root / "private-repository",
+                    output_root=root / "private-runs",
+                    task_mode="safe-isolated",
+                    task_operation="change",
+                    permission_mode="safe",
+                    workspace_mode="worktree",
+                )
+                store.sync_graph_result(
+                    {
+                        "thread_id": "thread-pending-review",
+                        "status": "WAITING_APPROVAL",
+                        "pending_approval": True,
+                        "verdict": None,
+                        "state": {},
+                    }
+                )
+            finally:
+                store.close()
+
+            output = StringIO()
+            with patch("sys.stdout", output):
+                exit_code = main(
+                    ["task", "review", "--thread-id", "thread-pending-review", "--state-db", str(state_path)]
+                )
+
+            payload = json.loads(output.getvalue())
+            self.assertEqual(0, exit_code)
+            self.assertEqual("REVIEW_PENDING_APPROVAL", payload["next_action"]["type"])
+            self.assertIn("task status", payload["next_action"]["command"])
+            self.assertIn("task decide", payload["next_action"]["decision_command"])
+            self.assertNotIn("--decision approve", payload["next_action"]["command"])
+
     def test_task_watch_streams_sanitized_events_and_finishes_for_terminal_task(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
