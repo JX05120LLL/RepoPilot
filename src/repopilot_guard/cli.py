@@ -248,6 +248,10 @@ def build_parser() -> argparse.ArgumentParser:
     task_status = task_subparsers.add_parser("status", help="读取任务状态、计划摘要和下一步操作，不调用模型")
     task_status.add_argument("--thread-id", required=True)
     task_status.add_argument("--state-db", type=Path)
+    task_review = task_subparsers.add_parser("review", help="汇总任务状态、最近证据和产物元数据，不读取正文")
+    task_review.add_argument("--thread-id", required=True)
+    task_review.add_argument("--event-limit", type=int, default=8, help="返回最近 1-50 条脱敏事件，默认 8")
+    task_review.add_argument("--state-db", type=Path)
     task_events = task_subparsers.add_parser("events", help="按游标读取已脱敏的持久化证据事件")
     task_events.add_argument("--thread-id", required=True)
     task_events.add_argument("--after-sequence", type=int, default=0, help="只返回该序号之后的事件")
@@ -1262,7 +1266,7 @@ def _run_task(args: argparse.Namespace) -> int:
 
     registry: ProjectRegistry | None = None
     try:
-        if args.task_command in {"list", "events", "watch", "archive"}:
+        if args.task_command in {"list", "events", "watch", "archive", "review"}:
             return _run_task_store_command(args)
         if args.task_command in {"artifacts", "artifact", "export"}:
             return _run_task_artifact_command(args)
@@ -1516,6 +1520,22 @@ def _run_task_store_command(args: argparse.Namespace) -> int:
                     "events": [event.to_dict() for event in events],
                 }
             )
+        if args.task_command == "review":
+            if not 1 <= args.event_limit <= 50:
+                raise ValueError("TASK_EVENT_LIMIT_INVALID")
+            task = store.get(args.thread_id)
+            events = store.recent_events(args.thread_id, limit=args.event_limit)
+            artifacts = store.artifacts(args.thread_id)
+            return _print_json_result(
+                {
+                    "status": "READY",
+                    "code": "TASK_REVIEW_READY",
+                    "task": _stored_task_summary(task),
+                    "recent_events": [event.to_dict() for event in events],
+                    "artifacts": [artifact.to_dict() for artifact in artifacts],
+                    "next_action": _review_next_action(task),
+                }
+            )
         task = store.archive(args.thread_id)
         return _print_json_result(
             {"status": "READY", "code": "TASK_ARCHIVED", "task": _stored_task_summary(task)}
@@ -1541,6 +1561,25 @@ def _run_task_store_command(args: argparse.Namespace) -> int:
         )
     finally:
         store.close()
+
+
+def _review_next_action(task: StoredTask) -> dict[str, str] | None:
+    """由持久化事实给出终端下一步，不推测模型、补丁或验证结果。"""
+
+    if task.pending_approval:
+        return {
+            "type": "DECIDE_PENDING_APPROVAL",
+            "command": f"repopilot-guard task status --thread-id {task.thread_id}",
+        }
+    if task.status in {"REPORT", "FAILED", "BLOCKED", "CANCELLED"}:
+        return {
+            "type": "INSPECT_TASK_ARTIFACTS",
+            "command": f"repopilot-guard task artifacts --thread-id {task.thread_id}",
+        }
+    return {
+        "type": "WATCH_TASK",
+        "command": f"repopilot-guard task watch --thread-id {task.thread_id}",
+    }
 
 
 def _run_task_watch(store: TaskStore, args: argparse.Namespace) -> int:

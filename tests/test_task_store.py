@@ -90,6 +90,30 @@ class TaskStoreTests(unittest.TestCase):
             finally:
                 reopened.close()
 
+    def test_recent_events_returns_bounded_tail_in_chronological_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            store = TaskStore(root / "state.sqlite")
+            try:
+                self._create_task(store, root, "thread-tail")
+                store.sync_graph_result(
+                    {
+                        "thread_id": "thread-tail",
+                        "status": "WAITING_APPROVAL",
+                        "state": {"tool_events": [{"type": "FIRST"}, {"type": "SECOND"}]},
+                    }
+                )
+
+                events = store.recent_events("thread-tail", limit=2)
+
+                self.assertEqual(2, len(events))
+                self.assertLess(events[0].sequence, events[1].sequence)
+                self.assertEqual("SECOND", events[-1].event_type)
+                with self.assertRaisesRegex(ValueError, "TASK_EVENT_LIMIT_INVALID"):
+                    store.recent_events("thread-tail", limit=0)
+            finally:
+                store.close()
+
     def test_task_operation_persists_and_invalid_checkpoint_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

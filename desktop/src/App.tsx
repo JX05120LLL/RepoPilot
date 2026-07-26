@@ -14,6 +14,7 @@ import {
   CheckCircle,
   ChatCircle,
   CircleNotch,
+  ClockCounterClockwise,
   Command,
   FileArrowUp,
   FileCode,
@@ -261,6 +262,21 @@ const artifactLabels: Record<string, string> = {
   verification: "验证结果",
   telemetry: "运行遥测",
 };
+const taskStateLabels: Record<string, string> = {
+  WAITING_APPROVAL: "等待审批",
+  RUNNING: "正在执行",
+  REPORT: "任务已结束",
+  PASSED: "验证通过",
+  FAILED: "验证失败",
+  BLOCKED: "已阻断",
+  CANCELLED: "已取消",
+  UNVERIFIED: "尚未验证",
+};
+
+function taskStateLabel(status: string, verdict?: string | null, pendingApproval = false): string {
+  if (pendingApproval) return taskStateLabels.WAITING_APPROVAL;
+  return taskStateLabels[verdict || status] ?? verdict ?? status;
+}
 
 const eventLabels: Record<string, string> = {
   TASK_CREATED: "任务已创建",
@@ -492,6 +508,7 @@ export function App() {
   const [apiCapabilities, setApiCapabilities] = useState<string[]>([]);
   const taskSearchRef = useRef<HTMLInputElement>(null);
   const taskDescriptionRef = useRef<HTMLTextAreaElement>(null);
+  const runtimeConfigurationRef = useRef<HTMLElement>(null);
   const [runtimeHealth, setRuntimeHealth] = useState<RuntimeHealth>({
     status: "UNKNOWN",
     code: "API_NOT_CHECKED",
@@ -1428,6 +1445,13 @@ export function App() {
     setActiveView("task");
   }
 
+  function openRuntimeConfiguration() {
+    setActiveView("context");
+    window.requestAnimationFrame(() =>
+      runtimeConfigurationRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }),
+    );
+  }
+
   function switchProject(nextProjectId: string) {
     if (task?.project_id && task.project_id !== nextProjectId) beginNewTask();
     setProjectId(nextProjectId);
@@ -1673,6 +1697,15 @@ export function App() {
       onSelect: () => setActiveView("context"),
     },
     {
+      id: "runtime-configuration",
+      group: "系统",
+      label: "运行配置",
+      description: "管理本地模型、Embedding 与 Qdrant 连接配置",
+      icon: <SlidersHorizontal size={16} />,
+      keywords: "settings api key model embedding qdrant 配置",
+      onSelect: openRuntimeConfiguration,
+    },
+    {
       id: "view-review",
       group: "视图",
       label: "证据与产物",
@@ -1729,41 +1762,57 @@ export function App() {
       id: `task-${item.thread_id}`,
       group: "最近任务",
       label: compactTaskLabel(item),
-      description: `${item.status} · ${item.task_mode === "full-local" ? "完全本机" : "安全隔离"}`,
+      description: `${taskStateLabel(item.status, item.verdict, item.pending_approval)} · ${item.task_mode === "full-local" ? "完全本机" : "安全隔离"}`,
       icon: <TerminalWindow size={16} />,
       keywords: `${item.thread_id} ${item.project_id ?? ""}`,
       onSelect: () => void selectTask(item),
     })),
   ];
+  const recentTasks = tasks
+    .filter(
+      (item) =>
+        !taskQuery.trim() ||
+        compactTaskLabel(item)
+          .toLocaleLowerCase()
+          .includes(taskQuery.trim().toLocaleLowerCase()),
+    )
+    .slice(0, 5);
 
   return (
     <main className="product-shell">
       <aside className="navigation-pane">
         <div className="product-brand">
-          <span className="brand-menu">
-            <strong>RepoPilot</strong>
-          </span>
-          <div className="brand-actions">
-            <button
-              className="icon-button"
-              type="button"
-              title="新建任务 (Ctrl+N)"
-              aria-label="新建任务"
-              onClick={beginNewTask}
-            >
-              <Plus size={18} />
-            </button>
-            <button
-              className={showTaskSearch ? "icon-button active" : "icon-button"}
-              type="button"
-              title="搜索任务 (Ctrl+K)"
-              aria-label="搜索任务"
-              onClick={() => setShowTaskSearch((current) => !current)}
-            >
-              <MagnifyingGlass size={18} />
-            </button>
-          </div>
+          <span className="brand-menu"><strong>RepoPilot</strong></span>
         </div>
+
+        <nav className="primary-navigation" aria-label="工作台入口">
+          <button type="button" onClick={beginNewTask}>
+            <Plus size={17} />
+            <span>新建任务</span>
+            <small>Ctrl+N</small>
+          </button>
+          <button
+            className={showTaskSearch ? "active" : ""}
+            type="button"
+            onClick={() => setShowTaskSearch((current) => !current)}
+          >
+            <ListMagnifyingGlass size={17} />
+            <span>搜索任务</span>
+          </button>
+          <button type="button" onClick={() => setShowCommandPalette(true)}>
+            <Command size={17} />
+            <span>命令面板</span>
+            <small>Ctrl+K</small>
+          </button>
+          <button
+            className={activeView === "context" ? "active" : ""}
+            type="button"
+            onClick={() => setActiveView("context")}
+          >
+            <PuzzlePiece size={17} />
+            <span>上下文与扩展</span>
+          </button>
+        </nav>
 
         {showTaskSearch && (
           <div className="task-search">
@@ -1864,6 +1913,30 @@ export function App() {
               </button>
             </div>
           </details>
+
+          <section className="recent-task-navigation" aria-label="最近任务">
+            <div className="navigation-heading">
+              <span>最近任务</span>
+            </div>
+            <div className="recent-task-list">
+              {recentTasks.length === 0 && <p className="sidebar-empty">暂无任务记录</p>}
+              {recentTasks.map((item) => (
+                <button
+                  className={task?.thread_id === item.thread_id ? "recent-task-row active" : "recent-task-row"}
+                  type="button"
+                  key={item.thread_id}
+                  onClick={() => void selectTask(item)}
+                >
+                  <ClockCounterClockwise size={15} />
+                  <span>
+                    <strong>{compactTaskLabel(item)}</strong>
+                    <small>{taskStateLabel(item.status, item.verdict, item.pending_approval)} · {item.task_mode === "full-local" ? "完全本机" : "安全隔离"}</small>
+                  </span>
+                  <i className={"task-dot status-" + item.status.toLowerCase()} />
+                </button>
+              ))}
+            </div>
+          </section>
         </section>
 
         <div className="navigation-footer">
@@ -1871,6 +1944,10 @@ export function App() {
             <input type="checkbox" checked={showArchived} onChange={(event) => setShowArchived(event.target.checked)} />
             显示归档
           </label>
+          <button className="navigation-settings" type="button" onClick={openRuntimeConfiguration}>
+            <SlidersHorizontal size={16} />
+            <span>运行配置</span>
+          </button>
           <div className={"runtime-indicator runtime-" + serviceStatus}>
             <span />
             <div>
@@ -1986,7 +2063,7 @@ export function App() {
                           <span className="agent-mark"><TerminalWindow size={15} weight="bold" /></span>
                           <strong>RepoPilot</strong>
                           <span className={"state-chip state-" + taskStatus.toLowerCase()}>
-                            {task.pending_approval ? "等待审批" : taskStatus}
+                            {taskStateLabel(taskStatus, task.verdict, task.pending_approval)}
                           </span>
                         </div>
                         {taskOutcome && (
@@ -2035,7 +2112,7 @@ export function App() {
                               <FileCode size={18} />
                               <span>
                                 已生成 {artifacts.length} 份可审计产物
-                                <small>{task.verdict ?? "等待最终验证"}</small>
+                                <small>{task.verdict ? taskStateLabel(task.status, task.verdict) : "等待最终验证"}</small>
                               </span>
                             </div>
                             <button type="button" onClick={() => setActiveView("review")}>
@@ -2124,7 +2201,7 @@ export function App() {
                         : <WarningCircle size={19} weight="fill" />}
                     <div>
                       <strong>{taskOutcome?.title ?? "任务状态已更新"}</strong>
-                      <span>{task.pending_approval ? "请在上方完成审批" : task.verdict ?? task.status}</span>
+                      <span>{task.pending_approval ? "请在上方完成审批" : taskStateLabel(task.status, task.verdict)}</span>
                     </div>
                   </div>
                   <div className="task-command-actions">
@@ -2401,7 +2478,7 @@ export function App() {
               <span>{contextSnapshot ? "已冻结任务快照" : "项目级配置"}</span>
             </header>
 
-            <section className="settings-section">
+            <section className="settings-section" ref={runtimeConfigurationRef}>
               <div className="settings-title">
                 <SlidersHorizontal size={19} />
                 <div><h3>运行配置</h3><p>仅保存到桌面应用自己的本地配置文件，密钥不会回显或写入任务证据。</p></div>
@@ -2597,7 +2674,7 @@ export function App() {
               <header>
                 <div>
                   <h2>{selectedArtifact ? artifactLabels[selectedArtifact] ?? selectedArtifact : "选择任务产物"}</h2>
-                  <p>{task ? compactTaskLabel(task) + " · " + (task.verdict ?? task.status) : "尚未选择任务"}</p>
+                  <p>{task ? compactTaskLabel(task) + " · " + taskStateLabel(task.status, task.verdict, task.pending_approval) : "尚未选择任务"}</p>
                 </div>
                 <div className="review-header-actions">
                   {artifactVersions.length > 0 && (

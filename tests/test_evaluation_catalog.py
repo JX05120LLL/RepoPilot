@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+from repopilot_guard import __version__
 from repopilot_guard.evaluation import (
     BaselineValidator,
     EvaluationCatalog,
@@ -116,7 +117,7 @@ class EvaluationCatalogTests(unittest.TestCase):
             self.assertEqual(["J01"], report["metadata"]["selected_task_ids"])
             self.assertEqual(64, len(report["metadata"]["catalog_sha256"]))
             self.assertEqual(64, len(report["metadata"]["fixture_set_sha256"]))
-            self.assertEqual("0.1.3", report["metadata"]["repopilot"]["version"])
+            self.assertEqual(__version__, report["metadata"]["repopilot"]["version"])
             self.assertIn(report["metadata"]["repopilot"]["source_tree_state"], {"CLEAN", "DIRTY", "UNAVAILABLE"})
             self.assertEqual("J01/workspace", report["results"][0]["validation_workspace"])
             self.assertEqual("J01/maven-stdout.txt", report["results"][0]["stdout_log"])

@@ -5,6 +5,7 @@ import os
 import subprocess
 import tempfile
 import time
+import tomllib
 import unittest
 import zipfile
 from io import StringIO
@@ -84,6 +85,18 @@ class _Result:
 
 
 class CliProductTests(unittest.TestCase):
+    def test_desktop_and_python_release_versions_stay_synchronized(self) -> None:
+        root = Path(__file__).parents[1]
+        pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+        package = json.loads((root / "desktop" / "package.json").read_text(encoding="utf-8"))
+        tauri = json.loads((root / "desktop" / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8"))
+        cargo = tomllib.loads((root / "desktop" / "src-tauri" / "Cargo.toml").read_text(encoding="utf-8"))
+
+        self.assertEqual(__version__, pyproject["project"]["version"])
+        self.assertEqual(__version__, package["version"])
+        self.assertEqual(__version__, tauri["version"])
+        self.assertEqual(__version__, cargo["package"]["version"])
+
     def test_desktop_preview_uses_fixed_powershell_arguments(self) -> None:
         completed = SimpleNamespace(returncode=0)
         with (
@@ -1086,6 +1099,29 @@ class CliProductTests(unittest.TestCase):
             self.assertGreater(events["next_sequence"], 0)
             self.assertIn("[REDACTED]", encoded_events)
             self.assertNotIn("never-print-this", encoded_events)
+
+            output = StringIO()
+            with patch("sys.stdout", output):
+                exit_code = main(
+                    [
+                        "task",
+                        "review",
+                        "--thread-id",
+                        "thread-management-cli",
+                        "--event-limit",
+                        "2",
+                        "--state-db",
+                        str(state_path),
+                    ]
+                )
+            review = json.loads(output.getvalue())
+            encoded_review = json.dumps(review, ensure_ascii=False)
+            self.assertEqual(0, exit_code)
+            self.assertEqual("TASK_REVIEW_READY", review["code"])
+            self.assertEqual("thread-management-cli", review["task"]["thread_id"])
+            self.assertLessEqual(len(review["recent_events"]), 2)
+            self.assertNotIn(str(repository), encoded_review)
+            self.assertNotIn("never-print-this", encoded_review)
 
             output = StringIO()
             with patch("sys.stdout", output):

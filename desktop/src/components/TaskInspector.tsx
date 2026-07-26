@@ -69,6 +69,23 @@ const statusLabels: Record<string, string> = {
   UNVERIFIED: "未验证",
 };
 
+const stageLabels: Record<string, string> = {
+  INTAKE: "接收任务",
+  WORKSPACE: "准备工作区",
+  PREFLIGHT: "运行预检",
+  INGEST: "整理上下文",
+  RETRIEVE: "检索上下文",
+  ANALYZE: "分析代码",
+  RESEARCH_TOOLS: "研究代码",
+  PLAN: "生成计划",
+  PLAN_APPROVAL: "计划审批",
+  EXECUTION_APPROVAL: "执行审批",
+  PATCH: "应用补丁",
+  VERIFY: "Maven 验证",
+  REVIEW: "审阅结果",
+  REPORT: "生成报告",
+};
+
 function statusTone(status: string, verdict?: string | null): string {
   const value = verdict || status;
   if (value === "PASSED") return "success";
@@ -83,6 +100,11 @@ function sourceLocation(source: InspectorSource): string {
     return `${source.path}:${source.lineStart}-${source.lineEnd}`;
   }
   return `${source.path}:${source.lineStart}`;
+}
+
+function stageLabel(stage?: string, fallback?: string): string {
+  const normalized = stage?.trim().toUpperCase();
+  return (normalized ? stageLabels[normalized] : undefined) ?? fallback ?? "等待开始";
 }
 
 export function TaskInspector({
@@ -133,7 +155,7 @@ export function TaskInspector({
           <dl className="inspector-facts">
             <div><dt>模式</dt><dd>{task.mode === "safe-isolated" ? "安全隔离修复" : "完全本机控制"}</dd></div>
             <div><dt>类型</dt><dd>{task.operation === "research" ? "计划模式" : "修改代码"}</dd></div>
-            <div><dt>阶段</dt><dd>{task.currentStage || task.status}</dd></div>
+            <div><dt>阶段</dt><dd>{stageLabel(task.currentStage, statusLabels[task.status] ?? task.status)}</dd></div>
             <div><dt>线程</dt><dd title={task.threadId}>{task.threadId.slice(0, 12)}</dd></div>
           </dl>
         </section>

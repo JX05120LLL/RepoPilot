@@ -360,6 +360,64 @@ button:active:not(:disabled) {
   color: var(--ink);
 }
 
+.recent-task-navigation {
+  padding-bottom: 10px;
+}
+
+.recent-task-navigation .navigation-heading {
+  padding-top: 12px;
+}
+
+.recent-task-list {
+  display: grid;
+  gap: 2px;
+  padding: 0 8px;
+}
+
+.recent-task-row {
+  display: grid;
+  grid-template-columns: 17px minmax(0, 1fr) 8px;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 45px;
+  padding: 6px 10px;
+  color: #5f6670;
+  background: transparent;
+  border: 0;
+  border-radius: 7px;
+  text-align: left;
+}
+
+.recent-task-row:hover,
+.recent-task-row.active {
+  color: var(--ink);
+  background: #e3e6e6;
+}
+
+.recent-task-row > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.recent-task-row strong,
+.recent-task-row small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recent-task-row strong {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.recent-task-row small {
+  color: var(--muted);
+  font: 9px var(--mono);
+}
+
 .sidebar-form {
   display: grid;
   gap: 9px;
@@ -424,6 +482,27 @@ textarea::placeholder {
   margin-bottom: 8px;
   color: var(--muted);
   font-size: 11px;
+}
+
+.navigation-settings {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-height: 31px;
+  margin: 0 0 7px;
+  padding: 6px 3px;
+  color: #5f6670;
+  background: transparent;
+  border: 0;
+  border-radius: 5px;
+  font-size: 11px;
+  text-align: left;
+}
+
+.navigation-settings:hover {
+  color: var(--ink);
+  background: #e7e9ea;
 }
 
 .runtime-indicator {

@@ -568,6 +568,36 @@ class TaskStore:
             for row in rows
         )
 
+    def recent_events(self, thread_id: str, *, limit: int = 8) -> tuple[StoredTaskEvent, ...]:
+        """返回最近的脱敏事件，并按发生顺序排列，供只读任务审阅使用。"""
+
+        if not 1 <= limit <= 50:
+            raise ValueError("TASK_EVENT_LIMIT_INVALID")
+        with self._lock:
+            self._get_locked(thread_id)
+            rows = self._connection.execute(
+                """
+                SELECT event.sequence, event.event_id, event.event_type, event.payload_json, event.created_at, task.trace_id
+                FROM task_events AS event
+                INNER JOIN tasks AS task ON task.thread_id = event.thread_id
+                WHERE event.thread_id = ?
+                ORDER BY event.sequence DESC
+                LIMIT ?
+                """,
+                (thread_id, limit),
+            ).fetchall()
+        return tuple(
+            StoredTaskEvent(
+                sequence=int(row["sequence"]),
+                event_id=row["event_id"],
+                trace_id=row["trace_id"],
+                event_type=row["event_type"],
+                payload=json.loads(row["payload_json"]),
+                created_at=row["created_at"],
+            )
+            for row in reversed(rows)
+        )
+
     def telemetry(self, thread_id: str) -> dict[str, object]:
         """按已持久化证据事件重建遥测，进程重启后仍可查询。"""
 

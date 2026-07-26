@@ -6,7 +6,7 @@ RepoPilot 面向已有代码仓库的维护场景：用户选择一个本地项�
 
 项目的产品体验参考 [OpenAI Codex](https://openai.com/codex/) 与 [xAI grok-build](https://github.com/xai-org/grok-build) 的项目工作区、Agent 工作流和工具扩展思路，但 RepoPilot **不是对上述项目的源码二次开发**。当前代码从零实现，重点探索 Java/Spring Boot 仓库维护中的安全边界、证据闭环、RAG、Skills、MCP 和本地桌面交互。
 
-当前版本：`0.1.3 / Pre-Alpha`。第一版 MVP 的后端闭环已经跑通；Windows x64 release 与 NSIS 安装包已成功构建，并完成隔离目录中的安装、启动、sidecar 退出和卸载烟雾测试。当前代码版本的 15 项端到端评测已一次性执行并全部符合预期，升级迁移等交付验收仍在进行，尚不建议用于生产仓库。
+当前版本：`0.1.5 / Pre-Alpha`。第一版 MVP 的后端闭环已经跑通；Windows x64 release 与 NSIS 安装包已成功构建，并完成隔离目录中的安装、启动、sidecar 退出和卸载烟雾测试。当前代码版本的 15 项端到端评测已一次性执行并全部符合预期，升级迁移等交付验收仍在进行，尚不建议用于生产仓库。
 
 ## 目录
 
@@ -363,7 +363,7 @@ uv run repopilot-guard task start `
 uv run repopilot-guard terminal
 ```
 
-进入终端后可使用 `projects`、`tasks`、`use project`、`use task`、`current`、`start`、`status`、`watch`、`approve`、`revise`、`reject`、`artifacts` 和 `artifact`。例如：
+进入终端后可使用 `projects`、`tasks`、`use project`、`use task`、`current`、`start`、`status`、`review`、`watch`、`approve`、`revise`、`reject`、`artifacts` 和 `artifact`。例如：
 
 ```text
 repopilot> projects
@@ -378,6 +378,8 @@ repopilot[t:xxxx]> approve
 `use project` 会先调用只读项目诊断，`use task` 会先读取持久任务状态，成功后才更新当前 Terminal 进程内的便捷上下文。该上下文只用于省略重复 ID，不持久化授权、不改变任务模式，也不能绕过后端校验；输入 `current` 可随时查看当前选择。
 
 终端默认输出适合人工阅读的摘要。输入 `json on` 可切换到机器可读 JSON，输入 `json off` 恢复摘要模式；`watch <thread_id>` 始终输出实时 JSONL 事件流，便于长任务追踪和外部工具消费，按 `Ctrl+C` 可中断查看而不取消后台任务。
+
+`review [thread_id]` 是一次只读任务审阅：汇总持久化状态、最近最多 8 条脱敏 Evidence 和产物的 SHA-256 元数据，便于审批或交接前快速核对。它不读取产物正文、不访问仓库、不调用模型，也不改变任务状态。
 
 默认使用安全隔离修复：
 

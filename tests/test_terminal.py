@@ -79,6 +79,7 @@ class TerminalCommandRouterTests(unittest.TestCase):
 
         start = router.route("start safe research 分析当前项目", session)
         status = router.route("status", session)
+        review = router.route("review", session)
         artifact = router.route("artifact report", session)
 
         self.assertIn("project-1", start.argv)
@@ -86,6 +87,10 @@ class TerminalCommandRouterTests(unittest.TestCase):
         self.assertEqual(
             status.argv,
             ("task", "status", "--thread-id", "thread-1"),
+        )
+        self.assertEqual(
+            review.argv,
+            ("task", "review", "--thread-id", "thread-1"),
         )
         self.assertEqual(
             artifact.argv,
@@ -256,6 +261,29 @@ class TerminalCommandRouterTests(unittest.TestCase):
         self.assertIn("BLOCKED  QDRANT_UNAVAILABLE", output.getvalue())
         self.assertIn("Qdrant 未就绪", output.getvalue())
         self.assertNotIn("must-not-render", output.getvalue())
+
+    def test_renderer_summarizes_review_without_rendering_event_secrets(self) -> None:
+        output = StringIO()
+
+        TerminalRenderer().render(
+            json.dumps(
+                {
+                    "status": "READY",
+                    "task": {"status": "WAITING_APPROVAL", "verdict": "UNVERIFIED", "display_title": "修复订单校验"},
+                    "recent_events": [{"sequence": 7, "type": "PLAN_READY", "payload": {"code": "PLAN_READY", "secret": "must-not-render"}}],
+                    "artifacts": [{"kind": "plan_markdown", "sha256": "a" * 64}],
+                },
+                ensure_ascii=False,
+            ),
+            ["task", "review"],
+            output,
+        )
+
+        rendered = output.getvalue()
+        self.assertIn("任务审阅", rendered)
+        self.assertIn("PLAN_READY", rendered)
+        self.assertIn("plan_markdown", rendered)
+        self.assertNotIn("must-not-render", rendered)
 
 
 if __name__ == "__main__":

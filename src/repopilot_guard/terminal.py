@@ -25,6 +25,7 @@ TERMINAL_HELP = """可用命令：
   start <safe|full> <change|research> <任务描述>
                                        使用当前项目启动任务
   status [线程ID]                      查看任务状态和下一步
+  review [线程ID]                      汇总状态、最近证据和产物完整性
   events [线程ID]                      查看脱敏证据事件
   watch [线程ID]                       持续追踪任务事件
   approve [线程ID]                     批准当前审批关卡
@@ -95,6 +96,8 @@ class TerminalRenderer:
             self._render_tasks(payload, stream)
         elif route == ("task", "events"):
             self._render_events(payload, stream)
+        elif route == ("task", "review"):
+            self._render_review(payload, stream)
         elif route == ("task", "artifacts"):
             self._render_artifacts(payload, stream)
         elif route == ("task", "artifact"):
@@ -166,6 +169,42 @@ class TerminalRenderer:
                 )
             suffix = f"  {_truncate(summary, 88)}" if summary else ""
             print(f"  {sequence:>4}  {event_type}{suffix}", file=stream)
+
+    @staticmethod
+    def _render_review(payload: dict[str, object], stream: TextIO) -> None:
+        task = payload.get("task")
+        summary = task if isinstance(task, dict) else {}
+        status = _text(summary.get("status"), "UNKNOWN")
+        verdict = _text(summary.get("verdict"), "UNVERIFIED")
+        print(f"任务审阅  [{status}]  验证 {verdict}", file=stream)
+        title = summary.get("display_title")
+        if isinstance(title, str) and title.strip():
+            print(f"  {_truncate(title, 96)}", file=stream)
+        if summary.get("pending_approval") is True:
+            print("  审批  等待用户确认", file=stream)
+        events = payload.get("recent_events")
+        event_items = events if isinstance(events, list) else []
+        print(f"  最近证据  {len(event_items)}", file=stream)
+        for event in event_items:
+            if not isinstance(event, dict):
+                continue
+            event_payload = event.get("payload")
+            details = event_payload if isinstance(event_payload, dict) else {}
+            message = _text(details.get("message", details.get("code", details.get("status"))), "")
+            suffix = f"  {_truncate(message, 72)}" if message else ""
+            print(f"    {_text(event.get('sequence'), '-'):>4}  {_text(event.get('type'), 'EVIDENCE')}{suffix}", file=stream)
+        artifacts = payload.get("artifacts")
+        artifact_items = artifacts if isinstance(artifacts, list) else []
+        print(f"  产物  {len(artifact_items)}", file=stream)
+        for artifact in artifact_items:
+            if not isinstance(artifact, dict):
+                continue
+            print(
+                f"    {_text(artifact.get('kind'), 'unknown'):<18} "
+                f"sha256:{_text(artifact.get('sha256'), '-')[:12]}",
+                file=stream,
+            )
+        TerminalRenderer._render_next_action(payload, stream)
 
     @staticmethod
     def _render_artifacts(payload: dict[str, object], stream: TextIO) -> None:
@@ -354,6 +393,7 @@ class TerminalCommandRouter:
             )
         single_argument_commands = {
             "status": "status",
+            "review": "review",
             "events": "events",
             "watch": "watch",
             "artifacts": "artifacts",
