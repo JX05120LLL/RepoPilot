@@ -1533,7 +1533,7 @@ def _run_task_store_command(args: argparse.Namespace) -> int:
                     "task": _stored_task_summary(task),
                     "recent_events": [event.to_dict() for event in events],
                     "artifacts": [artifact.to_dict() for artifact in artifacts],
-                    "next_action": _review_next_action(task),
+                    "next_action": _review_next_action(task, artifacts),
                 }
             )
         task = store.archive(args.thread_id)
@@ -1563,7 +1563,10 @@ def _run_task_store_command(args: argparse.Namespace) -> int:
         store.close()
 
 
-def _review_next_action(task: StoredTask) -> dict[str, str] | None:
+def _review_next_action(
+    task: StoredTask,
+    artifacts: object = (),
+) -> dict[str, str] | None:
     """由持久化事实给出终端下一步，不推测模型、补丁或验证结果。"""
 
     if task.pending_approval:
@@ -1571,6 +1574,24 @@ def _review_next_action(task: StoredTask) -> dict[str, str] | None:
             "type": "DECIDE_PENDING_APPROVAL",
             "command": f"repopilot-guard task status --thread-id {task.thread_id}",
         }
+    artifact_kinds = {
+        getattr(artifact, "kind", None)
+        for artifact in artifacts
+        if isinstance(getattr(artifact, "kind", None), str)
+    } if isinstance(artifacts, (list, tuple)) else set()
+    for kind, action_type in (
+        ("verification", "READ_VERIFICATION_EVIDENCE"),
+        ("git_diff", "READ_DIFF_EVIDENCE"),
+        ("plan_markdown", "READ_PLAN_EVIDENCE"),
+    ):
+        if kind in artifact_kinds:
+            return {
+                "type": action_type,
+                "command": (
+                    "repopilot-guard task artifact --thread-id "
+                    f"{task.thread_id} --kind {kind}"
+                ),
+            }
     if task.status in {"REPORT", "FAILED", "BLOCKED", "CANCELLED"}:
         return {
             "type": "INSPECT_TASK_ARTIFACTS",

@@ -13,6 +13,38 @@ from typing import Callable, TextIO
 from repopilot_guard.permissions import FULL_ACCESS_CONFIRMATION
 
 
+_TASK_STATUS_LABELS = {
+    "WAITING_APPROVAL": "等待审批",
+    "RUNNING": "正在执行",
+    "REPORT": "已生成报告",
+    "BLOCKED": "已阻断",
+    "FAILED": "执行失败",
+    "CANCELLED": "已取消",
+}
+_TASK_VERDICT_LABELS = {
+    "PASSED": "验证通过",
+    "FAILED": "验证未通过",
+    "BLOCKED": "已阻断",
+    "UNVERIFIED": "尚未验证",
+}
+_ARTIFACT_LABELS = {
+    "plan_json": "计划 JSON",
+    "plan_markdown": "修改计划",
+    "patch_proposal": "补丁提案",
+    "git_diff": "真实 Diff",
+    "verification": "验证结果",
+    "telemetry": "运行遥测",
+    "report": "任务报告",
+}
+_NEXT_ACTION_LABELS = {
+    "DECIDE_PENDING_APPROVAL": "处理当前审批",
+    "READ_VERIFICATION_EVIDENCE": "核验 Maven 验证记录",
+    "READ_DIFF_EVIDENCE": "核验真实代码 Diff",
+    "READ_PLAN_EVIDENCE": "审阅修改计划",
+    "INSPECT_TASK_ARTIFACTS": "查看任务产物",
+    "WATCH_TASK": "继续跟踪任务进度",
+}
+
 TERMINAL_HELP = """可用命令：
   welcome                              查看本机就绪状态与推荐下一步
   projects                             列出已注册项目
@@ -139,7 +171,7 @@ class TerminalRenderer:
                 continue
             status = _text(task.get("status"), "UNKNOWN")
             title = _truncate(_text(task.get("display_title"), "未命名任务"), 72)
-            print(f"  [{status}] {title}", file=stream)
+            print(f"  [{_task_status_label(status)}] {title}", file=stream)
             print(f"    线程  {_text(task.get('thread_id'), '-')}", file=stream)
             print(
                 "    模式  "
@@ -176,7 +208,7 @@ class TerminalRenderer:
         summary = task if isinstance(task, dict) else {}
         status = _text(summary.get("status"), "UNKNOWN")
         verdict = _text(summary.get("verdict"), "UNVERIFIED")
-        print(f"任务审阅  [{status}]  验证 {verdict}", file=stream)
+        print(f"任务审阅  {_task_status_label(status)} · {_task_verdict_label(verdict)}", file=stream)
         title = summary.get("display_title")
         if isinstance(title, str) and title.strip():
             print(f"  {_truncate(title, 96)}", file=stream)
@@ -199,8 +231,9 @@ class TerminalRenderer:
         for artifact in artifact_items:
             if not isinstance(artifact, dict):
                 continue
+            kind = _text(artifact.get("kind"), "unknown")
             print(
-                f"    {_text(artifact.get('kind'), 'unknown'):<18} "
+                f"    {_artifact_label(kind):<18} "
                 f"sha256:{_text(artifact.get('sha256'), '-')[:12]}",
                 file=stream,
             )
@@ -217,7 +250,7 @@ class TerminalRenderer:
             kind = _text(artifact.get("kind"), "unknown")
             size = _text(artifact.get("size_bytes"), "0")
             digest = _text(artifact.get("sha256"), "-")[:12]
-            print(f"  {kind:<18} {size:>8} B  sha256:{digest}", file=stream)
+            print(f"  {_artifact_label(kind):<18} {size:>8} B  sha256:{digest}", file=stream)
 
     @staticmethod
     def _render_artifact(payload: dict[str, object], stream: TextIO) -> None:
@@ -225,7 +258,7 @@ class TerminalRenderer:
         metadata = artifact if isinstance(artifact, dict) else {}
         print(
             "产物  "
-            f"{_text(metadata.get('kind'), 'unknown')}  "
+            f"{_artifact_label(_text(metadata.get('kind'), 'unknown'))}  "
             f"sha256:{_text(metadata.get('sha256'), '-')[:12]}",
             file=stream,
         )
@@ -237,7 +270,7 @@ class TerminalRenderer:
     def _render_task(payload: dict[str, object], stream: TextIO) -> None:
         status = _text(payload.get("status"), "UNKNOWN")
         verdict = _text(payload.get("verdict"), "-")
-        print(f"任务  [{status}]  验证 {verdict}", file=stream)
+        print(f"任务  {_task_status_label(status)} · {_task_verdict_label(verdict)}", file=stream)
         title = payload.get("display_title")
         if isinstance(title, str) and title.strip():
             print(f"  {_truncate(title, 96)}", file=stream)
@@ -292,7 +325,14 @@ class TerminalRenderer:
             return
         command = next_action.get("command")
         if isinstance(command, str) and command.strip():
-            print(f"  下一步  {command}", file=stream)
+            action_type = next_action.get("type")
+            action_label = (
+                _NEXT_ACTION_LABELS.get(action_type, "查看下一步操作")
+                if isinstance(action_type, str)
+                else "查看下一步操作"
+            )
+            print(f"  下一步  {action_label}", file=stream)
+            print(f"    {command}", file=stream)
 
 
 def _text(value: object, fallback: str) -> str:
@@ -300,6 +340,18 @@ def _text(value: object, fallback: str) -> str:
         return fallback
     text = str(value).strip()
     return text or fallback
+
+
+def _task_status_label(status: str) -> str:
+    return _TASK_STATUS_LABELS.get(status, status)
+
+
+def _task_verdict_label(verdict: str) -> str:
+    return _TASK_VERDICT_LABELS.get(verdict, verdict)
+
+
+def _artifact_label(kind: str) -> str:
+    return _ARTIFACT_LABELS.get(kind, kind)
 
 
 def _truncate(value: str, limit: int) -> str:

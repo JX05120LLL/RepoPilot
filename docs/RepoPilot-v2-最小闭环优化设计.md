@@ -1,5 +1,7 @@
 # RepoPilot v2 最小闭环优化设计
 
+> 事实同步说明（2026-07-26）：本文件主要记录 v2 设计取舍与迭代路线；当前已实现能力、真实联调和设计预留的准确边界以 [当前能力基线](当前能力基线.md) 为准。该基线会随源码和测试更新，避免将早期路线图误读为当前交付状态。
+
 > 文档状态：设计基线
 >
 > 目标：在不推倒现有 Python/LangGraph MVP 的前提下，吸收 Grok Build 的架构边界，解决当前“能跑但不够稳定、不够可解释、不够容易演示”的问题。
@@ -93,7 +95,7 @@ RepoPilot 的 SQLite checkpoint 已经能恢复 LangGraph 状态，但 v2 不能
 | 本地接口 | FastAPI、SSE、后台运行任务、项目/任务/审批/Diff/报告接口存在，且只监听本机 | `api.py` |
 | 桌面端 | React/Vite/Tauri 已形成项目任务树、Agent 会话、上下文扩展、产物审阅与命令面板，并完成 Windows NSIS 安装、启动和卸载烟雾测试 | `desktop/src/App.tsx`、`desktop/src-tauri/` |
 | 真实联调 | 已使用真实 Embedding/Qdrant/聊天模型完成一次代码理解任务并到达计划审批 | 本地 SQLite checkpoint 与 SSE 运行记录 |
-| 自动测试 | 当前全量 `unittest` 为 226 项；TypeScript 类型检查与 Vite 生产构建可通过 | 本地测试运行结果 |
+| 自动测试 | 当前全量 `unittest` 为 230 项；TypeScript 类型检查与 Vite 生产构建可通过 | 本地测试运行结果 |
 | 评测 | 有 15 条任务定义 JSON、独立 Java/Maven Git 基线生成器和实际结果 JSON/CSV/Markdown 报告执行器；尚未运行真实模型全量报告 | `evaluation/tasks.json`、`evaluation.py` |
 
 ### 3.1 当前状态的正确解释

@@ -1060,6 +1060,11 @@ class CliProductTests(unittest.TestCase):
                         "state": {
                             "tool_events": [{"type": "MODEL_BLOCKED", "api_key": "never-print-this"}],
                             "error_summary": "EXPECTED_BLOCK",
+                            "verification_result": {
+                                "status": "FAILED",
+                                "code": "MAVEN_FAILED",
+                                "stdout_summary": "never-print-this",
+                            },
                         },
                     }
                 )
@@ -1120,6 +1125,8 @@ class CliProductTests(unittest.TestCase):
             self.assertEqual("TASK_REVIEW_READY", review["code"])
             self.assertEqual("thread-management-cli", review["task"]["thread_id"])
             self.assertLessEqual(len(review["recent_events"]), 2)
+            self.assertEqual("READ_VERIFICATION_EVIDENCE", review["next_action"]["type"])
+            self.assertIn("--kind verification", review["next_action"]["command"])
             self.assertNotIn(str(repository), encoded_review)
             self.assertNotIn("never-print-this", encoded_review)
 

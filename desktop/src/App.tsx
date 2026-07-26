@@ -4,6 +4,7 @@ import { ArtifactContent } from "./components/ArtifactContent";
 import { CommandPalette, type CommandPaletteItem } from "./components/CommandPalette";
 import { TaskInspector } from "./components/TaskInspector";
 import { TaskProgressTrail } from "./components/TaskProgressTrail";
+import { ReviewDecisionSummary } from "./components/ReviewDecisionSummary";
 import { API } from "./lib/api";
 import { asRecord, readString, readStringList } from "./lib/values";
 import {
@@ -2693,6 +2694,19 @@ export function App() {
                   )}
                 </div>
               </header>
+              <ReviewDecisionSummary
+                task={task ? {
+                  status: task.status,
+                  verdict: task.verdict,
+                  pendingApproval: task.pending_approval,
+                  taskMode: task.task_mode,
+                } : null}
+                artifacts={artifacts.map((artifact) => ({ kind: artifact.kind }))}
+                onOpenArtifact={(kind) => {
+                  setSelectedArtifact(kind);
+                  setSelectedArtifactVersion(null);
+                }}
+              />
               {taskCanExportEvidence && (
                 <div className="evidence-export-control">
                   <input

@@ -282,8 +282,36 @@ class TerminalCommandRouterTests(unittest.TestCase):
         rendered = output.getvalue()
         self.assertIn("任务审阅", rendered)
         self.assertIn("PLAN_READY", rendered)
-        self.assertIn("plan_markdown", rendered)
+        self.assertIn("修改计划", rendered)
         self.assertNotIn("must-not-render", rendered)
+
+    def test_renderer_review_surfaces_only_the_safe_artifact_next_step(self) -> None:
+        output = StringIO()
+
+        TerminalRenderer().render(
+            json.dumps(
+                {
+                    "status": "READY",
+                    "task": {"status": "REPORT", "verdict": "FAILED"},
+                    "recent_events": [],
+                    "artifacts": [{"kind": "verification", "sha256": "b" * 64}],
+                    "next_action": {
+                        "type": "READ_VERIFICATION_EVIDENCE",
+                        "command": "repopilot-guard task artifact --thread-id thread-1 --kind verification",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            ["task", "review"],
+            output,
+        )
+
+        rendered = output.getvalue()
+        self.assertIn("任务审阅  已生成报告 · 验证未通过", rendered)
+        self.assertIn("验证结果", rendered)
+        self.assertIn("核验 Maven 验证记录", rendered)
+        self.assertIn("task artifact --thread-id thread-1 --kind verification", rendered)
+        self.assertNotIn("[REPORT]", rendered)
 
 
 if __name__ == "__main__":

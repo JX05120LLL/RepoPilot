@@ -2836,6 +2836,106 @@ textarea::placeholder {
   white-space: nowrap;
 }
 
+.review-decision {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 14px 18px;
+  margin: 16px 28px 0;
+  padding: 14px 0 16px;
+  border-bottom: 1px solid var(--line);
+}
+
+.review-decision-verdict {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  align-items: start;
+  gap: 9px;
+  color: #7f8791;
+}
+
+.review-decision-verdict > div {
+  display: grid;
+  gap: 3px;
+}
+
+.review-decision-verdict span {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.review-decision-verdict strong {
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 680;
+}
+
+.review-decision-verdict p {
+  margin: 0;
+  color: #69717b;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.review-decision-success .review-decision-verdict > svg { color: var(--success); }
+.review-decision-warning .review-decision-verdict > svg { color: var(--warning); }
+.review-decision-danger .review-decision-verdict > svg { color: var(--danger); }
+
+.review-decision-facts {
+  display: flex;
+  grid-column: 1 / -1;
+  flex-wrap: wrap;
+  gap: 0;
+  margin: 0;
+  border-top: 1px solid #e7e9eb;
+  border-left: 1px solid #e7e9eb;
+}
+
+.review-decision-facts > div {
+  display: grid;
+  flex: 1 1 150px;
+  gap: 3px;
+  min-width: 0;
+  padding: 7px 9px;
+  border-right: 1px solid #e7e9eb;
+  border-bottom: 1px solid #e7e9eb;
+}
+
+.review-decision-facts dt {
+  color: #8a919a;
+  font-size: 9px;
+}
+
+.review-decision-facts dd {
+  margin: 0;
+  color: #505861;
+  font-size: 10px;
+  font-weight: 620;
+}
+
+.review-decision-action {
+  display: inline-flex;
+  align-items: center;
+  align-self: start;
+  justify-content: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 6px 9px;
+  color: #4d5660;
+  background: #f7f8f9;
+  border: 1px solid #dfe3e6;
+  border-radius: 5px;
+  font-size: 10px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.review-decision-action:hover {
+  color: var(--ink);
+  background: #eef2f7;
+  border-color: #c8d1dc;
+}
+
 .artifact-content {
   min-width: 0;
   min-height: 0;
@@ -3348,6 +3448,10 @@ textarea::placeholder {
 
   .artifact-reader > header {
     flex-wrap: wrap;
+  }
+
+  .review-decision {
+    margin-inline: 16px;
   }
 
   .review-header-actions {

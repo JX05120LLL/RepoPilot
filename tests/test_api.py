@@ -177,9 +177,16 @@ class ApiTests(unittest.TestCase):
                         },
                     )
                     self.assertEqual(200, created.status_code)
-                    snapshot = client.get("/api/tasks/thread-1")
-                    self.assertEqual(200, snapshot.status_code)
-                    progress = snapshot.json()["progress"]
+                    deadline = time.monotonic() + 1
+                    progress = None
+                    while time.monotonic() < deadline:
+                        snapshot = client.get("/api/tasks/thread-1")
+                        self.assertEqual(200, snapshot.status_code)
+                        progress = snapshot.json()["progress"]
+                        if progress["current_stage"] == "plan_approval":
+                            break
+                        time.sleep(0.01)
+                    self.assertIsNotNone(progress)
                     self.assertEqual("plan_approval", progress["current_stage"])
                     self.assertIsNone(progress["terminal_kind"])
                     self.assertEqual(
