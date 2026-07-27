@@ -772,6 +772,7 @@ textarea::placeholder {
 }
 
 .terminal-copy,
+.terminal-clear,
 .terminal-run {
   display: inline-flex;
   align-items: center;
@@ -790,6 +791,17 @@ textarea::placeholder {
 
 .terminal-copy:hover:not(:disabled) {
   color: #ffffff;
+  background: #2a3642;
+}
+
+.terminal-clear {
+  width: 28px;
+  padding: 0;
+  color: #9aa7b4;
+}
+
+.terminal-clear:hover:not(:disabled) {
+  color: #e0aaa3;
   background: #2a3642;
 }
 
@@ -3336,6 +3348,69 @@ textarea::placeholder {
 }
 
 .runtime-config-group > header span {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.configuration-state {
+  margin-left: auto;
+  padding: 3px 6px;
+  border-radius: 4px;
+  font: 9px var(--mono);
+  font-style: normal;
+  white-space: nowrap;
+}
+
+.configuration-state.complete {
+  color: #2f6b4f;
+  background: #e8f2eb;
+}
+
+.configuration-state.incomplete {
+  color: #826334;
+  background: #fbf2da;
+}
+
+.model-preset-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 7px 0 1px;
+}
+
+.model-preset-row > span {
+  margin-right: 2px;
+  color: #68727c;
+  font-size: 10px;
+}
+
+.model-preset-row button {
+  min-height: 25px;
+  padding: 4px 7px;
+  color: #53606b;
+  background: #ffffff;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  font: 10px var(--sans);
+  font-weight: 650;
+}
+
+.model-preset-row button:hover:not(:disabled) {
+  color: #1f405d;
+  background: #f2f6fa;
+  border-color: #b8cad9;
+}
+
+.model-preset-row button.active {
+  color: #24516f;
+  background: #eaf2f7;
+  border-color: #adc4d3;
+}
+
+.model-preset-row small {
+  flex: 1 1 180px;
   color: var(--muted);
   font-size: 10px;
   line-height: 1.45;

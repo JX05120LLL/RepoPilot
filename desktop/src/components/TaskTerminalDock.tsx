@@ -4,6 +4,7 @@ import {
   CopySimple,
   Play,
   TerminalWindow,
+  Trash,
   X,
 } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
@@ -52,6 +53,22 @@ export function TaskTerminalDock({
     setEntries([]);
     setRunning(false);
   }, [threadId]);
+
+  useEffect(() => {
+    function handleShortcut(event: KeyboardEvent) {
+      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== "l") return;
+      if (
+        event.target instanceof HTMLInputElement ||
+        event.target instanceof HTMLSelectElement ||
+        event.target instanceof HTMLTextAreaElement
+      ) return;
+      if (entries.length === 0) return;
+      event.preventDefault();
+      setEntries([]);
+    }
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
+  }, [entries.length]);
 
   async function runSelected() {
     if (!selected || running) return;
@@ -117,6 +134,16 @@ export function TaskTerminalDock({
         <button type="button" className="terminal-copy" title="复制当前 CLI 命令" onClick={() => void copySelected()} disabled={!selected}>
           {copied ? <CheckCircle size={16} weight="fill" /> : <CopySimple size={16} />}
           {copied ? "已复制" : "复制"}
+        </button>
+        <button
+          type="button"
+          className="terminal-clear"
+          title="清空查询结果 (Ctrl+L)"
+          aria-label="清空查询结果"
+          onClick={() => setEntries([])}
+          disabled={entries.length === 0 || running}
+        >
+          <Trash size={15} />
         </button>
         <button type="button" className="terminal-run" title="运行受控查询" onClick={() => void runSelected()} disabled={!selected || running}>
           <Play size={14} weight="fill" />

@@ -300,6 +300,21 @@ type RuntimeConfiguration = {
   };
   qdrant?: { url: string };
 };
+type ChatModelPreset = {
+  id: string;
+  label: string;
+  baseUrl: string;
+  model: string;
+  description: string;
+};
+type EmbeddingModelPreset = {
+  id: string;
+  label: string;
+  baseUrl: string;
+  model: string;
+  dimensions: string;
+  description: string;
+};
 type ProjectModeReadiness = {
   status: "READY" | "BLOCKED";
   code: string;
@@ -354,6 +369,32 @@ const runtimeDependencyLabels: Record<string, string> = {
   embedding_provider: "Embedding 模型",
   qdrant: "Qdrant",
 };
+const chatModelPresets: ChatModelPreset[] = [
+  {
+    id: "deepseek-chat",
+    label: "DeepSeek Chat",
+    baseUrl: "https://api.deepseek.com",
+    model: "deepseek-chat",
+    description: "OpenAI-compatible 对话接口",
+  },
+  {
+    id: "kimi-k3",
+    label: "Kimi K3",
+    baseUrl: "https://api.moonshot.cn/v1",
+    model: "kimi-k3",
+    description: "需使用开放平台可用的 API Key",
+  },
+];
+const embeddingModelPresets: EmbeddingModelPreset[] = [
+  {
+    id: "openai-embedding-small",
+    label: "OpenAI embedding-3-small",
+    baseUrl: "https://api.openai.com/v1",
+    model: "text-embedding-3-small",
+    dimensions: "1536",
+    description: "1536 维 OpenAI-compatible 向量接口",
+  },
+];
 
 function taskStateLabel(status: string, verdict?: string | null, pendingApproval = false): string {
   if (pendingApproval) return taskStateLabels.WAITING_APPROVAL;
@@ -1429,6 +1470,19 @@ export function App() {
     } finally {
       setRuntimeConfigurationBusy(false);
     }
+  }
+
+  function applyChatModelPreset(preset: ChatModelPreset) {
+    setChatBaseUrl(preset.baseUrl);
+    setChatModel(preset.model);
+    setRuntimeConfigurationMessage("已填入模型预设；请自行输入 API Key 后保存。预设不会读取或修改已有密钥。");
+  }
+
+  function applyEmbeddingModelPreset(preset: EmbeddingModelPreset) {
+    setEmbeddingBaseUrl(preset.baseUrl);
+    setEmbeddingModel(preset.model);
+    setEmbeddingDimensions(preset.dimensions);
+    setRuntimeConfigurationMessage("已填入 Embedding 预设；请自行输入 API Key 后保存。预设不会读取或修改已有密钥。");
   }
 
   async function chooseProjectDirectory() {
@@ -3087,7 +3141,30 @@ export function App() {
                     </div>
                     <div className="runtime-config-groups">
                       <section className="runtime-config-group">
-                        <header><b>对话模型</b><span>用于任务分析、工具调用和修改计划。</span></header>
+                        <header>
+                          <b>对话模型</b>
+                          <span>用于任务分析、工具调用和修改计划。</span>
+                          <em className={runtimeConfiguration.chat?.api_key_configured && chatBaseUrl && chatModel ? "configuration-state complete" : "configuration-state incomplete"}>
+                            {runtimeConfiguration.chat?.api_key_configured && chatBaseUrl && chatModel ? "配置完整" : "待配置"}
+                          </em>
+                        </header>
+                        <div className="model-preset-row" aria-label="对话模型预设">
+                          <span>快速填入</span>
+                          {chatModelPresets.map((preset) => (
+                            <button
+                              key={preset.id}
+                              type="button"
+                              className={chatBaseUrl === preset.baseUrl && chatModel === preset.model ? "active" : ""}
+                              title={preset.description}
+                              aria-pressed={chatBaseUrl === preset.baseUrl && chatModel === preset.model}
+                              onClick={() => applyChatModelPreset(preset)}
+                              disabled={!runtimeConfiguration.writable}
+                            >
+                              {preset.label}
+                            </button>
+                          ))}
+                          <small>仅填地址与模型，不写入 Key</small>
+                        </div>
                         <div className="runtime-config-grid">
                           <label>Base URL<input value={chatBaseUrl} onChange={(event) => setChatBaseUrl(event.target.value)} placeholder="https://api.deepseek.com" disabled={!runtimeConfiguration.writable} /></label>
                           <label>Model<input value={chatModel} onChange={(event) => setChatModel(event.target.value)} placeholder="deepseek-chat" disabled={!runtimeConfiguration.writable} /></label>
@@ -3099,7 +3176,30 @@ export function App() {
                         </div>
                       </section>
                       <section className="runtime-config-group">
-                        <header><b>Embedding 模型</b><span>用于代码、研发文档和项目记忆的向量检索。</span></header>
+                        <header>
+                          <b>Embedding 模型</b>
+                          <span>用于代码、研发文档和项目记忆的向量检索。</span>
+                          <em className={runtimeConfiguration.embedding?.api_key_configured && embeddingBaseUrl && embeddingModel && embeddingDimensions ? "configuration-state complete" : "configuration-state incomplete"}>
+                            {runtimeConfiguration.embedding?.api_key_configured && embeddingBaseUrl && embeddingModel && embeddingDimensions ? "配置完整" : "待配置"}
+                          </em>
+                        </header>
+                        <div className="model-preset-row" aria-label="Embedding 模型预设">
+                          <span>快速填入</span>
+                          {embeddingModelPresets.map((preset) => (
+                            <button
+                              key={preset.id}
+                              type="button"
+                              className={embeddingBaseUrl === preset.baseUrl && embeddingModel === preset.model && embeddingDimensions === preset.dimensions ? "active" : ""}
+                              title={preset.description}
+                              aria-pressed={embeddingBaseUrl === preset.baseUrl && embeddingModel === preset.model && embeddingDimensions === preset.dimensions}
+                              onClick={() => applyEmbeddingModelPreset(preset)}
+                              disabled={!runtimeConfiguration.writable}
+                            >
+                              {preset.label}
+                            </button>
+                          ))}
+                          <small>请确认服务端支持对应维度</small>
+                        </div>
                         <div className="runtime-config-grid">
                           <label>Base URL<input value={embeddingBaseUrl} onChange={(event) => setEmbeddingBaseUrl(event.target.value)} placeholder="OpenAI-compatible embedding endpoint" disabled={!runtimeConfiguration.writable} /></label>
                           <label>Model<input value={embeddingModel} onChange={(event) => setEmbeddingModel(event.target.value)} placeholder="text-embedding-3-small" disabled={!runtimeConfiguration.writable} /></label>
@@ -3112,7 +3212,11 @@ export function App() {
                         </div>
                       </section>
                       <section className="runtime-config-group">
-                        <header><b>本机检索服务</b><span>Qdrant 仅用于保存项目级向量索引和已验证记忆。</span></header>
+                        <header>
+                          <b>本机检索服务</b>
+                          <span>Qdrant 仅用于保存项目级向量索引和已验证记忆。</span>
+                          <em className={qdrantUrl ? "configuration-state complete" : "configuration-state incomplete"}>{qdrantUrl ? "已填写" : "待配置"}</em>
+                        </header>
                         <div className="runtime-config-grid">
                           <label className="runtime-config-wide">Qdrant URL<input value={qdrantUrl} onChange={(event) => setQdrantUrl(event.target.value)} placeholder="http://127.0.0.1:6333" disabled={!runtimeConfiguration.writable} /></label>
                         </div>

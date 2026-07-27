@@ -127,7 +127,7 @@ class CliProductTests(unittest.TestCase):
         self.assertIn("Get-NetTCPConnection -LocalPort $UiPort -State Listen", script)
         self.assertIn("Test-RepoPilotHealth", script)
         self.assertIn("/api/health", script)
-        self.assertIn('scope -eq "127.0.0.1-only"', script)
+        self.assertIn('scope -ne "127.0.0.1-only"', script)
         self.assertIn('VITE_REPOPILOT_API_URL = "http://127.0.0.1:${ApiPort}/api"', script)
         self.assertIn('REPOPILOT_DESKTOP_PREVIEW_ORIGIN = "http://127.0.0.1:${UiPort}"', script)
         self.assertIn("Stop-RepoPilotProcessTree", script)
@@ -135,6 +135,13 @@ class CliProductTests(unittest.TestCase):
         self.assertIn("repopilot-vite-preview.err.log", script)
         self.assertNotIn("Test-NetConnection", script)
         self.assertNotIn(" --open", script)
+
+    def test_preview_script_stays_ascii_compatible_with_windows_powershell(self) -> None:
+        repository_root = Path(__file__).resolve().parents[1]
+        script = (repository_root / "scripts" / "start-desktop-preview.ps1").read_text(encoding="utf-8")
+
+        # Windows PowerShell 5 can misparse UTF-8-without-BOM non-ASCII scripts.
+        script.encode("ascii")
 
     def test_welcome_guides_first_time_user_to_register_a_project(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

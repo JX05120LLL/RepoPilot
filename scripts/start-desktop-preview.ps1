@@ -18,6 +18,7 @@ $apiLog = Join-Path $env:TEMP "repopilot-api-preview.log"
 $apiErrorLog = Join-Path $env:TEMP "repopilot-api-preview.err.log"
 $viteLog = Join-Path $env:TEMP "repopilot-vite-preview.log"
 $viteErrorLog = Join-Path $env:TEMP "repopilot-vite-preview.err.log"
+$healthDiagnostic = ""
 if ($ApiPort -eq $UiPort) {
     throw "RepoPilot preview requires distinct API and UI ports."
 }
@@ -30,11 +31,26 @@ if (Get-NetTCPConnection -LocalPort $UiPort -State Listen -ErrorAction SilentlyC
 
 function Test-RepoPilotHealth([int]$Port) {
     try {
-        # Qdrant 不可用时，健康接口仍会返回 API 就绪与依赖诊断，不能将其误判为启动失败。
-        $health = Invoke-RestMethod -Uri "http://127.0.0.1:${Port}/api/health" -Method Get -TimeoutSec 8
-        return $health.status -eq "READY" -and $health.scope -eq "127.0.0.1-only"
+        # A blocked Agent dependency is distinct from an unavailable loopback API.
+        # Validate the HTTP response and JSON contract explicitly for stable preview startup.
+        $response = Invoke-WebRequest -Uri "http://127.0.0.1:${Port}/api/health" -Method Get -UseBasicParsing -TimeoutSec 8
+        if ($response.StatusCode -ne 200 -or -not $response.Content) {
+            $script:healthDiagnostic = "Health endpoint did not return HTTP 200."
+            return $false
+        }
+        $health = $response.Content | ConvertFrom-Json -ErrorAction Stop
+        if ($health.status -ne "READY") {
+            $script:healthDiagnostic = "Health endpoint did not satisfy the loopback API contract."
+            return $false
+        }
+        if ($health.scope -ne "127.0.0.1-only") {
+            $script:healthDiagnostic = "Health endpoint did not satisfy the loopback API contract."
+            return $false
+        }
+        return $true
     }
     catch {
+        $script:healthDiagnostic = $_.Exception.Message
         return $false
     }
 }
@@ -66,9 +82,9 @@ try {
         $details = ""
         if (Test-Path -LiteralPath $apiErrorLog) { $details = Get-Content -LiteralPath $apiErrorLog -Raw }
         if (-not $details -and (Test-Path -LiteralPath $apiLog)) { $details = Get-Content -LiteralPath $apiLog -Raw }
-        throw "RepoPilot API did not start on 127.0.0.1:${ApiPort}. ${details}"
+        throw "RepoPilot API did not start on 127.0.0.1:${ApiPort}. ${healthDiagnostic} ${details}"
     }
-    # 仅将本轮预览启动的 loopback API 地址注入 Vite；正式 Tauri 构建仍使用默认 8765。
+    # Inject only this preview's loopback API into Vite; Tauri keeps its default port.
     $env:VITE_REPOPILOT_API_URL = "http://127.0.0.1:${ApiPort}/api"
     $viteArguments = @("run", "dev", "--", "--host", "127.0.0.1", "--port", "$UiPort")
     $vite = Start-Process -FilePath $npm.Source -ArgumentList $viteArguments -WorkingDirectory $desktopRoot -WindowStyle Hidden -RedirectStandardOutput $viteLog -RedirectStandardError $viteErrorLog -PassThru
