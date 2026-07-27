@@ -18,10 +18,11 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, SecretStr
 
 from repopilot_guard import __version__
+from repopilot_guard.capabilities import CapabilityDescriptor, CapabilityPolicy
 from repopilot_guard.config import ComponentCheck, RuntimeConfigurationError, RuntimeConfigurationManager
 from repopilot_guard.context import ManagedDocumentStore
 from repopilot_guard.document_indexing import index_uploaded_document
-from repopilot_guard.graph import GraphRunner
+from repopilot_guard.graph import GraphRunner, research_capability_registry
 from repopilot_guard.mcp import McpConfigError, McpConfigLoader, McpConfiguration
 from repopilot_guard.mcp_runtime import McpRuntime, McpRuntimeError
 from repopilot_guard.models import TaskMode, TaskOperation, TaskRequest, WorkspaceSelection
@@ -29,6 +30,7 @@ from repopilot_guard.permissions import FULL_ACCESS_CONFIRMATION, PermissionGran
 from repopilot_guard.plugins import PluginError, PluginRegistry
 from repopilot_guard.project_diagnostics import assess_task_admission, diagnose_project
 from repopilot_guard.project_registry import ProjectRegistry
+from repopilot_guard.skills import SkillRegistry
 from repopilot_guard.task_export import TaskEvidenceExporter
 from repopilot_guard.task_diagnostics import build_task_diagnostic, extract_diagnostic_codes
 from repopilot_guard.task_progress import build_task_progress
@@ -258,6 +260,16 @@ def create_app(
             return diagnose_project(registry.get(project_id))
         except ValueError as error:
             raise HTTPException(404, {"code": "PROJECT_NOT_FOUND", "message": "项目不存在。"}) from error
+
+    @app.get("/api/projects/{project_id}/capability-directory")
+    def project_capability_directory(project_id: str) -> dict[str, object]:
+        """返回不含路径和正文的能力元数据与权限策略投影。"""
+
+        try:
+            project = registry.get(project_id)
+        except ValueError as error:
+            raise HTTPException(404, {"code": "PROJECT_NOT_FOUND", "message": "项目不存在。"}) from error
+        return _capability_directory(project.root_path, plugins)
 
     @app.post("/api/projects/{project_id}/documents")
     def index_project_document(project_id: str, body: DocumentIndexBody) -> dict[str, object]:
@@ -922,6 +934,76 @@ def _start_lease_heartbeat(store: TaskStore, thread_id: str, stop: Event) -> Thr
     worker = Thread(target=renew, name=f"repopilot-lease-{thread_id}", daemon=True)
     worker.start()
     return worker
+
+
+def _capability_directory(project_root: Path, plugins: PluginRegistry) -> dict[str, object]:
+    """构造项目级只读能力目录，绝不将发现路径或 Skill 正文返回给桌面端。"""
+
+    policy = CapabilityPolicy()
+    safe_grant = PermissionGrant.safe()
+    full_grant = PermissionGrant(PermissionMode.FULL, FULL_ACCESS_CONFIRMATION)
+    skill_registry = SkillRegistry.discover(
+        project_root=project_root,
+        plugin_roots=plugins.active_skill_roots(),
+    )
+    descriptors = [*research_capability_registry().list(), *skill_registry.capabilities()]
+    capabilities = [
+        _public_capability_descriptor(descriptor, policy, safe_grant, full_grant)
+        for descriptor in sorted(descriptors, key=lambda item: item.capability_id)
+    ]
+    plugin_items = [
+        {
+            "plugin_id": plugin.plugin_id,
+            "name": plugin.manifest.name,
+            "version": plugin.manifest.version,
+            "description": plugin.manifest.description,
+            "enabled": plugin.enabled,
+            "integrity_status": plugin.integrity_status,
+            "active": plugin.enabled and plugin.integrity_status == "VERIFIED",
+        }
+        for plugin in plugins.list()
+    ]
+    return {
+        "status": "READY",
+        "capabilities": capabilities,
+        "plugins": plugin_items,
+        "issues": [{"code": issue.code, "message": issue.message} for issue in skill_registry.issues],
+    }
+
+
+def _public_capability_descriptor(
+    descriptor: CapabilityDescriptor,
+    policy: CapabilityPolicy,
+    safe_grant: PermissionGrant,
+    full_grant: PermissionGrant,
+) -> dict[str, object]:
+    """将能力描述投影为 UI 所需字段，不透传来源路径或扩展配置。"""
+
+    metadata = dict(descriptor.metadata)
+    details = {
+        key: metadata[key]
+        for key in ("allowed_tools", "user_invocable", "disable_model_invocation", "content_sha256")
+        if key in metadata
+    }
+    scope_labels = {
+        "bundled": "RepoPilot 内置",
+        "plugin": "已验证插件",
+        "user": "本机用户",
+        "project": "当前项目",
+    }
+    return {
+        "capability_id": descriptor.capability_id,
+        "name": descriptor.name,
+        "description": descriptor.description,
+        "kind": descriptor.kind.value,
+        "scope": descriptor.scope.value,
+        "source_label": scope_labels[descriptor.scope.value],
+        "risks": sorted(risk.value for risk in descriptor.risks),
+        "enabled": descriptor.enabled,
+        "details": details,
+        "safe_policy": policy.decide(descriptor, safe_grant).to_dict(),
+        "full_policy": policy.decide(descriptor, full_grant).to_dict(),
+    }
 
 
 def _grant_for_mode(mode: TaskMode, confirmation: str | None) -> PermissionGrant:

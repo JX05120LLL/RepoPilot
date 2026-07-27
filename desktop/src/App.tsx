@@ -45,6 +45,18 @@ const API_UNAVAILABLE_MESSAGE = "本机 API 尚未启动或无法访问。";
 const EVIDENCE_STREAM_ERROR =
   "证据流连接中断，请检查本机 API。任务状态会继续尝试轮询。";
 const TASK_EVIDENCE_EXPORT_CAPABILITY = "task_evidence_export";
+const capabilityKindLabels = {
+  builtin_tool: "内置工具",
+  skill: "Skill",
+  mcp_tool: "MCP 工具",
+} as const;
+const capabilityRiskLabels: Record<string, string> = {
+  read: "读取",
+  write: "写入",
+  process: "进程",
+  network: "网络",
+  secret_access: "密钥",
+};
 type Mode = "safe-isolated" | "full-local";
 type Operation = "change" | "research";
 type WorkspaceView = "task" | "context" | "review";
@@ -152,6 +164,41 @@ type McpProbeResult = {
   };
   closed?: { state?: string };
 };
+type CapabilityPolicyDecision = {
+  allowed: boolean;
+  requires_approval: boolean;
+  code: string;
+  reason: string;
+};
+type CapabilityDirectoryItem = {
+  capability_id: string;
+  name: string;
+  description: string;
+  kind: keyof typeof capabilityKindLabels;
+  scope: string;
+  source_label: string;
+  risks: string[];
+  enabled: boolean;
+  details: Record<string, unknown>;
+  safe_policy?: CapabilityPolicyDecision;
+  full_policy?: CapabilityPolicyDecision;
+  discovered_mcp?: boolean;
+};
+type CapabilityDirectory = {
+  status: string;
+  capabilities: CapabilityDirectoryItem[];
+  plugins: Array<{
+    plugin_id: string;
+    name: string;
+    version: string;
+    description: string;
+    enabled: boolean;
+    integrity_status: string;
+    active: boolean;
+  }>;
+  issues: Array<{ code: string; message: string }>;
+};
+type CapabilityFilter = "all" | keyof typeof capabilityKindLabels;
 type ContextSnapshot = {
   snapshot_sha256: string;
   included_chars: number;
@@ -545,6 +592,9 @@ export function App() {
   const [plugins, setPlugins] = useState<Plugin[]>([]);
   const [pluginSource, setPluginSource] = useState("");
   const [pluginBusy, setPluginBusy] = useState(false);
+  const [capabilityDirectory, setCapabilityDirectory] =
+    useState<CapabilityDirectory | null>(null);
+  const [capabilityFilter, setCapabilityFilter] = useState<CapabilityFilter>("all");
   const [apiReady, setApiReady] = useState(false);
   const [apiCapabilities, setApiCapabilities] = useState<string[]>([]);
   const taskSearchRef = useRef<HTMLInputElement>(null);
@@ -656,6 +706,23 @@ export function App() {
     }
     if (!response.ok) throw new Error("无法读取项目诊断");
     setProjectDiagnosis((await response.json()) as ProjectDiagnosis);
+  }
+
+  async function loadCapabilityDirectory(targetProjectId: string) {
+    if (!targetProjectId) {
+      setCapabilityDirectory(null);
+      return;
+    }
+    const response = await fetch(
+      `${API}/projects/${encodeURIComponent(targetProjectId)}/capability-directory`,
+    );
+    // 与旧版本机 API 保持兼容，避免桌面预览因新增信息面板阻断原有任务流程。
+    if (response.status === 404) {
+      setCapabilityDirectory(null);
+      return;
+    }
+    if (!response.ok) throw new Error("无法读取项目能力目录");
+    setCapabilityDirectory((await response.json()) as CapabilityDirectory);
   }
 
   async function checkApiHealth() {
@@ -853,6 +920,12 @@ export function App() {
   useEffect(() => {
     void loadProjectDiagnosis(projectId).catch((error) =>
       setRequestError(error instanceof Error ? error.message : "无法读取项目诊断"),
+    );
+  }, [projectId]);
+
+  useEffect(() => {
+    void loadCapabilityDirectory(projectId).catch((error) =>
+      setRequestError(error instanceof Error ? error.message : "无法读取项目能力目录"),
     );
   }, [projectId]);
 
@@ -1230,6 +1303,7 @@ export function App() {
         );
       setPluginSource("");
       await loadPlugins();
+      await loadCapabilityDirectory(projectId);
     } catch (error) {
       setRequestError(error instanceof Error ? error.message : "插件安装失败");
     } finally {
@@ -1259,6 +1333,7 @@ export function App() {
             : (payload.detail?.message ?? "插件状态更新失败"),
         );
       await loadPlugins();
+      await loadCapabilityDirectory(projectId);
     } catch (error) {
       setRequestError(
         error instanceof Error ? error.message : "插件状态更新失败",
@@ -1642,6 +1717,7 @@ export function App() {
     if (task?.project_id && task.project_id !== nextProjectId) beginNewTask();
     setProjectId(nextProjectId);
     setApprovedMcpTools([]);
+    setMcpResult(null);
     setConfirmed(false);
   }
 
@@ -1676,6 +1752,48 @@ export function App() {
 
   const interrupt = task?.interrupts?.[0];
   const currentProject = projects.find((item) => item.project_id === projectId);
+  const discoveredMcpCapabilities: CapabilityDirectoryItem[] = (
+    mcpResult?.connection?.tools ?? []
+  ).map((tool) => ({
+    capability_id: tool.capability_id,
+    name: tool.capability_id,
+    description: tool.description,
+    kind: "mcp_tool",
+    scope: "project",
+    source_label: "当前项目 MCP",
+    risks: tool.risks,
+    enabled: true,
+    details: {},
+    discovered_mcp: true,
+  }));
+  const capabilityItems = [
+    ...(capabilityDirectory?.capabilities ?? []),
+    ...discoveredMcpCapabilities,
+  ].filter((item) => capabilityFilter === "all" || item.kind === capabilityFilter);
+  const frozenCapabilityIds = new Set(contextSnapshot?.capability_ids ?? []);
+  const frozenToolIds = new Set(contextSnapshot?.bound_tool_ids ?? []);
+  const fullAccessConfirmed =
+    task?.task_mode === "full-local" || (!task && mode === "full-local" && confirmed);
+
+  function capabilityState(item: CapabilityDirectoryItem) {
+    if (item.discovered_mcp) {
+      return approvedMcpTools.includes(item.capability_id)
+        ? { label: "待任务冻结", tone: "pending", detail: "创建任务后由 PolicyGuard 再次裁决。" }
+        : { label: "待选择", tone: "neutral", detail: "仅已发现，尚未加入任何任务。" };
+    }
+    if (!item.enabled) return { label: "已禁用", tone: "blocked", detail: "能力目录已将该能力禁用。" };
+    if (frozenToolIds.has(item.capability_id) || frozenCapabilityIds.has(item.capability_id)) {
+      return { label: "已冻结", tone: "ready", detail: "已进入当前任务快照，不能由模型自行升级。" };
+    }
+    if (mode === "full-local" && !fullAccessConfirmed) {
+      return { label: "待确认", tone: "pending", detail: "需先完成完全本机控制确认，才会按完全权限策略创建任务。" };
+    }
+    const policy = fullAccessConfirmed ? item.full_policy : item.safe_policy;
+    if (policy?.allowed) return { label: "可用", tone: "ready", detail: policy.reason };
+    if (policy?.requires_approval) return { label: "需审批", tone: "pending", detail: policy.reason };
+    return { label: "已阻断", tone: "blocked", detail: policy?.reason ?? "当前策略不允许此能力。" };
+  }
+
   const safeModeReadiness = projectDiagnosis?.task_modes.safe_isolated;
   const selectedModeReadiness =
     mode === "safe-isolated"
@@ -2790,6 +2908,75 @@ export function App() {
               <div><h2>上下文与扩展</h2><p>{currentProject?.display_name ?? "尚未选择项目"}</p></div>
               <span>{contextSnapshot ? "已冻结任务快照" : "项目级配置"}</span>
             </header>
+
+            <section className="settings-section capability-directory-section">
+              <div className="settings-title">
+                <ShieldCheck size={19} />
+                <div><h3>能力目录</h3><p>来源、风险和权限由本机策略统一裁决。目录不代表模型已获得执行权限。</p></div>
+              </div>
+              <div className="settings-content capability-directory-content">
+                <div className="capability-directory-summary">
+                  <span>{capabilityDirectory?.capabilities.length ?? 0} 项已登记能力</span>
+                  <span>{(capabilityDirectory?.plugins ?? []).filter((plugin) => plugin.active).length} 个已验证插件</span>
+                  {task && <span>任务模式：{mode === "safe-isolated" ? "安全隔离" : "完全本机"}</span>}
+                </div>
+                <div className="capability-filters" role="group" aria-label="筛选能力类型">
+                  {(
+                    [
+                      ["all", "全部"],
+                      ["builtin_tool", "工具"],
+                      ["skill", "Skills"],
+                      ["mcp_tool", "MCP"],
+                    ] as const
+                  ).map(([filter, label]) => (
+                    <button
+                      key={filter}
+                      className={capabilityFilter === filter ? "active" : ""}
+                      type="button"
+                      aria-pressed={capabilityFilter === filter}
+                      onClick={() => setCapabilityFilter(filter)}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                {!projectId ? (
+                  <p className="capability-empty">选择项目后查看可供任务使用的受控能力。</p>
+                ) : !capabilityDirectory ? (
+                  <p className="capability-empty">当前本机 API 尚未提供能力目录。升级后端后可查看策略投影。</p>
+                ) : capabilityItems.length === 0 ? (
+                  <p className="capability-empty">当前筛选条件下没有能力。MCP 工具需先在下方显式探测。</p>
+                ) : (
+                  <div className="capability-list">
+                    {capabilityItems.map((item) => {
+                      const state = capabilityState(item);
+                      const allowedTools = Array.isArray(item.details.allowed_tools)
+                        ? item.details.allowed_tools.filter((value): value is string => typeof value === "string")
+                        : [];
+                      return (
+                        <article key={item.capability_id} className="capability-row">
+                          <span className={`capability-kind capability-kind-${item.kind}`} title={capabilityKindLabels[item.kind]}>
+                            {item.kind === "builtin_tool" ? <TerminalWindow size={16} /> : item.kind === "skill" ? <Stack size={16} /> : <PuzzlePiece size={16} />}
+                          </span>
+                          <div className="capability-main">
+                            <div><b>{item.name}</b><span>{capabilityKindLabels[item.kind]} · {item.source_label}</span></div>
+                            <p>{item.description}</p>
+                            <div className="capability-meta">
+                              {item.risks.map((risk) => <span key={risk}>{capabilityRiskLabels[risk] ?? risk}</span>)}
+                              {allowedTools.length > 0 && <code>允许：{allowedTools.join(", ")}</code>}
+                            </div>
+                          </div>
+                          <span className={`capability-state ${state.tone}`} title={state.detail}>{state.label}</span>
+                        </article>
+                      );
+                    })}
+                  </div>
+                )}
+                {(capabilityDirectory?.issues ?? []).map((issue) => (
+                  <p className="capability-issue" key={issue.code}>{issue.code}：{issue.message}</p>
+                ))}
+              </div>
+            </section>
 
             <section className="settings-section" ref={runtimeConfigurationRef}>
               <div className="settings-title">

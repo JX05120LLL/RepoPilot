@@ -593,6 +593,56 @@ class ApiTests(unittest.TestCase):
                 plugin_registry.close()
                 registry.close()
 
+    def test_capability_directory_projects_policy_without_exposing_paths_or_skill_body(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repository = root / "repo"
+            skill_root = repository / ".agents" / "skills" / "java-review"
+            skill_root.mkdir(parents=True)
+            (skill_root / "SKILL.md").write_text(
+                "---\nname: java-review\ndescription: Java review guidance\nallowed-tools: [read_file]\n---\nNever expose this body.\n",
+                encoding="utf-8",
+            )
+            plugin_root = root / "spring-maintenance"
+            plugin_root.mkdir()
+            (plugin_root / "repopilot-plugin.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "id": "spring-maintenance",
+                        "name": "Spring Maintenance",
+                        "version": "1.0.0",
+                        "description": "Java maintenance guidance.",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registry = ProjectRegistry(root / "state.sqlite")
+            plugin_registry = PluginRegistry(root / "state.sqlite")
+            project = registry.add(repository, "能力目录项目")
+            try:
+                with TestClient(create_app(FakeRunner(), registry, root / "runs", plugin_registry=plugin_registry)) as client:
+                    self.assertEqual(200, client.post("/api/plugins", json={"source": str(plugin_root)}).status_code)
+                    response = client.get(f"/api/projects/{project.project_id}/capability-directory")
+
+                self.assertEqual(200, response.status_code)
+                payload = response.json()
+                builtin = next(item for item in payload["capabilities"] if item["capability_id"] == "read_file")
+                skill = next(item for item in payload["capabilities"] if item["capability_id"] == "skill__java-review")
+                self.assertEqual("RepoPilot 内置", builtin["source_label"])
+                self.assertTrue(builtin["safe_policy"]["allowed"])
+                self.assertEqual("当前项目", skill["source_label"])
+                self.assertEqual(["read_file"], skill["details"]["allowed_tools"])
+                self.assertEqual("USER_GRANTED_FULL_ACCESS", skill["full_policy"]["code"])
+                self.assertEqual("Spring Maintenance", payload["plugins"][0]["name"])
+                serialized = json.dumps(payload, ensure_ascii=False)
+                self.assertNotIn(str(repository), serialized)
+                self.assertNotIn(str(plugin_root), serialized)
+                self.assertNotIn("Never expose this body", serialized)
+            finally:
+                plugin_registry.close()
+                registry.close()
+
     def test_document_index_api_uses_controlled_service_and_preserves_blocked_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

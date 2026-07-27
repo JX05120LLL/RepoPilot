@@ -809,7 +809,7 @@ class CodingGraphFactory:
         self._preflight_checker = preflight_checker
         self._workspace_manager = workspace_manager or WorkspaceManager()
         self._context_service = context_service or NoopContextService()
-        self._context_broker = context_broker or ContextBroker(capabilities=_research_capability_registry())
+        self._context_broker = context_broker or ContextBroker(capabilities=research_capability_registry())
         self._mcp_binding_service = mcp_binding_service or TaskMcpBindingService()
         self._cancellations = cancellation_registry or DEFAULT_CANCELLATION_REGISTRY
         self._research_model = research_model or NoopResearchModel()
@@ -1039,7 +1039,7 @@ class CodingGraphFactory:
         except ValueError:
             return _blocked(state, "MCP_BINDING_SNAPSHOT_INVALID", "MCP 工具快照无效，已阻断任务。")
         capabilities = CapabilityRegistry(
-            (*_research_capability_registry().list(), *bindings_registry(mcp_bindings).list())
+            (*research_capability_registry().list(), *bindings_registry(mcp_bindings).list())
         )
         bound_tool_ids = (*_RESEARCH_TOOL_DESCRIPTIONS, *(binding.capability_id for binding in mcp_bindings))
         broker_result = self._context_broker.assemble(
@@ -1902,8 +1902,8 @@ def _context_reference(item: Any) -> dict[str, object]:
     return {"source_type": item.source_type, "path": item.path, "line_start": item.line_start, "line_end": item.line_end, "note": "RAG 检索结果"}
 
 
-def _research_capability_registry() -> CapabilityRegistry:
-    """Broker 与执行器共享同一只读研究目录，防止快照与真实绑定脱节。"""
+def research_capability_registry() -> CapabilityRegistry:
+    """返回研究阶段固定的只读能力目录，供 Broker、执行器和本机 API 共享。"""
     return CapabilityRegistry(
         CapabilityDescriptor(
             capability_id=name,
