@@ -52,9 +52,10 @@ class RuntimeConfigurationManager:
 
         try:
             settings = AppSettings()
-            return {
+            writable = self.is_writable()
+            snapshot: dict[str, object] = {
                 "status": "READY",
-                "writable": self.is_writable(),
+                "writable": writable,
                 "restart_required": False,
                 "chat": {
                     "base_url": settings.chat_base_url or "",
@@ -69,6 +70,10 @@ class RuntimeConfigurationManager:
                 },
                 "qdrant": {"url": settings.qdrant_url},
             }
+            if not writable:
+                snapshot["code"] = "CONFIGURATION_WRITE_NOT_MANAGED"
+                snapshot["message"] = "当前连接仅可读取配置；请使用已安装的 RepoPilot Desktop 保存 API Key。"
+            return snapshot
         except Exception:
             # 配置值的解析细节可能含有用户输入，不能作为 API 错误返回。
             return {

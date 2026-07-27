@@ -2894,6 +2894,11 @@ textarea::placeholder {
   margin: 0 auto;
 }
 
+/* 视图切换依赖语义化 hidden；组件布局不能覆盖其默认隐藏行为。 */
+.utility-view [hidden] {
+  display: none !important;
+}
+
 .utility-header {
   display: flex;
   align-items: flex-start;
@@ -2920,6 +2925,28 @@ textarea::placeholder {
   background: #f2f3f4;
   border-radius: 5px;
   font-size: 10px;
+}
+
+.settings-intro {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  gap: 8px;
+  width: min(980px, 100%);
+  margin: -6px auto 14px;
+  padding: 10px 0 14px;
+  color: #51606c;
+  border-bottom: 1px solid var(--line);
+}
+
+.settings-intro svg {
+  margin-top: 1px;
+  color: #35687d;
+}
+
+.settings-intro p {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.55;
 }
 
 .settings-section {
@@ -3131,6 +3158,11 @@ textarea::placeholder {
   gap: 14px;
 }
 
+.settings-view .runtime-settings-section {
+  padding-top: 12px;
+  border-top: 0;
+}
+
 .runtime-configuration-status {
   display: flex;
   align-items: flex-start;
@@ -3170,6 +3202,143 @@ textarea::placeholder {
   background: #edf6ef;
   border: 1px solid #d7e9da;
   border-radius: 5px;
+}
+
+.runtime-dependency-section {
+  display: grid;
+  gap: 8px;
+  padding: 0 0 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.runtime-dependency-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.runtime-dependency-heading > div {
+  display: grid;
+  gap: 3px;
+}
+
+.runtime-dependency-heading b {
+  color: #404b56;
+  font-size: 11px;
+}
+
+.runtime-dependency-heading span,
+.runtime-dependency-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.runtime-dependency-heading .secondary-button {
+  flex: 0 0 auto;
+  min-height: 29px;
+  padding: 5px 8px;
+  font-size: 10px;
+}
+
+.runtime-dependency-list {
+  display: grid;
+  border-top: 1px solid var(--line);
+}
+
+.runtime-dependency-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 8px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.runtime-dependency-row > span {
+  margin-top: 1px;
+  padding: 3px 5px;
+  border-radius: 4px;
+  font: 9px var(--mono);
+  white-space: nowrap;
+}
+
+.runtime-dependency-row > span.ready {
+  color: #2f6b4f;
+  background: #e8f2eb;
+}
+
+.runtime-dependency-row > span.blocked {
+  color: #995246;
+  background: #f8eae7;
+}
+
+.runtime-dependency-row > div {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.runtime-dependency-row b {
+  color: #45505a;
+  font-size: 11px;
+}
+
+.runtime-dependency-row p {
+  margin: 0;
+  color: #6a737d;
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.runtime-dependency-row code {
+  max-width: 190px;
+  overflow: hidden;
+  color: #737d87;
+  font: 9px var(--mono);
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-config-groups {
+  display: grid;
+  gap: 18px;
+}
+
+.runtime-config-group {
+  display: grid;
+  gap: 11px;
+  margin: 0;
+  padding: 0 0 18px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.runtime-config-group:last-child {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.runtime-config-group > header {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.runtime-config-group > header b {
+  color: #38434e;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.runtime-config-group > header span {
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.45;
 }
 
 .runtime-config-grid {
@@ -4316,6 +4485,31 @@ textarea::placeholder {
   .settings-section {
     grid-template-columns: 1fr;
     gap: 14px;
+  }
+
+  .runtime-config-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .runtime-dependency-row {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .runtime-dependency-row code {
+    grid-column: 2;
+    justify-self: start;
+    max-width: 100%;
+    text-align: left;
+  }
+
+  .runtime-config-group > header {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .settings-intro {
+    margin-bottom: 10px;
   }
 
   .utility-view {

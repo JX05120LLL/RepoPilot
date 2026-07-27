@@ -9,7 +9,7 @@ import {
 import { useEffect, useState } from "react";
 
 export type TerminalCommand = {
-  id: "status" | "review" | "artifacts";
+  id: "status" | "events" | "review" | "artifacts";
   label: string;
   command: string;
 };
@@ -126,7 +126,7 @@ export function TaskTerminalDock({
 
       <div className="task-terminal-output" aria-live="polite">
         {entries.length === 0 ? (
-          <p><span>$</span> 选择状态、审阅或产物查询。</p>
+          <p><span>$</span> 选择状态、证据、审阅或产物查询。</p>
         ) : entries.map((entry) => (
           <article key={entry.id} className={`terminal-entry terminal-${entry.status}`}>
             <code>$ {entry.command}</code>

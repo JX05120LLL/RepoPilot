@@ -130,7 +130,11 @@ class CliProductTests(unittest.TestCase):
         self.assertIn('scope -eq "127.0.0.1-only"', script)
         self.assertIn('VITE_REPOPILOT_API_URL = "http://127.0.0.1:${ApiPort}/api"', script)
         self.assertIn('REPOPILOT_DESKTOP_PREVIEW_ORIGIN = "http://127.0.0.1:${UiPort}"', script)
+        self.assertIn("Stop-RepoPilotProcessTree", script)
+        self.assertIn("Wait-Process -Id $vite.Id", script)
+        self.assertIn("repopilot-vite-preview.err.log", script)
         self.assertNotIn("Test-NetConnection", script)
+        self.assertNotIn(" --open", script)
 
     def test_welcome_guides_first_time_user_to_register_a_project(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

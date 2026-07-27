@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from pydantic import ValidationError
 
-from repopilot_guard.config import AppSettings, ComponentCheck, sanitized_settings_error
+from repopilot_guard.config import AppSettings, ComponentCheck, RuntimeConfigurationManager, sanitized_settings_error
 from repopilot_guard.graph import (
     CodingGraphFactory,
     GraphPreflightChecker,
@@ -178,6 +178,14 @@ class AppSettingsTests(unittest.TestCase):
         self.assertEqual("ChatOpenAI", type(chat_model).__name__)
         self.assertEqual("OpenAIEmbeddings", type(embeddings).__name__)
         self.assertFalse(embeddings.check_embedding_ctx_length)
+
+    def test_unmanaged_runtime_snapshot_explains_desktop_only_write_boundary(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            snapshot = RuntimeConfigurationManager({}).snapshot()
+
+        self.assertFalse(snapshot["writable"])
+        self.assertEqual("CONFIGURATION_WRITE_NOT_MANAGED", snapshot["code"])
+        self.assertIn("已安装的 RepoPilot Desktop", str(snapshot["message"]))
 
 
 class QdrantBootstrapperTests(unittest.TestCase):

@@ -59,7 +59,7 @@ const capabilityRiskLabels: Record<string, string> = {
 };
 type Mode = "safe-isolated" | "full-local";
 type Operation = "change" | "research";
-type WorkspaceView = "task" | "context" | "review";
+type WorkspaceView = "task" | "context" | "settings" | "review";
 type EvidenceScope = "key" | "all";
 type EventStreamState = "idle" | "connecting" | "connected" | "reconnecting" | "offline" | "closed";
 type Project = {
@@ -279,6 +279,12 @@ type RuntimeHealth = {
   code: string;
   message?: string;
 };
+type RuntimeDependency = {
+  component: string;
+  status: "READY" | "BLOCKED";
+  code: string;
+  message: string;
+};
 type RuntimeConfiguration = {
   status: "READY" | "BLOCKED";
   code?: string;
@@ -342,6 +348,11 @@ const eventStreamLabels: Record<EventStreamState, string> = {
   reconnecting: "证据流重连中",
   offline: "API 不可达，轮询保底",
   closed: "证据流已结束",
+};
+const runtimeDependencyLabels: Record<string, string> = {
+  chat_provider: "对话模型",
+  embedding_provider: "Embedding 模型",
+  qdrant: "Qdrant",
 };
 
 function taskStateLabel(status: string, verdict?: string | null, pendingApproval = false): string {
@@ -599,11 +610,12 @@ export function App() {
   const [apiCapabilities, setApiCapabilities] = useState<string[]>([]);
   const taskSearchRef = useRef<HTMLInputElement>(null);
   const taskDescriptionRef = useRef<HTMLTextAreaElement>(null);
-  const runtimeConfigurationRef = useRef<HTMLElement>(null);
   const [runtimeHealth, setRuntimeHealth] = useState<RuntimeHealth>({
     status: "UNKNOWN",
     code: "API_NOT_CHECKED",
   });
+  const [runtimeDependencies, setRuntimeDependencies] = useState<RuntimeDependency[]>([]);
+  const [runtimeHealthChecking, setRuntimeHealthChecking] = useState(false);
   const [runtimeConfiguration, setRuntimeConfiguration] =
     useState<RuntimeConfiguration | null>(null);
   const [runtimeConfigurationBusy, setRuntimeConfigurationBusy] = useState(false);
@@ -726,6 +738,7 @@ export function App() {
   }
 
   async function checkApiHealth() {
+    setRuntimeHealthChecking(true);
     try {
       const response = await fetch(`${API}/health`);
       const payload = (await response.json()) as {
@@ -733,11 +746,23 @@ export function App() {
         agent_status?: "READY" | "BLOCKED";
         capabilities?: unknown;
         dependencies?: Array<{
+          component?: string;
           status?: string;
           code?: string;
           message?: string;
         }>;
       };
+      const dependencies = Array.isArray(payload.dependencies)
+        ? payload.dependencies.flatMap((item) =>
+            typeof item.component === "string" &&
+            (item.status === "READY" || item.status === "BLOCKED") &&
+            typeof item.code === "string" &&
+            typeof item.message === "string"
+              ? [{ component: item.component, status: item.status as RuntimeDependency["status"], code: item.code, message: item.message }]
+              : [],
+          )
+        : [];
+      setRuntimeDependencies(dependencies);
       // Desktop workflow needs the runtime dependency contract, not only an HTTP 200.
       const hasCurrentContract =
         typeof payload.agent_status === "string" &&
@@ -749,7 +774,7 @@ export function App() {
         ? payload.capabilities.filter((item): item is string => typeof item === "string")
         : [];
       setApiCapabilities(ready ? capabilities : []);
-      const blockedDependency = payload.dependencies?.find(
+      const blockedDependency = dependencies.find(
         (item) => item.status === "BLOCKED",
       );
       setRuntimeHealth({
@@ -772,11 +797,14 @@ export function App() {
     } catch {
       setApiReady(false);
       setApiCapabilities([]);
+      setRuntimeDependencies([]);
       setRuntimeHealth({
         status: "UNKNOWN",
         code: "API_UNAVAILABLE",
         message: "无法连接本机 API，请启动 RepoPilot 后端后重试。",
       });
+    } finally {
+      setRuntimeHealthChecking(false);
     }
   }
 
@@ -821,6 +849,18 @@ export function App() {
           `阶段  ${snapshot.progress?.current_stage ?? snapshot.status}`,
           progress,
         ],
+      };
+    }
+
+    if (command.id === "events") {
+      const recentEvents = events.slice(-8).reverse().map((event) =>
+        `${eventLabels[event.type] ?? event.type}  ${eventSummary(event)}`,
+      );
+      return {
+        title: `最近证据 ${recentEvents.length}`,
+        lines: recentEvents.length
+          ? recentEvents
+          : ["当前任务尚未产生可展示的脱敏证据事件。"],
       };
     }
 
@@ -1707,9 +1747,9 @@ export function App() {
   }
 
   function openRuntimeConfiguration() {
-    setActiveView("context");
-    window.requestAnimationFrame(() =>
-      runtimeConfigurationRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }),
+    setActiveView("settings");
+    void loadRuntimeConfiguration().catch(() =>
+      setRequestError("无法读取运行配置，请检查本地 API。"),
     );
   }
 
@@ -1996,14 +2036,14 @@ export function App() {
       id: "view-context",
       group: "视图",
       label: "上下文与扩展",
-      description: "查看文档、MCP、Skills、插件和运行配置",
+      description: "查看文档、MCP、Skills、插件和任务上下文",
       icon: <Stack size={16} />,
       onSelect: () => setActiveView("context"),
     },
     {
-      id: "runtime-configuration",
-      group: "系统",
-      label: "运行配置",
+      id: "view-settings",
+      group: "视图",
+      label: "设置",
       description: "管理本地模型、Embedding 与 Qdrant 连接配置",
       icon: <SlidersHorizontal size={16} />,
       keywords: "settings api key model embedding qdrant 配置",
@@ -2103,6 +2143,11 @@ export function App() {
           command: `repopilot-guard task status --thread-id ${task.thread_id}`,
         },
         {
+          id: "events",
+          label: "查看证据",
+          command: `repopilot-guard task events --thread-id ${task.thread_id}`,
+        },
+        {
           id: "review",
           label: "审阅任务",
           command: `repopilot-guard task review --thread-id ${task.thread_id}`,
@@ -2148,6 +2193,14 @@ export function App() {
           >
             <PuzzlePiece size={17} />
             <span>上下文与扩展</span>
+          </button>
+          <button
+            className={activeView === "settings" ? "active" : ""}
+            type="button"
+            onClick={openRuntimeConfiguration}
+          >
+            <SlidersHorizontal size={17} />
+            <span>设置</span>
           </button>
         </nav>
 
@@ -2319,6 +2372,9 @@ export function App() {
             </button>
             <button className={activeView === "context" ? "active" : ""} type="button" title="上下文与扩展" onClick={() => setActiveView("context")}>
               <Stack size={18} />
+            </button>
+            <button className={activeView === "settings" ? "active" : ""} type="button" title="设置" onClick={openRuntimeConfiguration}>
+              <SlidersHorizontal size={18} />
             </button>
             <button className={activeView === "review" ? "active" : ""} type="button" title="证据与产物" onClick={() => setActiveView("review")} disabled={!task}>
               <FileCode size={18} />
@@ -2902,14 +2958,24 @@ export function App() {
           </div>
         )}
 
-        {activeView === "context" && (
-          <section className="utility-view">
+        {(activeView === "context" || activeView === "settings") && (
+          <section className={activeView === "settings" ? "utility-view settings-view" : "utility-view"}>
             <header className="utility-header">
-              <div><h2>上下文与扩展</h2><p>{currentProject?.display_name ?? "尚未选择项目"}</p></div>
-              <span>{contextSnapshot ? "已冻结任务快照" : "项目级配置"}</span>
+              <div>
+                <h2>{activeView === "settings" ? "设置" : "上下文与扩展"}</h2>
+                <p>{activeView === "settings" ? "模型、Embedding 与本机检索服务配置" : currentProject?.display_name ?? "尚未选择项目"}</p>
+              </div>
+              <span>{activeView === "settings" ? "仅本机保存" : contextSnapshot ? "已冻结任务快照" : "项目级配置"}</span>
             </header>
 
-            <section className="settings-section capability-directory-section">
+            {activeView === "settings" && (
+              <div className="settings-intro">
+                <ShieldCheck size={18} />
+                <p>API Key 仅写入 RepoPilot 桌面应用的本机配置。已保存的密钥不会回显，也不会进入任务证据、日志或导出文件。</p>
+              </div>
+            )}
+
+            <section hidden={activeView !== "context"} className="settings-section capability-directory-section">
               <div className="settings-title">
                 <ShieldCheck size={19} />
                 <div><h3>能力目录</h3><p>来源、风险和权限由本机策略统一裁决。目录不代表模型已获得执行权限。</p></div>
@@ -2978,7 +3044,7 @@ export function App() {
               </div>
             </section>
 
-            <section className="settings-section" ref={runtimeConfigurationRef}>
+            <section hidden={activeView !== "settings"} className="settings-section runtime-settings-section">
               <div className="settings-title">
                 <SlidersHorizontal size={19} />
                 <div><h3>运行配置</h3><p>仅保存到桌面应用自己的本地配置文件，密钥不会回显或写入任务证据。</p></div>
@@ -2995,23 +3061,62 @@ export function App() {
                       </span>
                       <p>{runtimeConfiguration.message ?? "保存后需要重启 RepoPilot Desktop，正在运行的任务不会读取新配置。"}</p>
                     </div>
-                    <div className="runtime-config-grid">
-                      <label>Chat Base URL<input value={chatBaseUrl} onChange={(event) => setChatBaseUrl(event.target.value)} placeholder="https://api.deepseek.com" disabled={!runtimeConfiguration.writable} /></label>
-                      <label>Chat Model<input value={chatModel} onChange={(event) => setChatModel(event.target.value)} placeholder="deepseek-chat" disabled={!runtimeConfiguration.writable} /></label>
-                      <label className="runtime-secret-field">
-                        Chat API Key
-                        <input type="password" value={chatApiKey} onChange={(event) => { setChatApiKey(event.target.value); setClearChatApiKey(false); }} placeholder={runtimeConfiguration.chat?.api_key_configured ? "已配置，输入新值才会替换" : "未配置"} autoComplete="off" disabled={!runtimeConfiguration.writable || clearChatApiKey} />
-                        <small>{runtimeConfiguration.chat?.api_key_configured ? "已配置，值不会显示。" : "尚未配置。"}</small>
-                      </label>
-                      <label>Embedding Base URL<input value={embeddingBaseUrl} onChange={(event) => setEmbeddingBaseUrl(event.target.value)} placeholder="OpenAI-compatible embedding endpoint" disabled={!runtimeConfiguration.writable} /></label>
-                      <label>Embedding Model<input value={embeddingModel} onChange={(event) => setEmbeddingModel(event.target.value)} placeholder="text-embedding-3-small" disabled={!runtimeConfiguration.writable} /></label>
-                      <label>Embedding Dimensions<input inputMode="numeric" value={embeddingDimensions} onChange={(event) => setEmbeddingDimensions(event.target.value)} placeholder="1536" disabled={!runtimeConfiguration.writable} /></label>
-                      <label className="runtime-secret-field">
-                        Embedding API Key
-                        <input type="password" value={embeddingApiKey} onChange={(event) => { setEmbeddingApiKey(event.target.value); setClearEmbeddingApiKey(false); }} placeholder={runtimeConfiguration.embedding?.api_key_configured ? "已配置，输入新值才会替换" : "未配置"} autoComplete="off" disabled={!runtimeConfiguration.writable || clearEmbeddingApiKey} />
-                        <small>{runtimeConfiguration.embedding?.api_key_configured ? "已配置，值不会显示。" : "尚未配置。"}</small>
-                      </label>
-                      <label className="runtime-config-wide">Qdrant URL<input value={qdrantUrl} onChange={(event) => setQdrantUrl(event.target.value)} placeholder="http://127.0.0.1:6333" disabled={!runtimeConfiguration.writable} /></label>
+                    <div className="runtime-dependency-section">
+                      <div className="runtime-dependency-heading">
+                        <div><b>本机依赖检查</b><span>仅检查已声明的配置与本机检索服务，不会发送模型提示词。</span></div>
+                        <button className="secondary-button" type="button" onClick={() => void checkApiHealth()} disabled={runtimeHealthChecking}>
+                          <ArrowClockwise size={15} />{runtimeHealthChecking ? "检查中" : "刷新状态"}
+                        </button>
+                      </div>
+                      {runtimeDependencies.length === 0 ? (
+                        <p className="runtime-dependency-empty">本机 API 尚未返回依赖详情，请刷新状态或重启 RepoPilot Desktop。</p>
+                      ) : (
+                        <div className="runtime-dependency-list" aria-label="本机依赖状态">
+                          {runtimeDependencies.map((dependency) => (
+                            <div key={dependency.component} className="runtime-dependency-row">
+                              <span className={dependency.status === "READY" ? "ready" : "blocked"}>{dependency.status === "READY" ? "已就绪" : "已阻断"}</span>
+                              <div>
+                                <b>{runtimeDependencyLabels[dependency.component] ?? dependency.component}</b>
+                                <p>{dependency.message}</p>
+                              </div>
+                              <code>{dependency.code}</code>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                    <div className="runtime-config-groups">
+                      <section className="runtime-config-group">
+                        <header><b>对话模型</b><span>用于任务分析、工具调用和修改计划。</span></header>
+                        <div className="runtime-config-grid">
+                          <label>Base URL<input value={chatBaseUrl} onChange={(event) => setChatBaseUrl(event.target.value)} placeholder="https://api.deepseek.com" disabled={!runtimeConfiguration.writable} /></label>
+                          <label>Model<input value={chatModel} onChange={(event) => setChatModel(event.target.value)} placeholder="deepseek-chat" disabled={!runtimeConfiguration.writable} /></label>
+                          <label className="runtime-secret-field runtime-config-wide">
+                            API Key
+                            <input type="password" value={chatApiKey} onChange={(event) => { setChatApiKey(event.target.value); setClearChatApiKey(false); }} placeholder={runtimeConfiguration.chat?.api_key_configured ? "已配置，输入新值才会替换" : "未配置"} autoComplete="off" disabled={!runtimeConfiguration.writable || clearChatApiKey} />
+                            <small>{runtimeConfiguration.chat?.api_key_configured ? "已配置，值不会显示。" : "尚未配置。"}</small>
+                          </label>
+                        </div>
+                      </section>
+                      <section className="runtime-config-group">
+                        <header><b>Embedding 模型</b><span>用于代码、研发文档和项目记忆的向量检索。</span></header>
+                        <div className="runtime-config-grid">
+                          <label>Base URL<input value={embeddingBaseUrl} onChange={(event) => setEmbeddingBaseUrl(event.target.value)} placeholder="OpenAI-compatible embedding endpoint" disabled={!runtimeConfiguration.writable} /></label>
+                          <label>Model<input value={embeddingModel} onChange={(event) => setEmbeddingModel(event.target.value)} placeholder="text-embedding-3-small" disabled={!runtimeConfiguration.writable} /></label>
+                          <label>Dimensions<input inputMode="numeric" value={embeddingDimensions} onChange={(event) => setEmbeddingDimensions(event.target.value)} placeholder="1536" disabled={!runtimeConfiguration.writable} /></label>
+                          <label className="runtime-secret-field">
+                            API Key
+                            <input type="password" value={embeddingApiKey} onChange={(event) => { setEmbeddingApiKey(event.target.value); setClearEmbeddingApiKey(false); }} placeholder={runtimeConfiguration.embedding?.api_key_configured ? "已配置，输入新值才会替换" : "未配置"} autoComplete="off" disabled={!runtimeConfiguration.writable || clearEmbeddingApiKey} />
+                            <small>{runtimeConfiguration.embedding?.api_key_configured ? "已配置，值不会显示。" : "尚未配置。"}</small>
+                          </label>
+                        </div>
+                      </section>
+                      <section className="runtime-config-group">
+                        <header><b>本机检索服务</b><span>Qdrant 仅用于保存项目级向量索引和已验证记忆。</span></header>
+                        <div className="runtime-config-grid">
+                          <label className="runtime-config-wide">Qdrant URL<input value={qdrantUrl} onChange={(event) => setQdrantUrl(event.target.value)} placeholder="http://127.0.0.1:6333" disabled={!runtimeConfiguration.writable} /></label>
+                        </div>
+                      </section>
                     </div>
                     <div className="runtime-configuration-actions">
                       <label className="checkbox-row"><input type="checkbox" checked={clearChatApiKey} onChange={(event) => setClearChatApiKey(event.target.checked)} disabled={!runtimeConfiguration.writable} />清除 Chat API Key</label>
@@ -3026,7 +3131,7 @@ export function App() {
               </div>
             </section>
 
-            <section className="settings-section">
+            <section hidden={activeView !== "context"} className="settings-section">
               <div className="settings-title">
                 <FileArrowUp size={19} />
                 <div><h3>研发文档</h3><p>MD / TXT · {documents.length} 份已索引文档</p></div>
@@ -3047,7 +3152,7 @@ export function App() {
               </div>
             </section>
 
-            <section className="settings-section">
+            <section hidden={activeView !== "context"} className="settings-section">
               <div className="settings-title">
                 <PuzzlePiece size={19} />
                 <div><h3>MCP 工具</h3><p>连接状态：{mcpResult?.status ?? "未探测"}</p></div>
@@ -3085,7 +3190,7 @@ export function App() {
               </div>
             </section>
 
-            <section className="settings-section">
+            <section hidden={activeView !== "context"} className="settings-section">
               <div className="settings-title">
                 <SlidersHorizontal size={19} />
                 <div><h3>Skills 与插件</h3><p>{plugins.filter((item) => item.active).length} 个活动插件</p></div>
@@ -3106,7 +3211,7 @@ export function App() {
               </div>
             </section>
 
-            {(contextSnapshot || telemetry || taskAttachments.length > 0) && (
+            {activeView === "context" && (contextSnapshot || telemetry || taskAttachments.length > 0) && (
               <section className="settings-section">
                 <div className="settings-title">
                   <Stack size={19} />
