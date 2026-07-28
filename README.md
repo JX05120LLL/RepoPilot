@@ -6,7 +6,7 @@ RepoPilot 面向已有代码仓库的维护场景：用户选择一个本地项�
 
 项目的产品体验参考 [OpenAI Codex](https://openai.com/codex/) 与 [xAI grok-build](https://github.com/xai-org/grok-build) 的项目工作区、Agent 工作流和工具扩展思路，但 RepoPilot **不是对上述项目的源码二次开发**。当前代码从零实现，重点探索 Java/Spring Boot 仓库维护中的安全边界、证据闭环、RAG、Skills、MCP 和本地桌面交互。
 
-当前候选版本：`0.1.14 / Pre-Alpha`。第一版 MVP 的后端闭环已经跑通；Windows x64 release 与 NSIS 安装包已成功构建，并完成隔离目录中的安装、启动、sidecar 退出和卸载烟雾测试。桌面端采用 Windows GUI 子系统和无控制台的 Python sidecar，已安装应用启动时不会额外弹出命令行窗口。当前代码版本的 15 项端到端评测已一次性执行并全部符合预期，升级迁移等交付验收仍在进行，尚不建议用于生产仓库。
+当前候选版本：`0.1.15 / Pre-Alpha`。第一版 MVP 的后端闭环已经跑通；Windows x64 release 与 NSIS 安装包已成功构建，并完成隔离目录中的安装、启动、sidecar 退出和卸载烟雾测试。桌面端采用 Windows GUI 子系统和无控制台的 Python sidecar，已安装应用启动时不会额外弹出命令行窗口。当前代码版本的 15 项端到端评测已一次性执行并全部符合预期，升级迁移等交付验收仍在进行，尚不建议用于生产仓库。
 
 ## 目录
 
