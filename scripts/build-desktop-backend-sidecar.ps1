@@ -21,7 +21,7 @@ Remove-Item -LiteralPath $target -Force -ErrorAction SilentlyContinue
 # Package only the RepoPilot Python backend. Secrets and user data stay outside.
 $pyInstallerArguments = @(
     'run', '--with', 'pyinstaller', '--with', 'mcp[cli]', 'pyinstaller',
-    '--noconfirm', '--clean', '--onefile',
+    '--noconfirm', '--clean', '--onefile', '--windowed',
     '--name', 'repopilot-guard',
     '--distpath', $binaryRoot,
     '--workpath', (Join-Path $buildRoot 'work'),

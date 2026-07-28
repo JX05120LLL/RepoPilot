@@ -12,6 +12,7 @@ import { useEffect, useState } from "react";
 export type TerminalCommand = {
   id: "status" | "events" | "review" | "artifacts";
   label: string;
+  description: string;
   command: string;
 };
 
@@ -115,7 +116,7 @@ export function TaskTerminalDock({
         <div>
           <TerminalWindow size={17} />
           <strong>受控终端</strong>
-          <span>本机</span>
+          <span>只读</span>
         </div>
         <button type="button" className="icon-button" title="关闭受控终端 (Ctrl+J)" onClick={onClose}>
           <X size={17} />
@@ -123,14 +124,15 @@ export function TaskTerminalDock({
       </header>
 
       <div className="task-terminal-commandbar">
-        <span className="task-terminal-prompt">repopilot[{threadId.slice(0, 8)}]&gt;</span>
-        <label>
+        <span className="task-terminal-thread">任务 {threadId.slice(0, 8)}</span>
+        <label className="task-terminal-action-select">
           <span className="sr-only">选择受控命令</span>
           <select value={selected?.id ?? "status"} onChange={(event) => setCommandId(event.target.value as TerminalCommand["id"])}>
-            {commands.map((command) => <option key={command.id} value={command.id}>{command.command}</option>)}
+            {commands.map((command) => <option key={command.id} value={command.id}>{command.label}</option>)}
           </select>
           <CaretDown size={14} />
         </label>
+        <span className="task-terminal-action-description">{selected?.description}</span>
         <button type="button" className="terminal-copy" title="复制当前 CLI 命令" onClick={() => void copySelected()} disabled={!selected}>
           {copied ? <CheckCircle size={16} weight="fill" /> : <CopySimple size={16} />}
           {copied ? "已复制" : "复制"}
@@ -153,7 +155,10 @@ export function TaskTerminalDock({
 
       <div className="task-terminal-output" aria-live="polite">
         {entries.length === 0 ? (
-          <p><span>$</span> 选择状态、证据、审阅或产物查询。</p>
+          <div className="task-terminal-empty">
+            <p>选择一个只读查询后运行。这里不会打开系统命令行，也不能执行任意 Shell。</p>
+            {selected && <code>{selected.command}</code>}
+          </div>
         ) : entries.map((entry) => (
           <article key={entry.id} className={`terminal-entry terminal-${entry.status}`}>
             <code>$ {entry.command}</code>

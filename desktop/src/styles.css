@@ -734,17 +734,16 @@ textarea::placeholder {
   background: #151a21;
 }
 
-.task-terminal-prompt {
+.task-terminal-thread {
   flex: 0 0 auto;
-  color: #9fc6a9;
+  color: #91a5b9;
   font: 10px var(--mono);
 }
 
-.task-terminal-commandbar label {
+.task-terminal-action-select {
   position: relative;
   display: grid;
-  flex: 1 1 auto;
-  min-width: 0;
+  flex: 0 0 126px;
 }
 
 .task-terminal-commandbar select {
@@ -769,6 +768,16 @@ textarea::placeholder {
   right: 7px;
   pointer-events: none;
   color: #8e9aa7;
+}
+
+.task-terminal-action-description {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: #9ba8b5;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .terminal-copy,
@@ -823,14 +832,31 @@ textarea::placeholder {
   scrollbar-width: thin;
 }
 
-.task-terminal-output > p {
-  margin: 0;
-  color: #909eac;
-  font: 11px/1.65 var(--mono);
+.task-terminal-empty {
+  display: grid;
+  gap: 10px;
+  max-width: 760px;
+  padding: 2px 0;
 }
 
-.task-terminal-output > p span {
-  color: #9fc6a9;
+.task-terminal-empty p {
+  margin: 0;
+  color: #909eac;
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.task-terminal-empty code {
+  display: block;
+  overflow: hidden;
+  padding: 8px 10px;
+  color: #c6d6e4;
+  background: #111820;
+  border: 1px solid #303b46;
+  border-radius: 4px;
+  font: 10px/1.45 var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .terminal-entry {
@@ -2466,13 +2492,13 @@ textarea::placeholder {
   overflow: hidden;
   background: #ffffff;
   border: 1px solid #cfd3d8;
-  border-radius: 12px;
-  box-shadow: 0 10px 30px rgba(34, 40, 49, 0.1);
+  border-radius: 8px;
+  box-shadow: 0 6px 18px rgba(34, 40, 49, 0.08);
 }
 
 .composer:focus-within {
   border-color: #9db7ed;
-  box-shadow: 0 0 0 3px #edf3ff, 0 8px 28px rgba(38, 45, 55, 0.08);
+  box-shadow: 0 0 0 3px #edf3ff, 0 5px 16px rgba(38, 45, 55, 0.07);
 }
 
 .composer > textarea {
@@ -4491,6 +4517,35 @@ textarea::placeholder {
     box-shadow: none;
   }
 
+  .task-workspace.terminal-open .session-view {
+    padding-bottom: 262px;
+  }
+
+  .task-terminal-dock {
+    grid-template-rows: 38px 68px minmax(0, 1fr);
+    height: 262px;
+  }
+
+  .task-terminal-commandbar {
+    flex-wrap: wrap;
+    align-content: center;
+    gap: 4px 8px;
+  }
+
+  .task-terminal-action-select {
+    flex-basis: 118px;
+  }
+
+  .task-terminal-action-description {
+    order: 2;
+    flex-basis: calc(100% - 104px);
+    padding-left: 0;
+  }
+
+  .task-terminal-thread {
+    display: none;
+  }
+
   .conversation-column {
     width: calc(100% - 28px);
     padding-top: 24px;
@@ -4673,6 +4728,352 @@ textarea::placeholder {
 
   .diff-line code {
     padding-inline: 10px;
+  }
+}
+
+/* 工作台视觉收敛：紧凑、克制，并明确展示配置状态。 */
+.product-shell {
+  background: #f8fafb;
+}
+
+.navigation-pane {
+  background: #f1f3f5;
+}
+
+.brand-menu strong,
+.new-task-state h2,
+.utility-header h2 {
+  color: #172534;
+  font-weight: 720;
+}
+
+.product-brand {
+  min-height: 52px;
+  padding-inline: 18px 14px;
+}
+
+.primary-navigation {
+  padding-top: 8px;
+}
+
+.primary-navigation button {
+  min-height: 38px;
+}
+
+.primary-navigation button:hover:not(:disabled),
+.primary-navigation button.active {
+  color: #172534;
+  background: #e3e8ec;
+}
+
+.workbench,
+.utility-view {
+  background: #fbfcfd;
+}
+
+.workspace-header {
+  min-height: 54px;
+  padding-inline: 24px 16px;
+  background: rgba(255, 255, 255, 0.92);
+}
+
+.conversation-column {
+  width: min(880px, calc(100% - 48px));
+  padding-top: 32px;
+  padding-bottom: 40px;
+}
+
+.new-task-state {
+  padding-top: clamp(24px, 5vh, 56px);
+  padding-bottom: clamp(36px, 8vh, 84px);
+}
+
+.new-task-state h2,
+.utility-header h2 {
+  font-size: 25px;
+}
+
+.project-readiness,
+.task-starters {
+  width: min(700px, 100%);
+}
+
+.utility-view {
+  padding: 34px clamp(24px, 5vw, 80px) 60px;
+}
+
+.utility-header,
+.settings-section {
+  width: min(1040px, 100%);
+}
+
+.utility-header {
+  padding-bottom: 20px;
+}
+
+.runtime-configuration-status {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 18px;
+  padding: 12px 14px;
+  background: #f6f9fb;
+  border: 1px solid #dce5eb;
+  border-radius: 7px;
+  box-shadow: 0 1px 2px rgba(25, 39, 52, 0.03);
+}
+
+.runtime-status-copy {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+}
+
+.runtime-status-copy > span {
+  flex: 0 0 auto;
+  padding: 4px 6px;
+  border-radius: 4px;
+  font: 10px var(--mono);
+}
+
+.runtime-status-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.runtime-status-summary > span {
+  display: grid;
+  gap: 2px;
+  min-width: 64px;
+  padding-left: 9px;
+  border-left: 1px solid #d9e2e8;
+  color: #6d7680;
+  font-size: 10px;
+}
+
+.runtime-status-summary b {
+  font: 10px var(--mono);
+  font-weight: 700;
+}
+
+.runtime-status-summary .complete b {
+  color: #20724c;
+}
+
+.runtime-status-summary .incomplete b {
+  color: #95601b;
+}
+
+.runtime-config-groups {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.runtime-config-group {
+  align-content: start;
+  padding: 14px;
+  background: #ffffff;
+  border: 1px solid #e0e6ea;
+  border-radius: 7px;
+  box-shadow: 0 1px 2px rgba(25, 39, 52, 0.025);
+}
+
+.runtime-config-group:last-child {
+  grid-column: 1 / -1;
+}
+
+.runtime-config-grid {
+  gap: 9px;
+}
+
+.runtime-configuration-actions {
+  gap: 8px 16px;
+  padding-top: 2px;
+}
+
+.runtime-configuration-actions .secondary-button {
+  min-width: 102px;
+  color: #ffffff;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.runtime-configuration-actions .secondary-button:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+/* 设置页只保留一条主路径：配置优先，诊断按需展开。 */
+.settings-single-column {
+  display: block;
+  padding-top: 12px;
+  border-top: 0;
+}
+
+.settings-single-column .runtime-configuration {
+  width: min(820px, 100%);
+  gap: 22px;
+}
+
+.runtime-settings-overview {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 0 0 18px;
+  border-bottom: 1px solid #dde3e7;
+}
+
+.runtime-settings-copy {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 9px;
+}
+
+.runtime-settings-copy > span {
+  flex: 0 0 auto;
+  padding: 4px 6px;
+  border-radius: 4px;
+  font: 10px var(--mono);
+}
+
+.runtime-settings-copy > span.ready {
+  color: #20724c;
+  background: #e8f2eb;
+}
+
+.runtime-settings-copy > span.blocked {
+  color: #9a504a;
+  background: #f8e9e7;
+}
+
+.runtime-settings-copy p {
+  margin: 0;
+  color: #65717c;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.settings-single-column .runtime-config-groups {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 0;
+}
+
+.settings-single-column .runtime-config-group,
+.settings-single-column .runtime-config-group:last-child {
+  grid-column: auto;
+  gap: 12px;
+  padding: 0 0 22px;
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid #dde3e7;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.settings-single-column .runtime-config-group + .runtime-config-group {
+  padding-top: 22px;
+}
+
+.settings-single-column .runtime-config-group:last-child {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.settings-single-column .runtime-config-grid {
+  max-width: 760px;
+  gap: 11px 14px;
+}
+
+.runtime-diagnostics {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 0 0 16px;
+  border-bottom: 1px solid #dde3e7;
+}
+
+.runtime-diagnostics details {
+  min-width: 0;
+}
+
+.runtime-diagnostics summary {
+  color: #5c6772;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 620;
+}
+
+.runtime-diagnostics-body {
+  width: min(640px, calc(100vw - 160px));
+  padding-top: 11px;
+}
+
+.runtime-diagnostics .secondary-button {
+  flex: 0 0 auto;
+  min-height: 30px;
+  padding: 5px 9px;
+  font-size: 10px;
+}
+
+.open-project-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  margin-top: 22px;
+  padding: 7px 11px;
+  color: #ffffff;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.open-project-button:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.navigation-settings.active {
+  color: var(--ink);
+  background: #e3e8ec;
+}
+
+@media (max-width: 860px) {
+  .runtime-configuration-status {
+    grid-template-columns: 1fr;
+  }
+
+  .runtime-status-summary {
+    width: 100%;
+  }
+
+  .runtime-status-summary > span {
+    flex: 1 1 0;
+  }
+
+  .runtime-config-groups {
+    grid-template-columns: 1fr;
+  }
+
+  .runtime-config-group:last-child {
+    grid-column: auto;
+  }
+
+  .runtime-settings-overview {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .runtime-diagnostics-body {
+    width: auto;
   }
 }
 

@@ -245,10 +245,14 @@ class CliProductTests(unittest.TestCase):
         self.assertIn("REPOPILOT_STATE_DB_PATH", rust_source)
         self.assertIn("REPOPILOT_DESKTOP_DATA_DIR", rust_source)
         self.assertIn("CREATE_NO_WINDOW", rust_source)
+        self.assertIn('windows_subsystem = "windows"', rust_source)
         self.assertIn("WindowEvent::CloseRequested", rust_source)
         self.assertIn("app_handle.exit(0)", rust_source)
         self.assertIn("tauri_plugin_single_instance", rust_source)
         self.assertIn("get_webview_window(\"main\")", rust_source)
+
+        sidecar_builder = (repository_root / "scripts" / "build-desktop-backend-sidecar.ps1").read_text(encoding="utf-8")
+        self.assertIn("'--windowed'", sidecar_builder)
 
     def test_task_summary_excludes_raw_messages_and_tool_arguments(self) -> None:
         result = _Result()

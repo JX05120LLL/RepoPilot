@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! RepoPilot Desktop 的本机后端生命周期管理。
 //!
 //! 前端只能调用回环地址上的 Python API。开发环境由 `uv` 启动项目后端；

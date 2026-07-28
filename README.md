@@ -6,7 +6,7 @@ RepoPilot 面向已有代码仓库的维护场景：用户选择一个本地项�
 
 项目的产品体验参考 [OpenAI Codex](https://openai.com/codex/) 与 [xAI grok-build](https://github.com/xai-org/grok-build) 的项目工作区、Agent 工作流和工具扩展思路，但 RepoPilot **不是对上述项目的源码二次开发**。当前代码从零实现，重点探索 Java/Spring Boot 仓库维护中的安全边界、证据闭环、RAG、Skills、MCP 和本地桌面交互。
 
-当前发布版本：`0.1.13 / Pre-Alpha`。第一版 MVP 的后端闭环已经跑通；Windows x64 release 与 NSIS 安装包已成功构建，并完成隔离目录中的安装、启动、sidecar 退出和卸载烟雾测试。当前代码版本的 15 项端到端评测已一次性执行并全部符合预期，升级迁移等交付验收仍在进行，尚不建议用于生产仓库。
+当前候选版本：`0.1.14 / Pre-Alpha`。第一版 MVP 的后端闭环已经跑通；Windows x64 release 与 NSIS 安装包已成功构建，并完成隔离目录中的安装、启动、sidecar 退出和卸载烟雾测试。桌面端采用 Windows GUI 子系统和无控制台的 Python sidecar，已安装应用启动时不会额外弹出命令行窗口。当前代码版本的 15 项端到端评测已一次性执行并全部符合预期，升级迁移等交付验收仍在进行，尚不建议用于生产仓库。
 
 ## 目录
 
@@ -446,7 +446,7 @@ uv run repopilot-guard task start `
 
 ## 桌面端
 
-桌面工作区使用项目/任务树、Agent 会话、任务检查器、上下文与扩展、设置、证据与产物六类稳定区域。设置独立管理对话模型、Embedding 模型与 Qdrant 参数；上下文与扩展只展示能力目录、研发文档、MCP、Skills、插件和任务快照。已选择任务时，右上角可打开任务检查器，在不离开会话的情况下查看状态、上下文来源、附件、关键 Evidence 和任务产物；按 `Esc` 关闭，按 `Ctrl+Alt+I` 切换。按 `Ctrl+K` 可打开命令面板并搜索操作、项目和最近任务，使用方向键与 `Enter` 完成导航；按 `Ctrl+N` 新建任务，任务输入框内按 `Ctrl+Enter` 提交。命令面板和检查器只负责导航与展示，权限裁决仍由后端 `PolicyGuard` 完成。
+桌面工作区以项目/任务树和 Agent 会话为中心：从系统目录选择器打开本地文件夹后，RepoPilot 会自动注册并切换到该项目，不需要填写额外注册表单。侧栏承载新建任务、任务搜索、上下文与扩展、项目树、最近任务和设置；顶部只保留与当前任务直接相关的审阅、受控终端和任务检查器，避免重复导航。设置独立管理对话模型、Embedding 模型与 Qdrant 参数，优先展示可编辑配置，依赖诊断按需展开。已选择任务时，可打开任务检查器，在不离开会话的情况下查看状态、上下文来源、附件、关键 Evidence 和任务产物；按 `Esc` 关闭，按 `Ctrl+Alt+I` 切换。按 `Ctrl+K` 可打开命令面板并搜索操作、项目和最近任务，使用方向键与 `Enter` 完成导航；按 `Ctrl+N` 新建任务，任务输入框内按 `Ctrl+Enter` 提交。命令面板和检查器只负责导航与展示，权限裁决仍由后端 `PolicyGuard` 完成。
 
 ### 浏览器预览
 
@@ -497,7 +497,7 @@ Tauri 工程、图标、后端 sidecar 构建脚本和环境诊断已经具备�
 
 开发预览和 CLI 默认读取仓库根目录的 `.env`；已安装的 RepoPilot Desktop 不读取该开发文件。首次启动会在当前用户应用数据目录创建无密钥模板：`APPDATA\\com.repopilot.desktop\\settings.env`。
 
-推荐在桌面端的“设置”中填写 Chat、Embedding 与 Qdrant 参数。页面按“对话模型”“Embedding 模型”“本机检索服务”分组，只展示密钥是否已配置，绝不会回显 API Key；保存操作仅允许写入由 Tauri sidecar 管理的 `settings.env`，浏览器预览、CLI 和仓库 `.env` 都不能通过该接口写入。保存后必须重启 RepoPilot Desktop，运行中的 Agent 不会在任务中途切换模型或检索配置。
+推荐在桌面端左下角的“设置与运行配置”中填写 Chat、Embedding 与 Qdrant 参数。页面按“对话模型”“Embedding 模型”“本机检索服务”连续分组，只展示密钥是否已配置，绝不会回显 API Key；本机依赖检查默认折叠，避免干扰首次配置。保存操作仅允许写入由 Tauri sidecar 管理的 `settings.env`，浏览器预览、CLI 和仓库 `.env` 都不能通过该接口写入。保存后必须重启 RepoPilot Desktop，运行中的 Agent 不会在任务中途切换模型或检索配置。
 
 也可以手动编辑该文件后重启桌面应用：
 

@@ -23,7 +23,6 @@ import {
   ChatCircle,
   CircleNotch,
   ClockCounterClockwise,
-  Command,
   FileArrowUp,
   FileCode,
   FolderOpen,
@@ -586,8 +585,6 @@ export function App() {
   const [projectId, setProjectId] = useState(
     () => savedWorkbenchPreferences.projectId ?? "",
   );
-  const [projectPath, setProjectPath] = useState("");
-  const [projectName, setProjectName] = useState("");
   const [description, setDescription] = useState("");
   const [mode, setMode] = useState<Mode>("safe-isolated");
   const [operation, setOperation] = useState<Operation>("change");
@@ -1343,20 +1340,18 @@ export function App() {
     task,
   ]);
 
-  async function addProject() {
-    if (!projectPath.trim()) return;
+  async function addProject(path: string) {
+    if (!path.trim()) return;
     setRequestError("");
     try {
       const response = await fetch(
-        `${API}/projects?path=${encodeURIComponent(projectPath)}&name=${encodeURIComponent(projectName)}`,
+        `${API}/projects?path=${encodeURIComponent(path.trim())}`,
         { method: "POST" },
       );
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail ?? "项目注册失败");
       const project = payload.project as Project;
       setProjectId(project.project_id);
-      setProjectPath("");
-      setProjectName("");
       await loadProjects();
     } catch (error) {
       setRequestError(error instanceof Error ? error.message : "项目注册失败");
@@ -1492,7 +1487,9 @@ export function App() {
         multiple: false,
         title: "选择 RepoPilot 项目目录",
       });
-      if (typeof selected === "string") setProjectPath(selected);
+      if (typeof selected === "string") {
+        await addProject(selected);
+      }
     } catch {
       setRequestError(
         "系统目录选择器仅在已安装的 RepoPilot Desktop 中可用；浏览器调试时请手动输入路径。",
@@ -2194,21 +2191,25 @@ export function App() {
         {
           id: "status",
           label: "查看状态",
+          description: "读取当前阶段与执行状态",
           command: `repopilot-guard task status --thread-id ${task.thread_id}`,
         },
         {
           id: "events",
           label: "查看证据",
+          description: "读取近期审计证据摘要",
           command: `repopilot-guard task events --thread-id ${task.thread_id}`,
         },
         {
           id: "review",
           label: "审阅任务",
+          description: "读取计划、审批与验证结论",
           command: `repopilot-guard task review --thread-id ${task.thread_id}`,
         },
         {
           id: "artifacts",
           label: "查看产物",
+          description: "读取 Diff、报告等产物清单",
           command: `repopilot-guard task artifacts --thread-id ${task.thread_id}`,
         },
       ]
@@ -2235,11 +2236,6 @@ export function App() {
             <ListMagnifyingGlass size={17} />
             <span>搜索任务</span>
           </button>
-          <button type="button" onClick={() => setShowCommandPalette(true)}>
-            <Command size={17} />
-            <span>命令面板</span>
-            <small>Ctrl+K</small>
-          </button>
           <button
             className={activeView === "context" ? "active" : ""}
             type="button"
@@ -2247,14 +2243,6 @@ export function App() {
           >
             <PuzzlePiece size={17} />
             <span>上下文与扩展</span>
-          </button>
-          <button
-            className={activeView === "settings" ? "active" : ""}
-            type="button"
-            onClick={openRuntimeConfiguration}
-          >
-            <SlidersHorizontal size={17} />
-            <span>设置</span>
           </button>
         </nav>
 
@@ -2285,7 +2273,7 @@ export function App() {
             </button>
           </div>
           <div className="project-tree">
-            {projects.length === 0 && <p className="sidebar-empty">尚未注册本地项目</p>}
+            {projects.length === 0 && <p className="sidebar-empty">选择本地文件夹后会自动加入这里</p>}
             {projects.map((project) => {
               const projectTasks = tasks.filter(
                 (item) =>
@@ -2329,34 +2317,6 @@ export function App() {
               );
             })}
           </div>
-          <details className="project-adder" open={Boolean(projectPath)}>
-            <summary>
-              <Plus size={16} />
-              注册本地项目
-            </summary>
-            <div className="sidebar-form">
-              <label>
-                项目目录
-                <div className="input-with-action">
-                  <input
-                    value={projectPath}
-                    onChange={(event) => setProjectPath(event.target.value)}
-                    placeholder="D:\\code\\my-project"
-                  />
-                  <button className="icon-button" type="button" title="选择目录" onClick={() => void chooseProjectDirectory()}>
-                    <FolderOpen size={16} />
-                  </button>
-                </div>
-              </label>
-              <label>
-                显示名称
-                <input value={projectName} onChange={(event) => setProjectName(event.target.value)} placeholder="可选" />
-              </label>
-              <button className="secondary-button" type="button" onClick={() => void addProject()} disabled={!projectPath.trim()}>
-                注册项目
-              </button>
-            </div>
-          </details>
 
           <section className="recent-task-navigation" aria-label="最近任务">
             <div className="navigation-heading">
@@ -2388,9 +2348,9 @@ export function App() {
             <input type="checkbox" checked={showArchived} onChange={(event) => setShowArchived(event.target.checked)} />
             显示归档
           </label>
-          <button className="navigation-settings" type="button" onClick={openRuntimeConfiguration}>
+          <button className={activeView === "settings" ? "navigation-settings active" : "navigation-settings"} type="button" onClick={openRuntimeConfiguration}>
             <SlidersHorizontal size={16} />
-            <span>运行配置</span>
+            <span>设置与运行配置</span>
           </button>
           <div className={"runtime-indicator runtime-" + serviceStatus}>
             <span />
@@ -2418,18 +2378,6 @@ export function App() {
             )}
           </div>
           <div className="workspace-actions" aria-label="工作区视图">
-            <button className={showCommandPalette ? "active" : ""} type="button" title="命令面板 (Ctrl+K)" onClick={() => setShowCommandPalette(true)}>
-              <Command size={18} />
-            </button>
-            <button className={activeView === "task" ? "active" : ""} type="button" title="Agent 会话" onClick={() => setActiveView("task")}>
-              <ChatCircle size={18} />
-            </button>
-            <button className={activeView === "context" ? "active" : ""} type="button" title="上下文与扩展" onClick={() => setActiveView("context")}>
-              <Stack size={18} />
-            </button>
-            <button className={activeView === "settings" ? "active" : ""} type="button" title="设置" onClick={openRuntimeConfiguration}>
-              <SlidersHorizontal size={18} />
-            </button>
             <button className={activeView === "review" ? "active" : ""} type="button" title="证据与产物" onClick={() => setActiveView("review")} disabled={!task}>
               <FileCode size={18} />
             </button>
@@ -2478,8 +2426,13 @@ export function App() {
                     <p>
                       {currentProject
                         ? currentProject.display_name + "  ·  " + projectStatusLabel
-                        : "从左侧选择或注册一个本地项目"}
+                        : "选择一个本地文件夹后，RepoPilot 会自动添加项目并开始分析。"}
                     </p>
+                    {!currentProject && (
+                      <button className="open-project-button" type="button" onClick={() => void chooseProjectDirectory()}>
+                        <FolderOpen size={17} />打开本地项目
+                      </button>
+                    )}
                     {projectReadinessItems.length > 0 && (
                       <dl className="project-readiness" aria-label="当前项目就绪状态">
                         {projectReadinessItems.map((item) => (
@@ -3017,7 +2970,7 @@ export function App() {
             <header className="utility-header">
               <div>
                 <h2>{activeView === "settings" ? "设置" : "上下文与扩展"}</h2>
-                <p>{activeView === "settings" ? "模型、Embedding 与本机检索服务配置" : currentProject?.display_name ?? "尚未选择项目"}</p>
+                <p>{activeView === "settings" ? "模型与本机检索服务" : currentProject?.display_name ?? "尚未选择项目"}</p>
               </div>
               <span>{activeView === "settings" ? "仅本机保存" : contextSnapshot ? "已冻结任务快照" : "项目级配置"}</span>
             </header>
@@ -3098,46 +3051,57 @@ export function App() {
               </div>
             </section>
 
-            <section hidden={activeView !== "settings"} className="settings-section runtime-settings-section">
-              <div className="settings-title">
-                <SlidersHorizontal size={19} />
-                <div><h3>运行配置</h3><p>仅保存到桌面应用自己的本地配置文件，密钥不会回显或写入任务证据。</p></div>
-              </div>
+            <section hidden={activeView !== "settings"} className="settings-section runtime-settings-section settings-single-column">
               <div className="settings-content runtime-configuration">
                 {!runtimeConfiguration && (
                   <p className="configuration-notice">当前本地 API 尚未支持应用内运行配置。重启 RepoPilot Desktop 后重试。</p>
                 )}
                 {runtimeConfiguration && (
                   <>
-                    <div className="runtime-configuration-status">
-                      <span className={runtimeConfiguration.writable ? "ready" : "blocked"}>
-                        {runtimeConfiguration.writable ? "可保存到桌面配置" : "当前连接只读"}
-                      </span>
-                      <p>{runtimeConfiguration.message ?? "保存后需要重启 RepoPilot Desktop，正在运行的任务不会读取新配置。"}</p>
-                    </div>
-                    <div className="runtime-dependency-section">
-                      <div className="runtime-dependency-heading">
-                        <div><b>本机依赖检查</b><span>仅检查已声明的配置与本机检索服务，不会发送模型提示词。</span></div>
-                        <button className="secondary-button" type="button" onClick={() => void checkApiHealth()} disabled={runtimeHealthChecking}>
-                          <ArrowClockwise size={15} />{runtimeHealthChecking ? "检查中" : "刷新状态"}
-                        </button>
+                    <div className="runtime-settings-overview">
+                      <div className="runtime-settings-copy">
+                        <span className={runtimeConfiguration.writable ? "ready" : "blocked"}>
+                          {runtimeConfiguration.writable ? "可保存到桌面配置" : "当前连接只读"}
+                        </span>
+                        <p>密钥仅保存在此设备，不会显示在任务证据、日志或导出文件中。</p>
                       </div>
-                      {runtimeDependencies.length === 0 ? (
-                        <p className="runtime-dependency-empty">本机 API 尚未返回依赖详情，请刷新状态或重启 RepoPilot Desktop。</p>
-                      ) : (
-                        <div className="runtime-dependency-list" aria-label="本机依赖状态">
-                          {runtimeDependencies.map((dependency) => (
-                            <div key={dependency.component} className="runtime-dependency-row">
-                              <span className={dependency.status === "READY" ? "ready" : "blocked"}>{dependency.status === "READY" ? "已就绪" : "已阻断"}</span>
-                              <div>
-                                <b>{runtimeDependencyLabels[dependency.component] ?? dependency.component}</b>
-                                <p>{dependency.message}</p>
-                              </div>
-                              <code>{dependency.code}</code>
+                      <div className="runtime-status-summary" aria-label="运行配置完成情况">
+                        <span className={runtimeConfiguration.chat?.api_key_configured && chatBaseUrl && chatModel ? "complete" : "incomplete"}>
+                          <b>{runtimeConfiguration.chat?.api_key_configured && chatBaseUrl && chatModel ? "已完成" : "待配置"}</b>对话模型
+                        </span>
+                        <span className={runtimeConfiguration.embedding?.api_key_configured && embeddingBaseUrl && embeddingModel && embeddingDimensions ? "complete" : "incomplete"}>
+                          <b>{runtimeConfiguration.embedding?.api_key_configured && embeddingBaseUrl && embeddingModel && embeddingDimensions ? "已完成" : "待配置"}</b>向量检索
+                        </span>
+                        <span className={runtimeDependencies.find((dependency) => dependency.component === "qdrant")?.status === "READY" ? "complete" : "incomplete"}>
+                          <b>{runtimeDependencies.find((dependency) => dependency.component === "qdrant")?.status === "READY" ? "已连接" : "需处理"}</b>Qdrant
+                        </span>
+                      </div>
+                    </div>
+                    <div className="runtime-diagnostics">
+                      <details>
+                        <summary>查看本机依赖检查</summary>
+                        <div className="runtime-diagnostics-body">
+                          {runtimeDependencies.length === 0 ? (
+                            <p className="runtime-dependency-empty">本机 API 尚未返回依赖详情，请刷新状态或重启 RepoPilot Desktop。</p>
+                          ) : (
+                            <div className="runtime-dependency-list" aria-label="本机依赖状态">
+                              {runtimeDependencies.map((dependency) => (
+                                <div key={dependency.component} className="runtime-dependency-row">
+                                  <span className={dependency.status === "READY" ? "ready" : "blocked"}>{dependency.status === "READY" ? "已就绪" : "已阻断"}</span>
+                                  <div>
+                                    <b>{runtimeDependencyLabels[dependency.component] ?? dependency.component}</b>
+                                    <p>{dependency.message}</p>
+                                  </div>
+                                  <code>{dependency.code}</code>
+                                </div>
+                              ))}
                             </div>
-                          ))}
+                          )}
                         </div>
-                      )}
+                      </details>
+                      <button className="secondary-button" type="button" onClick={() => void checkApiHealth()} disabled={runtimeHealthChecking}>
+                        <ArrowClockwise size={15} />{runtimeHealthChecking ? "检查中" : "刷新状态"}
+                      </button>
                     </div>
                     <div className="runtime-config-groups">
                       <section className="runtime-config-group">
