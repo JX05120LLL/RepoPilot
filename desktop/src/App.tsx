@@ -531,15 +531,15 @@ function resolveTaskOutcome(item: Task, running: boolean): TaskOutcome {
   if (item.pending_approval) {
     return {
       tone: "warning",
-      title: "等待你的审批",
-      detail: "任务已暂停，不会在批准前继续执行后续动作。",
+      title: "已准备好继续处理",
+      detail: "RepoPilot 已完成定位；安全隔离模式会在实际写入前等待一次明确确认。",
     };
   }
   if (running) {
     return {
       tone: "neutral",
-      title: "任务正在运行",
-      detail: "RepoPilot 正在分析项目并持续记录可审计证据。",
+      title: "正在处理这个目标",
+      detail: "正在定位相关代码、应用受控修改并执行验证。",
     };
   }
 
@@ -547,22 +547,22 @@ function resolveTaskOutcome(item: Task, running: boolean): TaskOutcome {
   if (result === "PASSED") {
     return {
       tone: "success",
-      title: "任务已通过验证",
-      detail: "代码 Diff 与声明的验证结果均已生成，可进入审阅。",
+      title: "目标已完成",
+      detail: "已应用代码修改，并已通过声明的 Maven 验证。",
     };
   }
   if (result === "FAILED") {
     return {
       tone: "danger",
-      title: "任务执行失败",
-      detail: "补丁或验证明确失败，请在证据与产物中查看原因。",
+      title: "目标尚未完成",
+      detail: "修改或验证出现明确失败，RepoPilot 已停止继续写入。",
     };
   }
   if (result === "BLOCKED") {
     return {
       tone: "danger",
-      title: "任务已安全阻断",
-      detail: "任务没有继续执行高风险动作，请查看最后一条证据定位原因。",
+      title: "暂时无法继续处理",
+      detail: "安全策略或环境条件阻断了任务，未继续执行高风险动作。",
     };
   }
   if (result === "CANCELLED") {
@@ -575,8 +575,8 @@ function resolveTaskOutcome(item: Task, running: boolean): TaskOutcome {
   if (result === "UNVERIFIED") {
     return {
       tone: "warning",
-      title: "结果尚未验证",
-      detail: "当前已有分析或计划，但没有足够的补丁与验证证据。",
+      title: "已完成分析，但尚未修复",
+      detail: "当前只有研究结论或计划，没有可确认的代码修改和验证证据。",
     };
   }
   return {
@@ -1875,7 +1875,35 @@ export function App() {
       }
       if (decision === "revise") setRevisionComment("");
       if (decision === "approve") setExecutionApprovalConfirmation(false);
-      setTask(payload as Task);
+      const nextTask = payload as Task;
+      setTask(nextTask);
+
+      // 完全本机控制已由任务级确认语句冻结授权；此处仅自动继续图内的
+      // 第二个内部确认点，不会放宽 PolicyGuard、工具白名单或路径边界。
+      if (
+        decision === "approve" &&
+        nextTask.task_mode === "full-local" &&
+        nextTask.task_operation === "change" &&
+        nextTask.pending_approval
+      ) {
+        const continuation = await fetch(
+          `${API}/tasks/${nextTask.thread_id}/approval`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ decision: "approve", comment: null }),
+          },
+        );
+        const continuationPayload = await continuation.json();
+        if (!continuation.ok) {
+          throw new Error(
+            typeof continuationPayload.detail === "string"
+              ? continuationPayload.detail
+              : "无法继续执行已授权的任务",
+          );
+        }
+        setTask(continuationPayload as Task);
+      }
     } catch {
       setRequestError("审批请求未送达本机 API，请检查服务状态后重试。");
     } finally {
@@ -2203,6 +2231,9 @@ export function App() {
       ? "ready"
       : "degraded";
   const visibleEvents = events.slice(-14);
+  const hasGitDiff = artifacts.some((artifact) => artifact.kind === "git_diff");
+  const hasVerification = artifacts.some((artifact) => artifact.kind === "verification");
+  const hasPlan = artifacts.some((artifact) => artifact.kind === "plan_markdown");
   const attachedDocuments = attachedDocumentIds.map((documentId) =>
     documents.find((document) => document.document_id === documentId) ?? {
       document_id: documentId,
@@ -2759,99 +2790,102 @@ export function App() {
 
                 {task && (
                   <>
-                    <article className="task-request">
-                      <header>
-                        <strong>任务</strong>
-                        <div className="task-metadata">
-                          <span>{activeTaskOperation === "research" ? "计划模式" : "目标模式"}</span>
-                          <span>{activeTaskMode === "safe-isolated" ? "安全隔离修复" : "完全本机控制"}</span>
-                        </div>
-                      </header>
-                      <p>{displayedTaskDescription || "继续任务 " + compactTaskLabel(task)}</p>
+                    <article className="conversation-turn user-turn">
+                      <span className="turn-avatar">你</span>
+                      <div>
+                        <p>{displayedTaskDescription || "继续任务 " + compactTaskLabel(task)}</p>
+                        <small>
+                          {activeTaskOperation === "research" ? "计划模式" : "目标模式"}
+                          {" · "}
+                          {activeTaskMode === "safe-isolated" ? "安全隔离修复" : "完全本机控制"}
+                        </small>
+                      </div>
                     </article>
-                    <article className="execution-record">
+                    <article className="conversation-turn assistant-turn">
+                      <span className="turn-avatar agent-avatar"><TerminalWindow size={15} weight="bold" /></span>
                       <div className="agent-response">
                         <div className="agent-response-header">
-                          <span className="agent-mark"><TerminalWindow size={15} weight="bold" /></span>
                           <strong>RepoPilot</strong>
-                          <span className={"state-chip state-" + taskStatus.toLowerCase()}>
-                            {taskStateLabel(taskStatus, task.verdict, task.pending_approval)}
-                          </span>
-                          <span
-                            className={`event-stream-status stream-${eventStreamState}`}
-                            aria-label={eventStreamLabels[eventStreamState]}
-                            title="任务状态也会通过本机轮询恢复"
-                          >
-                            <i aria-hidden="true" />
-                            {eventStreamLabels[eventStreamState]}
-                          </span>
+                          {taskIsRunning && (
+                            <span className={`event-stream-status stream-${eventStreamState}`} aria-label={eventStreamLabels[eventStreamState]}>
+                              <i aria-hidden="true" />正在处理
+                            </span>
+                          )}
                         </div>
                         {taskOutcome && (
-                          <div className={"task-outcome outcome-" + taskOutcome.tone} aria-live="polite">
-                            <span>
+                          <div className="agent-goal-result" aria-live="polite">
+                            <span className={"goal-result-icon outcome-" + taskOutcome.tone}>
                               {taskOutcome.tone === "success"
-                                ? <CheckCircle size={18} weight="fill" />
+                                ? <CheckCircle size={20} weight="fill" />
                                 : taskOutcome.tone === "neutral"
-                                  ? <CircleNotch className={taskIsRunning ? "spin" : ""} size={18} />
-                                  : <WarningCircle size={18} weight="fill" />}
+                                  ? <CircleNotch className={taskIsRunning ? "spin" : ""} size={20} />
+                                  : <WarningCircle size={20} weight="fill" />}
                             </span>
                             <div>
-                              <strong>{taskOutcome.title}</strong>
+                              <h2>{taskOutcome.title}</h2>
                               <p>{taskOutcome.detail}</p>
                             </div>
                           </div>
                         )}
-                        <TaskDiagnosticPanel
-                          diagnostic={task.diagnostic}
-                          artifacts={artifacts}
-                          onOpenArtifact={(kind) => {
-                            setSelectedArtifact(kind);
-                            setSelectedArtifactVersion(null);
-                            setActiveView("review");
-                          }}
-                          onOpenRuntimeConfiguration={openRuntimeConfiguration}
-                        />
-                        {task.progress && task.progress.stages.length > 0 && (
-                          <TaskProgressTrail
-                            summary={task.progress.summary}
-                            stages={task.progress.stages}
-                            running={taskIsRunning}
-                          />
-                        )}
-                        {visibleEvents.length === 0 && taskIsRunning && (
-                          <div className="activity-loading" aria-label="任务正在初始化"><span /><span /><span /></div>
-                        )}
-                        <div className="agent-activity">
-                          {visibleEvents.map((event, index) => (
-                            <article key={event.id}>
-                              <span className="activity-line">
-                                {index === visibleEvents.length - 1 && taskIsRunning
-                                  ? <CircleNotch className="spin" size={15} />
-                                  : <CheckCircle size={15} weight="fill" />}
-                              </span>
-                              <div>
-                                <b>{eventLabels[event.type] ?? event.type}</b>
-                                <p>{eventSummary(event)}</p>
-                              </div>
-                            </article>
-                          ))}
+                        <div className="goal-result-facts" aria-label="任务结果摘要">
+                          {hasGitDiff && <span><CheckCircle size={14} weight="fill" />已生成真实代码修改</span>}
+                          {hasVerification && <span><CheckCircle size={14} weight="fill" />已记录 Maven 验证</span>}
+                          {hasPlan && !hasGitDiff && <span><FileCode size={14} />已生成处理方案</span>}
+                          {!hasGitDiff && !hasVerification && !hasPlan && taskIsRunning && <span><CircleNotch className="spin" size={14} />正在分析代码上下文</span>}
+                          {!hasGitDiff && !hasVerification && !hasPlan && !taskIsRunning && <span><WarningCircle size={14} weight="fill" />尚未生成可验证的修改</span>}
                         </div>
-                        {artifacts.length > 0 && (
-                          <div className="result-strip">
-                            <div>
-                              <FileCode size={18} />
-                              <span>
-                                已生成 {artifacts.length} 份可审计产物
-                                <small>{task.verdict ? taskStateLabel(task.status, task.verdict) : "等待最终验证"}</small>
-                              </span>
-                            </div>
-                            <button type="button" onClick={() => setActiveView("review")}>
-                              打开审阅 <ArrowRight size={15} />
+                        <div className="goal-result-actions">
+                          {hasGitDiff && (
+                            <button type="button" onClick={() => { setSelectedArtifact("git_diff"); setSelectedArtifactVersion(null); setActiveView("review"); }}>
+                              <FileCode size={16} />查看修改
                             </button>
-                          </div>
-                        )}
-                        {!taskIsRunning && artifacts.length === 0 && (
-                          <p className="agent-message">任务已停止，当前没有可供审阅的产物。</p>
+                          )}
+                          {hasVerification && (
+                            <button type="button" onClick={() => { setSelectedArtifact("verification"); setSelectedArtifactVersion(null); setActiveView("review"); }}>
+                              <CheckCircle size={16} />查看验证
+                            </button>
+                          )}
+                          {hasPlan && !hasGitDiff && (
+                            <button type="button" onClick={() => { setSelectedArtifact("plan_markdown"); setSelectedArtifactVersion(null); setActiveView("review"); }}>
+                              <ListMagnifyingGlass size={16} />查看处理方案
+                            </button>
+                          )}
+                        </div>
+                        {(taskIsRunning || visibleEvents.length > 0 || task.diagnostic) && (
+                          <details className="execution-details" open={taskIsRunning}>
+                            <summary>{taskIsRunning ? "查看正在执行的步骤" : `查看执行记录${visibleEvents.length ? `（${visibleEvents.length}）` : ""}`}</summary>
+                            <div className="execution-details-body">
+                              {task.progress && task.progress.stages.length > 0 && (
+                                <TaskProgressTrail summary={task.progress.summary} stages={task.progress.stages} running={taskIsRunning} />
+                              )}
+                              {visibleEvents.length === 0 && taskIsRunning && (
+                                <div className="activity-loading" aria-label="任务正在初始化"><span /><span /><span /></div>
+                              )}
+                              {visibleEvents.length > 0 && (
+                                <div className="agent-activity">
+                                  {visibleEvents.map((event, index) => (
+                                    <article key={event.id}>
+                                      <span className="activity-line">
+                                        {index === visibleEvents.length - 1 && taskIsRunning
+                                          ? <CircleNotch className="spin" size={15} />
+                                          : <CheckCircle size={15} weight="fill" />}
+                                      </span>
+                                      <div>
+                                        <b>{eventLabels[event.type] ?? event.type}</b>
+                                        <p>{eventSummary(event)}</p>
+                                      </div>
+                                    </article>
+                                  ))}
+                                </div>
+                              )}
+                              <TaskDiagnosticPanel
+                                diagnostic={task.diagnostic}
+                                artifacts={artifacts}
+                                onOpenArtifact={(kind) => { setSelectedArtifact(kind); setSelectedArtifactVersion(null); setActiveView("review"); }}
+                                onOpenRuntimeConfiguration={openRuntimeConfiguration}
+                              />
+                            </div>
+                          </details>
                         )}
                       </div>
                     </article>
@@ -2859,54 +2893,51 @@ export function App() {
                 )}
 
                 {task?.pending_approval && (
-                  <section className="inline-approval">
+                  <article className="conversation-turn assistant-turn approval-turn">
+                    <span className="turn-avatar agent-avatar"><TerminalWindow size={15} weight="bold" /></span>
+                    <section className="inline-approval">
                     <div className="approval-heading">
                       <WarningCircle size={20} weight="fill" />
                       <div>
                         <strong>
                           {researchPlanApproval
-                            ? "计划结论等待确认"
+                            ? "分析已完成，可以生成结论"
                             : interrupt?.type === "EXECUTION_APPROVAL_REQUIRED"
-                            ? "执行前需要你的批准"
-                            : "修改计划等待审阅"}
+                            ? "准备开始修复与验证"
+                            : "已定位修复方向"}
                         </strong>
-                        <p>{interrupt?.message ?? "审阅计划后决定是否继续。"}</p>
+                        <p>
+                          {researchPlanApproval
+                            ? "这是只读计划任务，继续后会整理结论，不会修改代码或运行 Maven。"
+                            : executionApproval
+                              ? "继续后将只在受控范围内写入代码并运行固定 Maven 验证。"
+                              : "RepoPilot 已完成问题定位；你无需审阅计划，继续后会进入下一步处理。"}
+                        </p>
                       </div>
                     </div>
-                    <div className="approval-scope" aria-label="本次审批范围">
-                      <div className="approval-scope-facts">
-                        <span><b>{executionApproval ? "执行范围" : "计划范围"}</b>{executionApproval ? "仅允许受控补丁写入候选文件" : "本次确认不写入代码"}</span>
-                        <span><b>Maven Recipe</b><code>{approvalRecipe}</code></span>
-                        {approvalTargetTest && <span><b>目标测试</b><code>{approvalTargetTest}</code></span>}
-                      </div>
-                      {approvalCandidateFiles.length > 0 && (
-                        <div className="approval-file-list">
-                          <span>候选文件</span>
-                          <ul>
-                            {approvalCandidateFiles.slice(0, 5).map((path) => <li key={path}><code>{path}</code></li>)}
-                          </ul>
-                          {approvalCandidateFiles.length > 5 && <small>另有 {approvalCandidateFiles.length - 5} 个候选文件</small>}
+                    <details className="approval-details">
+                      <summary>查看本次处理范围</summary>
+                      <div className="approval-scope" aria-label="本次审批范围">
+                        <div className="approval-scope-facts">
+                          <span><b>{executionApproval ? "写入范围" : "处理范围"}</b>{executionApproval ? "仅允许受控补丁写入候选文件" : "本次不会直接写入代码"}</span>
+                          <span><b>Maven Recipe</b><code>{approvalRecipe}</code></span>
+                          {approvalTargetTest && <span><b>目标测试</b><code>{approvalTargetTest}</code></span>}
                         </div>
-                      )}
-                      {!executionApproval && approvalSteps.length > 0 && (
-                        <details className="approval-steps">
-                          <summary>查看计划步骤（{approvalSteps.length}）</summary>
-                          <ol>{approvalSteps.map((step, index) => <li key={index}>{step}</li>)}</ol>
-                        </details>
-                      )}
-                      {executionApproval && (
-                        <p className="execution-approval-note">批准后才会生成并校验结构化补丁；补丁、Maven 执行和真实 Diff 都将写入审计证据。</p>
-                      )}
-                    </div>
-                    {interrupt?.type === "PLAN_APPROVAL_REQUIRED" && (
-                      <textarea value={revisionComment} onChange={(event) => setRevisionComment(event.target.value)} placeholder="填写需要调整的地方" aria-label="计划修改意见" />
-                    )}
+                        {approvalCandidateFiles.length > 0 && (
+                          <div className="approval-file-list">
+                            <span>候选文件</span>
+                            <ul>
+                              {approvalCandidateFiles.slice(0, 5).map((path) => <li key={path}><code>{path}</code></li>)}
+                            </ul>
+                            {approvalCandidateFiles.length > 5 && <small>另有 {approvalCandidateFiles.length - 5} 个候选文件</small>}
+                          </div>
+                        )}
+                        {!executionApproval && approvalSteps.length > 0 && (
+                          <ol className="approval-plan-steps">{approvalSteps.map((step, index) => <li key={index}>{step}</li>)}</ol>
+                        )}
+                      </div>
+                    </details>
                     <div className="approval-buttons">
-                      {interrupt?.type === "PLAN_APPROVAL_REQUIRED" && (
-                        <button className="secondary-button" type="button" onClick={() => void approve("revise")} disabled={!revisionComment.trim() || approvalBusy}>
-                          <ArrowClockwise size={16} />要求调整
-                        </button>
-                      )}
                       <button
                         className="primary-button"
                         type="button"
@@ -2920,13 +2951,14 @@ export function App() {
                         disabled={approvalBusy}
                       >
                         <CheckCircle size={16} weight="bold" />
-                        {approvalBusy ? "正在提交" : researchPlanApproval ? "确认并生成报告" : executionApproval ? "核对并批准执行" : "确认计划"}
+                        {approvalBusy ? "正在继续" : researchPlanApproval ? "生成结论" : executionApproval ? "允许执行并验证" : activeTaskMode === "full-local" ? "继续实现目标" : "继续修复"}
                       </button>
                       <button className="danger-button" type="button" onClick={() => void approve("reject")} disabled={approvalBusy}>
-                        <XCircle size={16} />拒绝
+                        <XCircle size={16} />停止任务
                       </button>
                     </div>
-                  </section>
+                    </section>
+                  </article>
                 )}
                 {executionApprovalConfirmation && task?.pending_approval && executionApproval && (
                   <div className="approval-confirmation-backdrop" role="presentation">
@@ -2969,22 +3001,18 @@ export function App() {
 
             <div className="composer-region">
               {task ? (
-                <div className={"task-command-bar outcome-" + (taskOutcome?.tone ?? "neutral")}>
-                  <div className="task-command-status">
-                    {taskOutcome?.tone === "success"
-                      ? <CheckCircle size={19} weight="fill" />
-                      : taskOutcome?.tone === "neutral"
-                        ? <CircleNotch className={taskIsRunning ? "spin" : ""} size={19} />
-                        : <WarningCircle size={19} weight="fill" />}
-                    <div>
-                      <strong>{taskOutcome?.title ?? "任务状态已更新"}</strong>
-                      <span>{task.pending_approval ? "请在上方完成审批" : taskStateLabel(task.status, task.verdict)}</span>
-                    </div>
-                  </div>
+                <div className="task-command-bar">
+                  <span className="task-command-hint">
+                    {task.pending_approval
+                      ? "等待你的确认后继续。"
+                      : taskIsRunning
+                        ? "任务正在运行，可以随时停止。"
+                        : "此任务已结束。"}
+                  </span>
                   <div className="task-command-actions">
                     {artifacts.length > 0 && (
                       <button className="secondary-button" type="button" onClick={() => setActiveView("review")}>
-                        <ListMagnifyingGlass size={16} />审阅产物
+                        <ListMagnifyingGlass size={16} />查看详情
                       </button>
                     )}
                     {taskIsRunning && (

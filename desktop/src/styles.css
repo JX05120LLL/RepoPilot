@@ -5418,3 +5418,258 @@ textarea::placeholder {
     min-width: 196px;
   }
 }
+
+/* 任务会话以最终结果为主，执行材料按需展开，避免将计划审阅当作主流程。 */
+.assistant-turn {
+  align-items: start;
+}
+
+.agent-response-header {
+  min-height: 28px;
+  color: #2f3740;
+  font-size: 13px;
+}
+
+.agent-goal-result {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 9px;
+  max-width: 760px;
+  margin-top: 10px;
+}
+
+.goal-result-icon {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  margin-top: 2px;
+  border-radius: 50%;
+}
+
+.goal-result-icon.outcome-success {
+  color: #28764d;
+  background: #e8f4ec;
+}
+
+.goal-result-icon.outcome-warning {
+  color: #9a660d;
+  background: #fff5df;
+}
+
+.goal-result-icon.outcome-danger {
+  color: #a3453e;
+  background: #fdebea;
+}
+
+.goal-result-icon.outcome-neutral {
+  color: #65717b;
+  background: #f0f2f3;
+}
+
+.agent-goal-result h2,
+.agent-goal-result p {
+  margin: 0;
+}
+
+.agent-goal-result h2 {
+  color: #28323b;
+  font-size: 15px;
+  font-weight: 680;
+  line-height: 1.45;
+}
+
+.agent-goal-result p {
+  max-width: 690px;
+  margin-top: 3px;
+  color: #69747e;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.goal-result-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  max-width: 760px;
+  margin-top: 13px;
+  color: #65717b;
+  font-size: 11px;
+}
+
+.goal-result-facts span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.goal-result-facts svg {
+  color: #47795d;
+}
+
+.goal-result-facts span:last-child svg {
+  color: #9a660d;
+}
+
+.goal-result-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  margin-top: 9px;
+}
+
+.goal-result-actions button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 5px 7px;
+  color: #2b6991;
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.goal-result-actions button:hover:not(:disabled) {
+  color: #1e5477;
+  background: #edf5f9;
+}
+
+.execution-details {
+  max-width: 760px;
+  margin-top: 18px;
+  border-top: 1px solid #e1e5e7;
+}
+
+.execution-details summary,
+.approval-details summary {
+  padding: 10px 0;
+  color: #65717b;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 620;
+}
+
+.execution-details summary:hover,
+.approval-details summary:hover {
+  color: #33414c;
+}
+
+.execution-details-body {
+  padding: 2px 0 4px;
+}
+
+.approval-turn {
+  margin-top: 24px;
+}
+
+.approval-turn .inline-approval {
+  width: auto;
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+}
+
+.approval-heading {
+  gap: 9px;
+  color: #9a660d;
+}
+
+.approval-heading strong {
+  color: #2f3740;
+  font-size: 13px;
+}
+
+.approval-heading p {
+  max-width: 660px;
+  color: #69747e;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.approval-details {
+  max-width: 760px;
+  margin-top: 10px;
+  border-top: 1px solid #e1e5e7;
+}
+
+.approval-scope {
+  gap: 10px;
+  margin-top: 0;
+  padding: 4px 0 10px;
+  color: #59636d;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+}
+
+.approval-scope-facts b,
+.approval-file-list > span {
+  color: #65717b;
+}
+
+.approval-file-list,
+.approval-plan-steps {
+  border-top-color: #e5e8ea;
+}
+
+.approval-file-list small {
+  color: #69747e;
+}
+
+.approval-buttons {
+  margin-top: 12px;
+}
+
+.task-command-bar {
+  width: min(940px, 100%);
+  min-height: 48px;
+  margin: 0 auto;
+  padding: 10px 2px 0;
+  color: #69747e;
+  background: transparent;
+  border: 0;
+  border-top: 1px solid #e1e5e7;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.task-command-hint {
+  min-width: 0;
+  color: #7a858e;
+  font-size: 11px;
+}
+
+.task-command-actions {
+  gap: 6px;
+}
+
+.task-command-actions .secondary-button,
+.task-command-actions .danger-button,
+.task-command-actions .primary-button {
+  min-height: 30px;
+  padding: 5px 9px;
+  border-radius: 5px;
+  font-size: 11px;
+}
+
+@media (max-width: 620px) {
+  .agent-goal-result {
+    grid-template-columns: 22px minmax(0, 1fr);
+  }
+
+  .task-command-bar {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .task-command-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+}
