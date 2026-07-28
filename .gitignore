@@ -14,6 +14,7 @@ desktop/src-tauri/binaries/*.exe
 .repopilot-evaluation/
 .playwright-cli/
 output/
+docs/
 desktop/node_modules/
 desktop/src-tauri/target/
 desktop/src-tauri/gen/

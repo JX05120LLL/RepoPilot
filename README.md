@@ -612,7 +612,6 @@ RepoPilot/
 ├─ evaluation/                15 项评测任务定义和说明
 ├─ examples/                  Skills、MCP 和插件示例
 ├─ scripts/                   桌面预览与 sidecar 构建脚本
-├─ docs/                      架构、阶段学习实验和设计文档
 ├─ compose.yaml               本地 Qdrant 服务
 ├─ pyproject.toml             Python 项目与依赖配置
 ├─ RepoPilot-PRD.md           产品需求文档
@@ -697,16 +696,10 @@ flowchart TB
 - Provider 的工具调用、结构化输出、usage 返回和中断能力取决于实际模型服务；
 - API 当前面向本机回环地址，不包含多用户认证和远程部署能力。
 
-## 相关文档
+## 仓库文档
 
 - [产品需求文档](RepoPilot-PRD.md)
 - [分阶段开发计划](开发计划.md)
-- [v2 最小闭环优化设计](docs/RepoPilot-v2-最小闭环优化设计.md)
-- [企业级编程助手平台架构](docs/企业级编程助手平台架构.md)
-- [插件包规范与学习实验](docs/插件包规范与学习实验.md)
-- [阶段二：隔离工作区与权限模式](docs/阶段二-隔离工作区与权限模式.md)
-- [阶段三：项目注册与 RAG](docs/阶段三-项目注册与RAG.md)
-- [阶段四：LangGraph 只读研究工作流](docs/阶段四-LangGraph只读研究工作流.md)
 
 ## License
 
