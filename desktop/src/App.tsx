@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type MouseEvent } from "react";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { ArtifactContent } from "./components/ArtifactContent";
 import { CommandPalette, type CommandPaletteItem } from "./components/CommandPalette";
@@ -22,19 +22,21 @@ import {
   CheckCircle,
   ChatCircle,
   CircleNotch,
-  ClockCounterClockwise,
+  DotsThree,
   FileArrowUp,
   FileCode,
   FolderOpen,
   ListMagnifyingGlass,
   MagnifyingGlass,
   Paperclip,
+  PencilSimple,
   Plus,
   PuzzlePiece,
   ShieldCheck,
   SidebarSimple,
   SlidersHorizontal,
   Stack,
+  Target,
   TerminalWindow,
   WarningCircle,
   XCircle,
@@ -58,6 +60,7 @@ const capabilityRiskLabels: Record<string, string> = {
 };
 type Mode = "safe-isolated" | "full-local";
 type Operation = "change" | "research";
+type ConversationMode = "goal" | "plan";
 type WorkspaceView = "task" | "context" | "settings" | "review";
 type EvidenceScope = "key" | "all";
 type EventStreamState = "idle" | "connecting" | "connected" | "reconnecting" | "offline" | "closed";
@@ -66,7 +69,25 @@ type Project = {
   display_name: string;
   root_path?: string;
   is_git_repository?: boolean;
+  archived_at?: string | null;
 };
+type Conversation = {
+  conversation_id: string;
+  project_id?: string | null;
+  display_title: string;
+  mode: ConversationMode;
+  created_at: string;
+  updated_at: string;
+  archived_at?: string | null;
+};
+type RenameTarget =
+  | { kind: "project"; id: string; title: string }
+  | { kind: "task"; id: string; title: string }
+  | { kind: "conversation"; id: string; title: string };
+type SidebarMenu =
+  | { kind: "project"; id: string; x: number; y: number }
+  | { kind: "task"; id: string; x: number; y: number }
+  | { kind: "conversation"; id: string; x: number; y: number };
 type Interrupt = {
   type: string;
   message?: string;
@@ -582,6 +603,7 @@ export function App() {
     loadWorkbenchPreferences,
   );
   const [projects, setProjects] = useState<Project[]>([]);
+  const [conversations, setConversations] = useState<Conversation[]>([]);
   const [projectId, setProjectId] = useState(
     () => savedWorkbenchPreferences.projectId ?? "",
   );
@@ -593,6 +615,7 @@ export function App() {
   );
   const [confirmed, setConfirmed] = useState(false);
   const [task, setTask] = useState<Task | null>(null);
+  const [conversation, setConversation] = useState<Conversation | null>(null);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [showArchived, setShowArchived] = useState(false);
   const [showTaskSearch, setShowTaskSearch] = useState(false);
@@ -668,12 +691,13 @@ export function App() {
   const [embeddingDimensions, setEmbeddingDimensions] = useState("");
   const [clearEmbeddingApiKey, setClearEmbeddingApiKey] = useState(false);
   const [qdrantUrl, setQdrantUrl] = useState("");
-  const [documentPath, setDocumentPath] = useState("");
   const [documentBusy, setDocumentBusy] = useState(false);
   const [documents, setDocuments] = useState<ManagedDocument[]>([]);
   const [attachedDocumentIds, setAttachedDocumentIds] = useState<string[]>([]);
-  const [showDocumentPicker, setShowDocumentPicker] = useState(false);
   const [projectDiagnosis, setProjectDiagnosis] = useState<ProjectDiagnosis | null>(null);
+  const [sidebarMenu, setSidebarMenu] = useState<SidebarMenu | null>(null);
+  const [renameTarget, setRenameTarget] = useState<RenameTarget | null>(null);
+  const [renameValue, setRenameValue] = useState("");
 
   async function loadProjects() {
     const response = await fetch(`${API}/projects`);
@@ -686,6 +710,15 @@ export function App() {
         ? current
         : nextProjects[0]?.project_id || "",
     );
+  }
+
+  async function loadConversations(includeArchived = showArchived) {
+    const response = await fetch(
+      `${API}/conversations?include_archived=${includeArchived}`,
+    );
+    if (!response.ok) throw new Error("无法读取对话列表");
+    const data = (await response.json()) as { conversations?: Conversation[] };
+    setConversations(data.conversations ?? []);
   }
 
   async function loadTasks(includeArchived = showArchived) {
@@ -937,6 +970,7 @@ export function App() {
     void Promise.all([
       loadProjects(),
       loadTasks(showArchived),
+      loadConversations(showArchived),
       loadPlugins(),
       loadRuntimeConfiguration(),
       checkApiHealth(),
@@ -986,8 +1020,6 @@ export function App() {
 
   useEffect(() => {
     setAttachedDocumentIds([]);
-    setDocumentPath("");
-    setShowDocumentPicker(false);
     void loadDocuments(projectId).catch((error) =>
       setRequestError(
         error instanceof Error ? error.message : "无法读取已导入研发文档",
@@ -1320,7 +1352,7 @@ export function App() {
         !isEditableTarget(event.target)
       ) {
         event.preventDefault();
-        beginNewTask();
+        void beginNewConversation();
       }
     }
 
@@ -1352,9 +1384,116 @@ export function App() {
       if (!response.ok) throw new Error(payload.detail ?? "项目注册失败");
       const project = payload.project as Project;
       setProjectId(project.project_id);
+      if (conversation?.conversation_id) {
+        const association = await fetch(
+          `${API}/conversations/${encodeURIComponent(conversation.conversation_id)}`,
+          {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ project_id: project.project_id }),
+          },
+        );
+        if (!association.ok) throw new Error("项目已添加，但当前对话未能关联。");
+        const associationPayload = (await association.json()) as { conversation: Conversation };
+        setConversation(associationPayload.conversation);
+        await loadConversations(showArchived);
+      }
       await loadProjects();
     } catch (error) {
       setRequestError(error instanceof Error ? error.message : "项目注册失败");
+    }
+  }
+
+  function openSidebarMenu(
+    event: MouseEvent<HTMLElement>,
+    kind: SidebarMenu["kind"],
+    id: string,
+  ) {
+    event.preventDefault();
+    setSidebarMenu({ kind, id, x: event.clientX, y: event.clientY });
+  }
+
+  function openRename(target: RenameTarget) {
+    setSidebarMenu(null);
+    setRenameTarget(target);
+    setRenameValue(target.title);
+  }
+
+  async function submitRename() {
+    if (!renameTarget || !renameValue.trim()) return;
+    setRequestError("");
+    try {
+      const path = renameTarget.kind === "project"
+        ? `${API}/projects/${encodeURIComponent(renameTarget.id)}`
+        : renameTarget.kind === "task"
+          ? `${API}/tasks/${encodeURIComponent(renameTarget.id)}`
+          : `${API}/conversations/${encodeURIComponent(renameTarget.id)}`;
+      const field = renameTarget.kind === "project" ? "display_name" : "display_title";
+      const response = await fetch(path, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ [field]: renameValue.trim() }),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail ?? "重命名失败");
+      if (renameTarget.kind === "project") await loadProjects();
+      if (renameTarget.kind === "task") {
+        const updated = payload.task as Task;
+        setTask((current) => current?.thread_id === updated.thread_id ? { ...current, ...updated } : current);
+        await loadTasks(showArchived);
+      }
+      if (renameTarget.kind === "conversation") {
+        const updated = payload.conversation as Conversation;
+        setConversation((current) => current?.conversation_id === updated.conversation_id ? updated : current);
+        await loadConversations(showArchived);
+      }
+      setRenameTarget(null);
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "重命名失败");
+    }
+  }
+
+  async function archiveProject(targetProjectId: string) {
+    setSidebarMenu(null);
+    try {
+      const response = await fetch(`${API}/projects/${encodeURIComponent(targetProjectId)}/archive`, { method: "POST" });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail ?? "项目归档失败");
+      if (projectId === targetProjectId) beginNewTask();
+      await loadProjects();
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "项目归档失败");
+    }
+  }
+
+  async function archiveConversation(conversationId: string) {
+    setSidebarMenu(null);
+    try {
+      const response = await fetch(`${API}/conversations/${encodeURIComponent(conversationId)}/archive`, { method: "POST" });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail ?? "对话归档失败");
+      if (conversation?.conversation_id === conversationId) beginNewTask();
+      await loadConversations(showArchived);
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "对话归档失败");
+    }
+  }
+
+  async function moveConversation(conversationId: string, nextProjectId: string | null) {
+    setSidebarMenu(null);
+    try {
+      const response = await fetch(`${API}/conversations/${encodeURIComponent(conversationId)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project_id: nextProjectId }),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail ?? "对话归属更新失败");
+      const updated = payload.conversation as Conversation;
+      setConversation((current) => current?.conversation_id === updated.conversation_id ? updated : current);
+      await loadConversations(showArchived);
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "对话归属更新失败");
     }
   }
 
@@ -1498,13 +1637,17 @@ export function App() {
   }
 
   async function chooseDocument() {
+    if (!projectId) {
+      setRequestError("请先为当前对话选择一个项目，再上传研发文档。");
+      return;
+    }
     try {
       const selected = await open({
         multiple: false,
         title: "选择研发文档",
         filters: [{ name: "Markdown 或文本", extensions: ["md", "txt"] }],
       });
-      if (typeof selected === "string") setDocumentPath(selected);
+      if (typeof selected === "string") await indexDocument(selected, true);
     } catch {
       setRequestError(
         "系统文件选择器仅在已安装的 RepoPilot Desktop 中可用；浏览器调试时请手动输入 MD/TXT 路径。",
@@ -1512,20 +1655,8 @@ export function App() {
     }
   }
 
-  function toggleTaskDocument(documentId: string, selected: boolean) {
-    if (selected && !attachedDocumentIds.includes(documentId) && attachedDocumentIds.length >= 4) {
-      setRequestError("单个任务最多附加 4 份研发文档，请先移除已有附件。");
-      return;
-    }
-    setAttachedDocumentIds((current) => {
-      if (!selected) return current.filter((id) => id !== documentId);
-      if (current.includes(documentId)) return current;
-      return [...current, documentId];
-    });
-  }
-
-  async function indexDocument(attachToCurrentTask = true) {
-    if (!projectId || !documentPath.trim()) return;
+  async function indexDocument(file: string, attachToCurrentTask = true) {
+    if (!projectId || !file.trim()) return;
     if (attachToCurrentTask && attachedDocumentIds.length >= 4) {
       setRequestError("单个任务最多附加 4 份研发文档，请先移除已有附件。");
       return;
@@ -1538,7 +1669,7 @@ export function App() {
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ file: documentPath.trim() }),
+          body: JSON.stringify({ file: file.trim() }),
         },
       );
       const raw = (await response.json()) as DocumentIndexResult & {
@@ -1552,7 +1683,6 @@ export function App() {
             payload.code ??
             (typeof raw.detail === "string" ? raw.detail : "文档索引失败"),
         );
-      setDocumentPath("");
       await loadDocuments(projectId);
       const documentId = payload.document?.document_id;
       if (attachToCurrentTask && documentId) {
@@ -1671,6 +1801,14 @@ export function App() {
         );
       }
       setTask(payload as Task);
+      if (conversation) {
+        // 执行后的真实 Agent 任务接管会话历史，草稿仅归档而不删除。
+        await fetch(`${API}/conversations/${encodeURIComponent(conversation.conversation_id)}/archive`, {
+          method: "POST",
+        });
+        setConversation(null);
+        await loadConversations(showArchived);
+      }
       setActiveView("task");
       await loadTasks();
     } catch (error) {
@@ -1763,21 +1901,54 @@ export function App() {
 
   async function archiveTask() {
     if (!task) return;
+    await archiveTaskById(task.thread_id);
+  }
+
+  async function archiveTaskById(threadId: string) {
+    setSidebarMenu(null);
     try {
-      const response = await fetch(`${API}/tasks/${task.thread_id}`, {
+      const response = await fetch(`${API}/tasks/${encodeURIComponent(threadId)}`, {
         method: "DELETE",
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail ?? "任务归档失败");
-      setTask(payload.task as Task);
+      const updated = payload.task as Task;
+      setTask((current) => current?.thread_id === updated.thread_id ? updated : current);
       await loadTasks(showArchived);
     } catch (error) {
       setRequestError(error instanceof Error ? error.message : "任务归档失败");
     }
   }
 
+  async function beginNewConversation(project: string | null = projectId || null) {
+    const conversationMode: ConversationMode = operation === "research" ? "plan" : "goal";
+    beginNewTask();
+    setRequestError("");
+    try {
+      const response = await fetch(`${API}/conversations`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          project_id: project,
+          mode: conversationMode,
+        }),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail ?? "新建对话失败");
+      const created = payload.conversation as Conversation;
+      setConversation(created);
+      setProjectId(created.project_id ?? "");
+      setOperation(created.mode === "plan" ? "research" : "change");
+      await loadConversations(showArchived);
+      window.requestAnimationFrame(() => taskDescriptionRef.current?.focus());
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "新建对话失败");
+    }
+  }
+
   function beginNewTask() {
     setTask(null);
+    setConversation(null);
     setEvents([]);
     setArtifacts([]);
     setArtifactVersions([]);
@@ -1827,6 +1998,7 @@ export function App() {
       const snapshot = (await response.json()) as Task;
       const merged = { ...selected, ...snapshot };
       setTask(merged);
+      setConversation(null);
       setProjectId(merged.project_id ?? projectId);
       if (merged.task_mode === "safe-isolated" || merged.task_mode === "full-local") {
         setMode(merged.task_mode);
@@ -1839,6 +2011,37 @@ export function App() {
         error instanceof Error ? error.message : "任务详情不可恢复",
       );
     }
+  }
+
+  function selectConversation(selected: Conversation) {
+    setTask(null);
+    setConversation(selected);
+    setProjectId(selected.project_id ?? "");
+    setOperation(selected.mode === "plan" ? "research" : "change");
+    setDescription("");
+    setRequestError("");
+    setActiveView("task");
+    setShowTaskTerminal(false);
+  }
+
+  function selectOperation(nextOperation: Operation) {
+    setOperation(nextOperation);
+    if (!conversation) return;
+    void fetch(`${API}/conversations/${encodeURIComponent(conversation.conversation_id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: nextOperation === "research" ? "plan" : "goal" }),
+    })
+      .then(async (response) => {
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.detail ?? "对话模式更新失败");
+        const updated = payload.conversation as Conversation;
+        setConversation(updated);
+        await loadConversations(showArchived);
+      })
+      .catch((error: unknown) =>
+        setRequestError(error instanceof Error ? error.message : "对话模式更新失败"),
+      );
   }
 
   const interrupt = task?.interrupts?.[0];
@@ -2050,17 +2253,15 @@ export function App() {
     !(mode === "full-local" && !confirmed);
   const commandItems: CommandPaletteItem[] = [
     {
-      id: "new-task",
+      id: "new-conversation",
       group: "操作",
-      label: "新建任务",
-      description: currentProject ? `在 ${currentProject.display_name} 中开始` : "先选择一个项目",
+      label: "新建对话",
+      description: currentProject ? `在 ${currentProject.display_name} 中开始` : "可先不关联项目",
       icon: <Plus size={16} />,
       shortcut: "Ctrl+N",
-      disabled: !currentProject,
       keywords: "new task 新建会话",
       onSelect: () => {
-        beginNewTask();
-        window.requestAnimationFrame(() => taskDescriptionRef.current?.focus());
+        void beginNewConversation();
       },
     },
     {
@@ -2177,15 +2378,6 @@ export function App() {
       onSelect: () => void selectTask(item),
     })),
   ];
-  const recentTasks = tasks
-    .filter(
-      (item) =>
-        !taskQuery.trim() ||
-        compactTaskLabel(item)
-          .toLocaleLowerCase()
-          .includes(taskQuery.trim().toLocaleLowerCase()),
-    )
-    .slice(0, 5);
   const terminalCommands: TerminalCommand[] = task
     ? [
         {
@@ -2223,9 +2415,9 @@ export function App() {
         </div>
 
         <nav className="primary-navigation" aria-label="工作台入口">
-          <button type="button" onClick={beginNewTask}>
+          <button type="button" onClick={() => void beginNewConversation()}>
             <Plus size={17} />
-            <span>新建任务</span>
+            <span>新建对话</span>
             <small>Ctrl+N</small>
           </button>
           <button
@@ -2283,34 +2475,70 @@ export function App() {
                       .toLocaleLowerCase()
                       .includes(taskQuery.trim().toLocaleLowerCase())),
               );
+              const projectConversations = conversations.filter(
+                (item) => item.project_id === project.project_id,
+              );
               const selected = project.project_id === projectId;
               return (
                 <section className="project-node" key={project.project_id}>
-                  <button
+                  <div
                     className={selected ? "project-row selected" : "project-row"}
-                    type="button"
-                    onClick={() => {
-                      switchProject(project.project_id);
-                    }}
+                    onContextMenu={(event) => openSidebarMenu(event, "project", project.project_id)}
                   >
-                    <FolderOpen size={16} weight={selected ? "fill" : "regular"} />
-                    <span>{project.display_name}</span>
-                    <small>{project.is_git_repository ? "Git" : "非 Git"}</small>
-                  </button>
+                    <button
+                      className="project-select"
+                      type="button"
+                      onClick={() => switchProject(project.project_id)}
+                    >
+                      <FolderOpen size={16} weight={selected ? "fill" : "regular"} />
+                      <span>{project.display_name}</span>
+                      <small>{project.is_git_repository ? "Git" : "非 Git"}</small>
+                    </button>
+                    <button
+                      className="tree-menu-button"
+                      type="button"
+                      title={`${project.display_name} 操作`}
+                      aria-label={`${project.display_name} 操作`}
+                      onClick={(event) => openSidebarMenu(event, "project", project.project_id)}
+                    >
+                      <DotsThree size={17} weight="bold" />
+                    </button>
+                  </div>
                   {selected && (
                     <div className="project-task-list">
-                      {projectTasks.length === 0 && <p>还没有任务记录</p>}
-                      {projectTasks.map((item) => (
-                        <button
-                          className={task?.thread_id === item.thread_id ? "active" : ""}
-                          type="button"
-                          key={item.thread_id}
-                          onClick={() => void selectTask(item)}
+                      {projectConversations.map((item) => (
+                        <div
+                          className={conversation?.conversation_id === item.conversation_id ? "tree-row active" : "tree-row"}
+                          key={item.conversation_id}
+                          onContextMenu={(event) => openSidebarMenu(event, "conversation", item.conversation_id)}
                         >
-                          <span>{compactTaskLabel(item)}</span>
-                          <i className={"task-dot status-" + item.status.toLowerCase()} />
-                        </button>
+                          <button type="button" onClick={() => selectConversation(item)}>
+                            <ChatCircle size={15} />
+                            <span>{item.display_title}</span>
+                            <small>{item.mode === "plan" ? "计划" : "目标"}</small>
+                          </button>
+                          <button className="tree-menu-button" type="button" title={`${item.display_title} 操作`} onClick={(event) => openSidebarMenu(event, "conversation", item.conversation_id)}>
+                            <DotsThree size={16} weight="bold" />
+                          </button>
+                        </div>
                       ))}
+                      {projectTasks.map((item) => (
+                        <div
+                          className={task?.thread_id === item.thread_id ? "tree-row active" : "tree-row"}
+                          key={item.thread_id}
+                          onContextMenu={(event) => openSidebarMenu(event, "task", item.thread_id)}
+                        >
+                          <button type="button" onClick={() => void selectTask(item)}>
+                            <ChatCircle size={15} />
+                            <span>{compactTaskLabel(item)}</span>
+                            <i className={"task-dot status-" + item.status.toLowerCase()} />
+                          </button>
+                          <button className="tree-menu-button" type="button" title={`${compactTaskLabel(item)} 操作`} onClick={(event) => openSidebarMenu(event, "task", item.thread_id)}>
+                            <DotsThree size={16} weight="bold" />
+                          </button>
+                        </div>
+                      ))}
+                      {projectTasks.length === 0 && projectConversations.length === 0 && <p>还没有对话</p>}
                     </div>
                   )}
                 </section>
@@ -2318,26 +2546,29 @@ export function App() {
             })}
           </div>
 
-          <section className="recent-task-navigation" aria-label="最近任务">
+          <section className="recent-task-navigation" aria-label="未归属对话">
             <div className="navigation-heading">
-              <span>最近任务</span>
+              <span>未归属对话</span>
             </div>
             <div className="recent-task-list">
-              {recentTasks.length === 0 && <p className="sidebar-empty">暂无任务记录</p>}
-              {recentTasks.map((item) => (
-                <button
-                  className={task?.thread_id === item.thread_id ? "recent-task-row active" : "recent-task-row"}
-                  type="button"
-                  key={item.thread_id}
-                  onClick={() => void selectTask(item)}
+              {conversations.filter((item) => !item.project_id).length === 0 && <p className="sidebar-empty">可先新建不关联项目的对话</p>}
+              {conversations.filter((item) => !item.project_id).map((item) => (
+                <div
+                  className={conversation?.conversation_id === item.conversation_id ? "recent-task-row active" : "recent-task-row"}
+                  key={item.conversation_id}
+                  onContextMenu={(event) => openSidebarMenu(event, "conversation", item.conversation_id)}
                 >
-                  <ClockCounterClockwise size={15} />
-                  <span>
-                    <strong>{compactTaskLabel(item)}</strong>
-                    <small>{taskStateLabel(item.status, item.verdict, item.pending_approval)} · {item.task_mode === "full-local" ? "完全本机" : "安全隔离"}</small>
-                  </span>
-                  <i className={"task-dot status-" + item.status.toLowerCase()} />
-                </button>
+                  <button type="button" onClick={() => selectConversation(item)}>
+                    <ChatCircle size={15} />
+                    <span>
+                      <strong>{item.display_title}</strong>
+                      <small>{item.mode === "plan" ? "计划模式" : "目标模式"} · 未关联项目</small>
+                    </span>
+                  </button>
+                  <button className="tree-menu-button" type="button" title={`${item.display_title} 操作`} onClick={(event) => openSidebarMenu(event, "conversation", item.conversation_id)}>
+                    <DotsThree size={16} weight="bold" />
+                  </button>
+                </div>
               ))}
             </div>
           </section>
@@ -2364,16 +2595,77 @@ export function App() {
           </div>
         </div>
       </aside>
+      {sidebarMenu && (
+        <>
+          <button className="sidebar-menu-backdrop" type="button" aria-label="关闭操作菜单" onClick={() => setSidebarMenu(null)} />
+          <section
+            className="sidebar-context-menu"
+            role="menu"
+            aria-label="项目或对话操作"
+            style={{ left: Math.min(sidebarMenu.x, window.innerWidth - 214), top: Math.min(sidebarMenu.y, window.innerHeight - 210) }}
+          >
+            {sidebarMenu.kind === "project" && (() => {
+              const item = projects.find((project) => project.project_id === sidebarMenu.id);
+              if (!item) return null;
+              return <>
+                <button type="button" role="menuitem" onClick={() => void beginNewConversation(item.project_id)}><Plus size={16} />在此项目中新建对话</button>
+                <button type="button" role="menuitem" onClick={() => openRename({ kind: "project", id: item.project_id, title: item.display_name })}><PencilSimple size={16} />重命名项目</button>
+                <button type="button" role="menuitem" className="menu-danger" onClick={() => void archiveProject(item.project_id)}><Archive size={16} />归档项目</button>
+              </>;
+            })()}
+            {sidebarMenu.kind === "conversation" && (() => {
+              const item = conversations.find((conversation) => conversation.conversation_id === sidebarMenu.id);
+              if (!item) return null;
+              return <>
+                <button type="button" role="menuitem" onClick={() => openRename({ kind: "conversation", id: item.conversation_id, title: item.display_title })}><PencilSimple size={16} />重命名对话</button>
+                {item.project_id ? (
+                  <button type="button" role="menuitem" onClick={() => void moveConversation(item.conversation_id, null)}><FolderOpen size={16} />移至未归属对话</button>
+                ) : currentProject ? (
+                  <button type="button" role="menuitem" onClick={() => void moveConversation(item.conversation_id, currentProject.project_id)}><FolderOpen size={16} />关联到当前项目</button>
+                ) : null}
+                <button type="button" role="menuitem" className="menu-danger" onClick={() => void archiveConversation(item.conversation_id)}><Archive size={16} />归档对话</button>
+              </>;
+            })()}
+            {sidebarMenu.kind === "task" && (() => {
+              const item = tasks.find((taskItem) => taskItem.thread_id === sidebarMenu.id);
+              if (!item) return null;
+              const running = !["REPORT", "FAILED", "PASSED", "BLOCKED", "CANCELLED", "UNVERIFIED"].includes(item.status);
+              return <>
+                <button type="button" role="menuitem" onClick={() => openRename({ kind: "task", id: item.thread_id, title: compactTaskLabel(item) })}><PencilSimple size={16} />重命名对话</button>
+                <button type="button" role="menuitem" className="menu-danger" disabled={running || Boolean(item.archived_at)} onClick={() => void archiveTaskById(item.thread_id)}><Archive size={16} />{running ? "运行中，暂不能归档" : "归档对话"}</button>
+              </>;
+            })()}
+          </section>
+        </>
+      )}
+      {renameTarget && (
+        <div className="rename-dialog-backdrop" role="presentation">
+          <section className="rename-dialog" role="dialog" aria-modal="true" aria-labelledby="rename-dialog-title">
+            <header><PencilSimple size={19} /><div><h2 id="rename-dialog-title">重命名{renameTarget.kind === "project" ? "项目" : "对话"}</h2><p>仅更新侧栏显示名称，不会修改文件、任务证据或 Git 历史。</p></div></header>
+            <input value={renameValue} maxLength={80} autoFocus aria-label="新名称" onChange={(event) => setRenameValue(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void submitRename(); }} />
+            <footer>
+              <button className="secondary-button" type="button" onClick={() => setRenameTarget(null)}>取消</button>
+              <button className="primary-button" type="button" disabled={!renameValue.trim()} onClick={() => void submitRename()}>保存</button>
+            </footer>
+          </section>
+        </div>
+      )}
 
       <section className="workbench">
         <header className="workspace-header">
           <div className="workspace-identity">
             <FolderOpen size={18} />
-            <strong title={currentProject?.display_name ?? "选择本地项目"}>{currentProject?.display_name ?? "选择本地项目"}</strong>
+            <strong title={currentProject?.display_name ?? "未关联项目"}>{currentProject?.display_name ?? "未关联项目"}</strong>
             {task && (
               <>
                 <span>/</span>
                 <small title={compactTaskLabel(task)}>{compactTaskLabel(task)}</small>
+              </>
+            )}
+            {conversation && (
+              <>
+                <span>/</span>
+                <small title={conversation.display_title}>{conversation.display_title}</small>
               </>
             )}
           </div>
@@ -2422,15 +2714,17 @@ export function App() {
                 {!task && (
                   <div className="new-task-state">
                     <p className="new-task-kicker">当前工作区</p>
-                    <h2>{operation === "research" ? "制定代码计划" : "准备开始代码任务"}</h2>
+                    <h2>{operation === "research" ? "先制定可信计划" : "明确目标，持续推进"}</h2>
                     <p>
                       {currentProject
                         ? currentProject.display_name + "  ·  " + projectStatusLabel
-                        : "选择一个本地文件夹后，RepoPilot 会自动添加项目并开始分析。"}
+                        : conversation
+                          ? "此对话暂未关联项目。可以先整理目标或计划；开始代码任务前请选择项目。"
+                          : "选择一个本地文件夹后，RepoPilot 会自动添加项目并开始分析。"}
                     </p>
                     {!currentProject && (
                       <button className="open-project-button" type="button" onClick={() => void chooseProjectDirectory()}>
-                        <FolderOpen size={17} />打开本地项目
+                        <FolderOpen size={17} />{conversation ? "选择关联项目" : "打开本地项目"}
                       </button>
                     )}
                     {projectReadinessItems.length > 0 && (
@@ -2469,7 +2763,7 @@ export function App() {
                       <header>
                         <strong>任务</strong>
                         <div className="task-metadata">
-                          <span>{activeTaskOperation === "research" ? "计划模式" : "修改代码"}</span>
+                          <span>{activeTaskOperation === "research" ? "计划模式" : "目标模式"}</span>
                           <span>{activeTaskMode === "safe-isolated" ? "安全隔离修复" : "完全本机控制"}</span>
                         </div>
                       </header>
@@ -2704,8 +2998,8 @@ export function App() {
                       </button>
                     )}
                     {!taskIsRunning && (
-                      <button className="primary-button" type="button" onClick={beginNewTask}>
-                        <Plus size={16} />新建任务
+                      <button className="primary-button" type="button" onClick={() => void beginNewConversation()}>
+                        <Plus size={16} />新建对话
                       </button>
                     )}
                   </div>
@@ -2741,15 +3035,10 @@ export function App() {
                         <span><b>确认完全本机访问</b>Agent 将直接在当前项目目录中执行已实现的高风险操作。</span>
                       </label>
                     )}
-                    {(documentPath || attachedDocuments.length > 0) && (
+                    {attachedDocuments.length > 0 && (
                       <div className="attachment-row">
                         <FileArrowUp size={16} />
-                        <span className="attachment-label">{documentPath || "已绑定研发文档"}</span>
-                        {documentPath && (
-                          <button type="button" onClick={() => void indexDocument(true)} disabled={documentBusy || !projectId || attachedDocumentIds.length >= 4}>
-                            {documentBusy ? "正在索引" : "加入上下文"}
-                          </button>
-                        )}
+                        <span className="attachment-label">已加入当前上下文</span>
                         {attachedDocuments.map((document) => (
                           <span className="attachment-chip" key={document.document_id}>
                             <FileCode size={14} />
@@ -2766,58 +3055,6 @@ export function App() {
                         ))}
                       </div>
                     )}
-                    {showDocumentPicker && (
-                      <section className="attachment-picker" aria-label="任务研发文档附件">
-                        <header>
-                          <div><strong>任务附件</strong><span>{attachedDocumentIds.length}/4</span></div>
-                          <button
-                            className="icon-button"
-                            type="button"
-                            title="关闭任务附件面板"
-                            aria-label="关闭任务附件面板"
-                            onClick={() => setShowDocumentPicker(false)}
-                          >
-                            <XCircle size={17} />
-                          </button>
-                        </header>
-                        <div className="attachment-document-list">
-                          {documents.length === 0 ? (
-                            <p>当前项目还没有已索引研发文档。</p>
-                          ) : documents.map((document) => (
-                            <label key={document.document_id}>
-                              <input
-                                type="checkbox"
-                                checked={attachedDocumentIds.includes(document.document_id)}
-                                onChange={(event) => toggleTaskDocument(document.document_id, event.target.checked)}
-                                disabled={!attachedDocumentIds.includes(document.document_id) && attachedDocumentIds.length >= 4}
-                              />
-                              <FileCode size={15} />
-                              <span>{document.display_name}</span>
-                              {attachedDocumentIds.includes(document.document_id) && <CheckCircle size={15} />}
-                            </label>
-                          ))}
-                        </div>
-                        <div className="attachment-import">
-                          <input
-                            value={documentPath}
-                            onChange={(event) => setDocumentPath(event.target.value)}
-                            placeholder="MD/TXT 本地路径"
-                            aria-label="研发文档本地路径"
-                          />
-                          <button className="icon-button" type="button" title="选择 MD 或 TXT 文档" onClick={() => void chooseDocument()}>
-                            <FolderOpen size={17} />
-                          </button>
-                          <button
-                            className="secondary-button"
-                            type="button"
-                            onClick={() => void indexDocument(true)}
-                            disabled={!projectId || !documentPath.trim() || documentBusy || attachedDocumentIds.length >= 4}
-                          >
-                            {documentBusy ? "导入中" : "导入并绑定"}
-                          </button>
-                        </div>
-                      </section>
-                    )}
                     <textarea
                       ref={taskDescriptionRef}
                       value={description}
@@ -2830,12 +3067,12 @@ export function App() {
                       }}
                       placeholder={operation === "research"
                         ? "描述要理解、定位或评估的代码问题"
-                        : "描述要完成的代码改动"}
+                        : "描述最终想实现的代码目标"}
                       aria-label="代码任务描述"
                     />
                     <div className="composer-toolbar">
                       <div className="composer-tools">
-                        <button className="icon-button" type="button" title="管理任务研发文档附件" onClick={() => setShowDocumentPicker((current) => !current)} disabled={!projectId}>
+                        <button className="icon-button" type="button" title="上传 MD 或 TXT 并直接加入当前上下文" onClick={() => void chooseDocument()} disabled={!projectId || documentBusy || attachedDocumentIds.length >= 4}>
                           <Paperclip size={19} />
                         </button>
                         <div className="operation-control" role="group" aria-label="任务类型">
@@ -2843,19 +3080,19 @@ export function App() {
                             className={operation === "change" ? "active" : ""}
                             type="button"
                             disabled={!allowedOperations.includes("change")}
-                            onClick={() => setOperation("change")}
-                            aria-label="修改代码"
+                            onClick={() => selectOperation("change")}
+                            aria-label="目标模式"
                             aria-pressed={operation === "change"}
-                            title="生成计划，经审批后修改代码并运行验证"
+                            title="围绕一个代码目标完成计划、受控修改和 Maven 验证"
                           >
-                            <FileCode size={15} />
-                            <span>修改代码</span>
+                            <Target size={15} />
+                            <span>目标模式</span>
                           </button>
                           <button
                             className={operation === "research" ? "active" : ""}
                             type="button"
                             disabled={!allowedOperations.includes("research")}
-                            onClick={() => setOperation("research")}
+                            onClick={() => selectOperation("research")}
                             aria-label="计划模式"
                             aria-pressed={operation === "research"}
                             title="只研究代码并输出证据化计划，不写入文件、不运行 Maven"
@@ -2877,7 +3114,7 @@ export function App() {
                               const nextAllowed = readiness?.allowed_operations;
                               setMode(nextMode);
                               if (nextAllowed?.length && !nextAllowed.includes(operation)) {
-                                setOperation(nextAllowed[0]);
+                                selectOperation(nextAllowed[0]);
                               }
                               if (nextMode === "safe-isolated") setConfirmed(false);
                             }}
@@ -2894,7 +3131,7 @@ export function App() {
                       </button>
                     </div>
                   </div>
-                  <p className="composer-caption">{currentProject ? projectStatusLabel : "选择项目后即可创建任务"}</p>
+                  <p className="composer-caption">{currentProject ? projectStatusLabel : conversation ? "未关联项目的对话不会执行代码；选择项目后才能启动 Agent。" : "选择项目后即可创建任务"}</p>
                 </>
               )}
             </div>
@@ -3206,10 +3443,8 @@ export function App() {
               </div>
               <div className="settings-content">
                 <div className="inline-form">
-                  <input value={documentPath} onChange={(event) => setDocumentPath(event.target.value)} placeholder="本地文档路径" />
-                  <button className="icon-button" type="button" title="选择文档" onClick={() => void chooseDocument()}><FolderOpen size={17} /></button>
-                  <button className="secondary-button" type="button" onClick={() => void indexDocument(false)} disabled={!projectId || !documentPath.trim() || documentBusy}>
-                    {documentBusy ? "索引中" : "添加"}
+                  <button className="secondary-button" type="button" onClick={() => void chooseDocument()} disabled={!projectId || documentBusy}>
+                    <FileArrowUp size={16} />{documentBusy ? "上传并索引中" : "上传文档"}
                   </button>
                 </div>
                 <div className="document-list">

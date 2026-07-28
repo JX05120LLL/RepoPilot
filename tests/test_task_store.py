@@ -153,6 +153,23 @@ class TaskStoreTests(unittest.TestCase):
             finally:
                 reopened.close()
 
+    def test_rename_updates_display_title_without_touching_task_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            store = TaskStore(root / "state.sqlite")
+            try:
+                self._create_task(store, root, "thread-rename")
+                renamed = store.rename("thread-rename", "修复订单参数校验")
+                self.assertEqual("修复订单参数校验", renamed.display_title)
+                self.assertEqual("thread-rename", renamed.thread_id)
+                self.assertEqual("task-thread-rename", renamed.task_id)
+                self.assertIn(
+                    "TASK_RENAMED",
+                    [event.event_type for event in store.events_after("thread-rename", 0)],
+                )
+            finally:
+                store.close()
+
     def test_runtime_failure_keeps_strong_status_and_recovers_missing_title(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

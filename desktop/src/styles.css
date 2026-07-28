@@ -5161,3 +5161,260 @@ textarea::placeholder {
     animation-iteration-count: 1 !important;
   }
 }
+
+/* 会话树与上下文菜单使用扁平层级，避免侧栏堆叠成卡片。 */
+.project-row,
+.tree-row,
+.recent-task-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  padding: 0;
+  border-radius: 6px;
+}
+
+.project-row:hover,
+.project-row.selected,
+.tree-row:hover,
+.tree-row.active,
+.recent-task-row:hover,
+.recent-task-row.active {
+  background: #e4e8ea;
+}
+
+.project-select,
+.tree-row > button:first-child,
+.recent-task-row > button:first-child {
+  display: grid;
+  align-items: center;
+  min-width: 0;
+  flex: 1 1 auto;
+  width: auto;
+  min-height: 36px;
+  padding: 7px 8px;
+  color: #4a535c;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  text-align: left;
+}
+
+.project-select {
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  gap: 7px;
+}
+
+.project-select span,
+.tree-row > button:first-child span,
+.recent-task-row > button:first-child strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-select span {
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.project-select small {
+  color: #77818b;
+  font: 9px var(--mono);
+}
+
+.tree-row > button:first-child {
+  grid-template-columns: 17px minmax(0, 1fr) auto;
+  gap: 7px;
+  color: #626d78;
+}
+
+.tree-row > button:first-child span {
+  font-size: 12px;
+}
+
+.tree-row > button:first-child small {
+  color: #8a949d;
+  font: 9px var(--mono);
+}
+
+.recent-task-row > button:first-child {
+  grid-template-columns: 17px minmax(0, 1fr);
+  gap: 8px;
+  min-height: 43px;
+}
+
+.recent-task-row > button:first-child > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.tree-menu-button {
+  display: inline-grid;
+  flex: 0 0 28px;
+  place-items: center;
+  width: 28px;
+  min-height: 28px;
+  margin-right: 3px;
+  padding: 0;
+  color: #7b8690;
+  background: transparent;
+  border: 0;
+  border-radius: 5px;
+  opacity: 0;
+}
+
+.project-row:hover .tree-menu-button,
+.project-row:focus-within .tree-menu-button,
+.tree-row:hover .tree-menu-button,
+.tree-row:focus-within .tree-menu-button,
+.recent-task-row:hover .tree-menu-button,
+.recent-task-row:focus-within .tree-menu-button {
+  opacity: 1;
+}
+
+.tree-menu-button:hover:not(:disabled) {
+  color: #263442;
+  background: #d5dcdf;
+}
+
+.project-task-list {
+  gap: 1px;
+  margin: 3px 0 8px 30px;
+  padding: 2px 0 2px 7px;
+  border-left-color: #d4dade;
+}
+
+.project-task-list > p {
+  margin: 6px 4px;
+}
+
+.sidebar-context-menu {
+  position: fixed;
+  z-index: 80;
+  display: grid;
+  min-width: 208px;
+  padding: 5px;
+  background: #fff;
+  border: 1px solid #d8dfe3;
+  border-radius: 7px;
+  box-shadow: 0 12px 30px rgba(27, 39, 48, 0.14);
+}
+
+.sidebar-context-menu button {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 6px 8px;
+  color: #34414d;
+  background: transparent;
+  border: 0;
+  border-radius: 5px;
+  font-size: 12px;
+  text-align: left;
+}
+
+.sidebar-context-menu button:hover:not(:disabled) {
+  background: #eef2f4;
+}
+
+.sidebar-context-menu .menu-danger {
+  color: #a93e35;
+}
+
+.sidebar-menu-backdrop {
+  position: fixed;
+  z-index: 79;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  background: transparent;
+  border: 0;
+}
+
+.rename-dialog-backdrop {
+  position: fixed;
+  z-index: 90;
+  display: grid;
+  place-items: center;
+  inset: 0;
+  padding: 20px;
+  background: rgba(25, 34, 41, 0.18);
+}
+
+.rename-dialog {
+  display: grid;
+  width: min(420px, 100%);
+  gap: 18px;
+  padding: 20px;
+  background: #fff;
+  border: 1px solid #d5dde2;
+  border-radius: 8px;
+  box-shadow: 0 20px 55px rgba(24, 35, 44, 0.18);
+}
+
+.rename-dialog header {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  color: #263442;
+}
+
+.rename-dialog h2,
+.rename-dialog p {
+  margin: 0;
+}
+
+.rename-dialog h2 {
+  font-size: 15px;
+}
+
+.rename-dialog p {
+  margin-top: 5px;
+  color: #74808b;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.rename-dialog input {
+  min-height: 38px;
+  padding: 8px 10px;
+  background: #fbfcfd;
+  border: 1px solid #cdd6dc;
+  border-radius: 5px;
+}
+
+.rename-dialog footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.composer {
+  border-radius: 7px;
+  box-shadow: 0 4px 14px rgba(32, 45, 55, 0.06);
+}
+
+.operation-control {
+  background: #f1f3f5;
+  border-color: #dce2e6;
+  border-radius: 6px;
+}
+
+.operation-control button {
+  border-radius: 4px;
+}
+
+@media (max-width: 860px) {
+  .tree-menu-button {
+    opacity: 1;
+  }
+
+  .sidebar-context-menu {
+    min-width: 196px;
+  }
+}

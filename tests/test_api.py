@@ -1011,3 +1011,65 @@ class ApiTests(unittest.TestCase):
                     self.assertNotIn("不得返回给客户端的内部错误", json.dumps(snapshot, ensure_ascii=False))
             finally:
                 registry.close()
+
+    def test_api_manages_project_conversation_and_task_titles_without_deleting_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repository = root / "repo"
+            repository.mkdir()
+            _initialize_git_repository(repository)
+            registry = ProjectRegistry(root / "state.sqlite")
+            project = registry.add(repository, "旧项目名")
+            try:
+                with TestClient(create_app(FakeRunner(delay=0), registry, root / "runs")) as client:
+                    renamed_project = client.patch(
+                        f"/api/projects/{project.project_id}",
+                        json={"display_name": "订单服务"},
+                    )
+                    self.assertEqual(200, renamed_project.status_code)
+                    self.assertEqual("订单服务", renamed_project.json()["project"]["display_name"])
+
+                    draft = client.post(
+                        "/api/conversations",
+                        json={"display_title": "先讨论接口边界", "mode": "plan"},
+                    )
+                    self.assertEqual(200, draft.status_code)
+                    conversation_id = draft.json()["conversation"]["conversation_id"]
+                    self.assertIsNone(draft.json()["conversation"]["project_id"])
+
+                    attached = client.patch(
+                        f"/api/conversations/{conversation_id}",
+                        json={"project_id": project.project_id, "display_title": "订单接口计划"},
+                    )
+                    self.assertEqual(200, attached.status_code)
+                    self.assertEqual(project.project_id, attached.json()["conversation"]["project_id"])
+
+                    archived_conversation = client.post(f"/api/conversations/{conversation_id}/archive")
+                    self.assertEqual(200, archived_conversation.status_code)
+                    self.assertEqual([], client.get("/api/conversations").json()["conversations"])
+                    self.assertEqual(1, len(client.get("/api/conversations?include_archived=true").json()["conversations"]))
+
+                    created = client.post(
+                        "/api/tasks",
+                        json={"project_id": project.project_id, "description": "初始任务标题", "thread_id": "thread-1"},
+                    )
+                    self.assertEqual(200, created.status_code)
+                    time.sleep(0.05)
+                    renamed_task = client.patch(
+                        "/api/tasks/thread-1",
+                        json={"display_title": "修复订单参数"},
+                    )
+                    self.assertEqual(200, renamed_task.status_code)
+                    self.assertEqual("修复订单参数", renamed_task.json()["task"]["display_title"])
+
+                    archived_project = client.post(f"/api/projects/{project.project_id}/archive")
+                    self.assertEqual(200, archived_project.status_code)
+                    self.assertEqual([], client.get("/api/projects").json()["projects"])
+                    self.assertEqual(1, len(client.get("/api/projects?include_archived=true").json()["projects"]))
+                    blocked = client.post(
+                        "/api/conversations",
+                        json={"project_id": project.project_id, "display_title": "不能关联"},
+                    )
+                    self.assertEqual(409, blocked.status_code)
+            finally:
+                registry.close()

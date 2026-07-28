@@ -179,6 +179,27 @@ class ProjectRegistryTests(unittest.TestCase):
             self.assertTrue(registry.list()[0].is_git_repository)
             registry.close()
 
+    def test_project_can_be_renamed_archived_and_restored_without_removing_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repository = create_repository(root)
+            registry = ProjectRegistry(root / "state.sqlite")
+            try:
+                project = registry.add(repository)
+                renamed = registry.rename(project.project_id, "订单服务")
+                self.assertEqual("订单服务", renamed.display_name)
+
+                archived = registry.archive(project.project_id)
+                self.assertIsNotNone(archived.archived_at)
+                self.assertEqual((), registry.list())
+                self.assertEqual(1, len(registry.list(include_archived=True)))
+
+                restored = registry.restore(project.project_id)
+                self.assertIsNone(restored.archived_at)
+                self.assertEqual("订单服务", registry.list()[0].display_name)
+            finally:
+                registry.close()
+
     def test_project_doctor_reports_mode_specific_readiness_without_creating_a_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field, SecretStr
 from repopilot_guard import __version__
 from repopilot_guard.capabilities import CapabilityDescriptor, CapabilityPolicy
 from repopilot_guard.config import ComponentCheck, RuntimeConfigurationError, RuntimeConfigurationManager
+from repopilot_guard.conversation_store import ConversationStore
 from repopilot_guard.context import ManagedDocumentStore
 from repopilot_guard.document_indexing import index_uploaded_document
 from repopilot_guard.graph import GraphRunner, research_capability_registry
@@ -87,6 +88,26 @@ class PluginEnabledBody(BaseModel):
 
 class DocumentIndexBody(BaseModel):
     file: str = Field(min_length=1, max_length=1024)
+
+
+class ProjectRenameBody(BaseModel):
+    display_name: str = Field(min_length=1, max_length=80)
+
+
+class ConversationCreateBody(BaseModel):
+    project_id: str | None = Field(default=None, max_length=128)
+    display_title: str | None = Field(default=None, max_length=80)
+    mode: str = Field(default="goal", pattern="^(goal|plan)$")
+
+
+class ConversationUpdateBody(BaseModel):
+    project_id: str | None = Field(default=None, max_length=128)
+    display_title: str | None = Field(default=None, max_length=80)
+    mode: str | None = Field(default=None, pattern="^(goal|plan)$")
+
+
+class TaskRenameBody(BaseModel):
+    display_title: str = Field(min_length=1, max_length=80)
 
 
 class RuntimeConfigurationBody(BaseModel):
@@ -176,14 +197,17 @@ def create_app(
 
     app = FastAPI(title="RepoPilot Guard", version=__version__)
     store = task_store or TaskStore(registry.database_path)
+    conversations = ConversationStore(registry.database_path)
     plugins = plugin_registry or PluginRegistry(registry.database_path)
     app.state.task_store = store
+    app.state.conversation_store = conversations
     create_mcp_runtime = mcp_runtime_factory or (lambda configuration, root: McpRuntime(configuration, workspace_root=root))
     index_document = document_indexer or (lambda project_id, source: index_uploaded_document(registry, project_id, source))
     check_runtime = runtime_health_checks or (lambda: ())
     runtime_configuration = runtime_configuration_manager or RuntimeConfigurationManager()
     # 当前 FastAPI/Starlette 版本通过 Router 生命周期关闭 SQLite 连接。
     app.router.on_shutdown.append(store.close)
+    app.router.on_shutdown.append(conversations.close)
     if plugin_registry is None:
         app.router.on_shutdown.append(plugins.close)
     # 开发期前端运行在 Vite 的独立本机端口，生产权限仍由 Python 后端裁决。
@@ -191,7 +215,7 @@ def create_app(
         CORSMiddleware,
         allow_origins=_desktop_allowed_origins(),
         allow_credentials=False,
-        allow_methods=["GET", "POST", "DELETE"],
+        allow_methods=["GET", "POST", "PATCH", "DELETE"],
         allow_headers=["Content-Type"],
     )
 
@@ -236,8 +260,8 @@ def create_app(
             raise HTTPException(status, {"code": code, "message": "运行配置未保存。"}) from error
 
     @app.get("/api/projects")
-    def list_projects() -> dict[str, object]:
-        return {"projects": [item.to_dict() for item in registry.list()]}
+    def list_projects(include_archived: bool = False) -> dict[str, object]:
+        return {"projects": [item.to_dict() for item in registry.list(include_archived=include_archived)]}
 
     @app.post("/api/projects")
     def add_project(path: str, name: str | None = None) -> dict[str, object]:
@@ -251,6 +275,90 @@ def create_app(
         if not registry.remove(project_id):
             raise HTTPException(404, "PROJECT_NOT_FOUND")
         return {"status": "READY"}
+
+    @app.patch("/api/projects/{project_id}")
+    def rename_project(project_id: str, body: ProjectRenameBody) -> dict[str, object]:
+        try:
+            return {"project": registry.rename(project_id, body.display_name).to_dict()}
+        except ValueError as error:
+            raise HTTPException(400 if str(error) == "PROJECT_DISPLAY_NAME_INVALID" else 404, str(error)) from error
+
+    @app.post("/api/projects/{project_id}/archive")
+    def archive_project(project_id: str) -> dict[str, object]:
+        try:
+            return {"project": registry.archive(project_id).to_dict()}
+        except ValueError as error:
+            raise HTTPException(404, str(error)) from error
+
+    @app.post("/api/projects/{project_id}/restore")
+    def restore_project(project_id: str) -> dict[str, object]:
+        try:
+            return {"project": registry.restore(project_id).to_dict()}
+        except ValueError as error:
+            raise HTTPException(404, str(error)) from error
+
+    @app.get("/api/conversations")
+    def list_conversations(include_archived: bool = False) -> dict[str, object]:
+        return {"conversations": [item.to_dict() for item in conversations.list(include_archived=include_archived)]}
+
+    @app.post("/api/conversations")
+    def create_conversation(body: ConversationCreateBody) -> dict[str, object]:
+        if body.project_id:
+            try:
+                project = registry.get(body.project_id)
+            except ValueError as error:
+                raise HTTPException(404, "PROJECT_NOT_FOUND") from error
+            if project.archived_at:
+                raise HTTPException(409, "PROJECT_ARCHIVED")
+        try:
+            return {
+                "conversation": conversations.create(
+                    project_id=body.project_id,
+                    display_title=body.display_title,
+                    mode=body.mode,
+                ).to_dict()
+            }
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
+
+    @app.patch("/api/conversations/{conversation_id}")
+    def update_conversation(conversation_id: str, body: ConversationUpdateBody) -> dict[str, object]:
+        project_id: str | None | object = ...
+        if "project_id" in body.model_fields_set:
+            project_id = body.project_id
+            if project_id:
+                try:
+                    project = registry.get(project_id)
+                except ValueError as error:
+                    raise HTTPException(404, "PROJECT_NOT_FOUND") from error
+                if project.archived_at:
+                    raise HTTPException(409, "PROJECT_ARCHIVED")
+        try:
+            return {
+                "conversation": conversations.update(
+                    conversation_id,
+                    display_title=body.display_title if "display_title" in body.model_fields_set else None,
+                    project_id=project_id,
+                    mode=body.mode,
+                ).to_dict()
+            }
+        except ValueError as error:
+            status = 404 if str(error) == "CONVERSATION_NOT_FOUND" else 400
+            raise HTTPException(status, str(error)) from error
+
+    @app.post("/api/conversations/{conversation_id}/archive")
+    def archive_conversation(conversation_id: str) -> dict[str, object]:
+        try:
+            return {"conversation": conversations.archive(conversation_id).to_dict()}
+        except ValueError as error:
+            raise HTTPException(404, str(error)) from error
+
+    @app.post("/api/conversations/{conversation_id}/restore")
+    def restore_conversation(conversation_id: str) -> dict[str, object]:
+        try:
+            return {"conversation": conversations.restore(conversation_id).to_dict()}
+        except ValueError as error:
+            raise HTTPException(404, str(error)) from error
 
     @app.get("/api/projects/{project_id}/diagnostics")
     def project_diagnostics(project_id: str) -> dict[str, object]:
@@ -505,6 +613,14 @@ def create_app(
             return {"task": store.archive(thread_id).to_dict()}
         except ValueError as error:
             raise HTTPException(409, str(error)) from error
+
+    @app.patch("/api/tasks/{thread_id}")
+    def rename_task(thread_id: str, body: TaskRenameBody) -> dict[str, object]:
+        try:
+            return {"task": store.rename(thread_id, body.display_title).to_dict()}
+        except ValueError as error:
+            status = 404 if str(error) == "TASK_NOT_FOUND" else 400
+            raise HTTPException(status, str(error)) from error
 
     @app.get("/api/tasks/{thread_id}/events")
     def events(

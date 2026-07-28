@@ -407,6 +407,27 @@ class TaskStore:
             self._connection.commit()
             return self._get_locked(thread_id)
 
+    def rename(self, thread_id: str, display_title: str) -> StoredTask:
+        """更新侧栏会话标题，同时保留原始任务描述、证据和 checkpoint。"""
+
+        title = _normalize_task_title(display_title)
+        if not title:
+            raise ValueError("TASK_DISPLAY_TITLE_INVALID")
+        with self._lock:
+            task = self._get_locked(thread_id)
+            now = self._now()
+            self._connection.execute(
+                "UPDATE tasks SET display_title = ?, updated_at = ? WHERE thread_id = ?",
+                (title, now, thread_id),
+            )
+            self._append_event_locked(
+                thread_id,
+                "TASK_RENAMED",
+                {"status": task.status},
+            )
+            self._connection.commit()
+            return self._get_locked(thread_id)
+
     def sync_graph_result(self, result: dict[str, object], *, execution_finished: bool = True) -> StoredTask:
         """将 checkpoint 快照投影为任务索引和只含摘要的事件流。"""
 

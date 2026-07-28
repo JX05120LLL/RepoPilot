@@ -19,6 +19,7 @@ class ProjectRecord:
     is_git_repository: bool
     created_at: str
     last_used_at: str
+    archived_at: str | None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -28,6 +29,7 @@ class ProjectRecord:
             "is_git_repository": self.is_git_repository,
             "created_at": self.created_at,
             "last_used_at": self.last_used_at,
+            "archived_at": self.archived_at,
         }
 
 
@@ -53,6 +55,8 @@ class ProjectRegistry:
             "SELECT * FROM projects WHERE root_path = ?", (str(root),)
         ).fetchone()
         if existing:
+            if existing["archived_at"]:
+                self.restore(existing["project_id"])
             self._touch(existing["project_id"])
             return self.get(existing["project_id"])
 
@@ -74,14 +78,58 @@ class ProjectRegistry:
             raise ValueError("PROJECT_NOT_FOUND")
         return self._refresh_git_state(self._record(row))
 
-    def list(self) -> tuple[ProjectRecord, ...]:
-        rows = self._connection.execute("SELECT * FROM projects ORDER BY last_used_at DESC, display_name ASC").fetchall()
+    def list(self, *, include_archived: bool = False) -> tuple[ProjectRecord, ...]:
+        query = "SELECT * FROM projects"
+        if not include_archived:
+            query += " WHERE archived_at IS NULL"
+        query += " ORDER BY last_used_at DESC, display_name ASC"
+        rows = self._connection.execute(query).fetchall()
         return tuple(self._refresh_git_state(self._record(row)) for row in rows)
 
     def remove(self, project_id: str) -> bool:
         cursor = self._connection.execute("DELETE FROM projects WHERE project_id = ?", (project_id,))
         self._connection.commit()
         return cursor.rowcount == 1
+
+    def rename(self, project_id: str, display_name: str) -> ProjectRecord:
+        """仅修改本地展示名称，不影响项目路径、Git 或关联任务。"""
+
+        name = self._normalize_display_name(display_name)
+        if not self._connection.execute(
+            "SELECT 1 FROM projects WHERE project_id = ?", (project_id,)
+        ).fetchone():
+            raise ValueError("PROJECT_NOT_FOUND")
+        self._connection.execute(
+            "UPDATE projects SET display_name = ?, last_used_at = ? WHERE project_id = ?",
+            (name, self._now(), project_id),
+        )
+        self._connection.commit()
+        return self.get(project_id)
+
+    def archive(self, project_id: str) -> ProjectRecord:
+        """归档只从活动项目树隐藏项目，绝不删除目录、任务或向量数据。"""
+
+        record = self.get(project_id)
+        if record.archived_at:
+            return record
+        now = self._now()
+        self._connection.execute(
+            "UPDATE projects SET archived_at = ?, last_used_at = ? WHERE project_id = ?",
+            (now, now, project_id),
+        )
+        self._connection.commit()
+        return self.get(project_id)
+
+    def restore(self, project_id: str) -> ProjectRecord:
+        record = self.get(project_id)
+        if not record.archived_at:
+            return record
+        self._connection.execute(
+            "UPDATE projects SET archived_at = NULL, last_used_at = ? WHERE project_id = ?",
+            (self._now(), project_id),
+        )
+        self._connection.commit()
+        return self.get(project_id)
 
     def touch(self, project_id: str) -> ProjectRecord:
         self._touch(project_id)
@@ -131,7 +179,8 @@ class ProjectRegistry:
                 root_path TEXT NOT NULL UNIQUE,
                 is_git_repository INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
-                last_used_at TEXT NOT NULL
+                last_used_at TEXT NOT NULL,
+                archived_at TEXT
             );
             CREATE TABLE IF NOT EXISTS task_workspaces (
                 task_id TEXT PRIMARY KEY,
@@ -144,7 +193,16 @@ class ProjectRegistry:
             );
             """
         )
+        self._ensure_column("projects", "archived_at", "TEXT")
         self._connection.commit()
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        columns = {
+            row["name"]
+            for row in self._connection.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if column not in columns:
+            self._connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def _touch(self, project_id: str) -> None:
         self._connection.execute("UPDATE projects SET last_used_at = ? WHERE project_id = ?", (self._now(), project_id))
@@ -172,11 +230,19 @@ class ProjectRegistry:
             is_git_repository=current_state,
             created_at=record.created_at,
             last_used_at=record.last_used_at,
+            archived_at=record.archived_at,
         )
 
     @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _normalize_display_name(value: str) -> str:
+        name = " ".join(value.split())
+        if not 1 <= len(name) <= 80:
+            raise ValueError("PROJECT_DISPLAY_NAME_INVALID")
+        return name
 
     @staticmethod
     def _record(row: sqlite3.Row) -> ProjectRecord:
@@ -187,4 +253,5 @@ class ProjectRegistry:
             is_git_repository=bool(row["is_git_repository"]),
             created_at=row["created_at"],
             last_used_at=row["last_used_at"],
+            archived_at=row["archived_at"],
         )
