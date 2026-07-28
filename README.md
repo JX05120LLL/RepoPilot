@@ -521,6 +521,21 @@ REPOPILOT_EMBEDDING_DIMENSIONS=<实际维度>
 REPOPILOT_QDRANT_URL=http://127.0.0.1:6333
 ```
 
+### 当前开发配置示例（不含密钥）
+
+本仓库开发环境曾使用以下 OpenAI-compatible 配置。它们只用于说明端点、模型名和向量维度，`API Key` 必须由每位使用者在本机自行填写，不能复制到 README、Git、截图或任务描述中：
+
+| 配置项 | 当前开发示例 | 密钥字段 |
+|---|---|---|
+| Chat Base URL | `https://api.moonshot.cn/v1` | `REPOPILOT_CHAT_API_KEY` |
+| Chat Model | `deepseek-v4-pro` | 使用上方 Chat Key |
+| Embedding Base URL | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `REPOPILOT_EMBEDDING_API_KEY` |
+| Embedding Model | `text-embedding-v4` | 使用上方 Embedding Key |
+| Embedding Dimensions | `1024` | 不需要 Key |
+| Qdrant URL | `http://127.0.0.1:6333` | 不需要 Key |
+
+源码开发时，配置文件是仓库根目录的 `.env`；已安装桌面应用使用独立文件 `%APPDATA%\com.repopilot.desktop\settings.env`，两者不会自动同步。当前安装版默认只有 Qdrant 地址，需在“设置与运行配置”分别填写 Chat 和 Embedding 的地址、模型、Key、维度后重启应用。界面只会显示 Key 是否已配置，绝不会回显其内容。
+
 该文件只保存在当前用户目录，不会写入安装包、Git、任务证据或 API 响应。系统环境变量优先于 `settings.env`。从源码使用 CLI 时，可通过下列命令查看路径或显式创建同一份无密钥模板；`init-config` 绝不覆盖已有文件：
 
 ```powershell
