@@ -521,20 +521,21 @@ REPOPILOT_EMBEDDING_DIMENSIONS=<实际维度>
 REPOPILOT_QDRANT_URL=http://127.0.0.1:6333
 ```
 
-### 当前开发配置示例（不含密钥）
+### 当前本机有效配置（不含密钥）
 
-本仓库开发环境曾使用以下 OpenAI-compatible 配置。它们只用于说明端点、模型名和向量维度，`API Key` 必须由每位使用者在本机自行填写，不能复制到 README、Git、截图或任务描述中：
+RepoPilot 当前本机运行时使用 OpenAI-compatible 接口。以下是本机实际生效的端点、模型名和向量维度，`API Key` 仅以“已配置/未配置”状态校验，绝不会出现在 README、Git、界面回显、截图或任务证据中：
 
-| 配置项 | 当前开发示例 | 密钥字段 |
-|---|---|---|
-| Chat Base URL | `https://api.moonshot.cn/v1` | `REPOPILOT_CHAT_API_KEY` |
-| Chat Model | `deepseek-v4-pro` | 使用上方 Chat Key |
-| Embedding Base URL | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `REPOPILOT_EMBEDDING_API_KEY` |
-| Embedding Model | `text-embedding-v4` | 使用上方 Embedding Key |
-| Embedding Dimensions | `1024` | 不需要 Key |
-| Qdrant URL | `http://127.0.0.1:6333` | 不需要 Key |
+| 用途 | Base URL | 模型 | Key 配置字段 |
+|---|---|---|---|
+| Chat / Coding Agent | `https://api.deepseek.com` | `deepseek-v4-pro` | `REPOPILOT_CHAT_API_KEY` |
+| Embedding / RAG | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `text-embedding-v4`，`1024` 维 | `REPOPILOT_EMBEDDING_API_KEY` |
+| Qdrant / 向量库 | `http://127.0.0.1:6333` | 不适用 | 不需要 Key |
 
-源码开发时，配置文件是仓库根目录的 `.env`；已安装桌面应用使用独立文件 `%APPDATA%\com.repopilot.desktop\settings.env`，两者不会自动同步。当前安装版默认只有 Qdrant 地址，需在“设置与运行配置”分别填写 Chat 和 Embedding 的地址、模型、Key、维度后重启应用。界面只会显示 Key 是否已配置，绝不会回显其内容。
+开发源码时，默认配置文件是仓库根目录的 `.env`；已安装桌面应用使用独立文件 `%APPDATA%\com.repopilot.desktop\settings.env`，两者不会自动同步。系统环境变量优先级高于这两个文件，因此排查“界面填写后仍然调用旧模型”时，应先检查是否存在同名 `REPOPILOT_*` 系统环境变量。
+
+桌面端可在“设置与运行配置”分别填写 Chat 和 Embedding 的地址、模型、Key 与维度，保存后重启应用。界面只显示 Key 是否已配置。源码开发也可复制 `.env.example` 为 `.env` 后填写同名字段；`.env` 已被 Git 忽略，不能提交。
+
+> 注意：Chat 的 Base URL、模型名和 API Key 必须来自同一家已开通该模型的服务商。例如 `https://api.deepseek.com` 应搭配 DeepSeek 的模型名与 `REPOPILOT_CHAT_API_KEY`；不要把 Moonshot 地址与 DeepSeek 模型名混用。Embedding 可独立使用百炼的 `text-embedding-v4`，但其 API Key 必须填写到 `REPOPILOT_EMBEDDING_API_KEY`，不能复用 Chat Key。
 
 该文件只保存在当前用户目录，不会写入安装包、Git、任务证据或 API 响应。系统环境变量优先于 `settings.env`。从源码使用 CLI 时，可通过下列命令查看路径或显式创建同一份无密钥模板；`init-config` 绝不覆盖已有文件：
 
