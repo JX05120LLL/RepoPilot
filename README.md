@@ -6,7 +6,7 @@ RepoPilot 面向已有代码仓库的维护场景：用户选择一个本地项�
 
 项目的产品体验参考 [OpenAI Codex](https://openai.com/codex/) 与 [xAI grok-build](https://github.com/xai-org/grok-build) 的项目工作区、Agent 工作流和工具扩展思路，但 RepoPilot **不是对上述项目的源码二次开发**。当前代码从零实现，重点探索 Java/Spring Boot 仓库维护中的安全边界、证据闭环、RAG、Skills、MCP 和本地桌面交互。
 
-当前候选版本：`0.1.17 / Pre-Alpha`。第一版 MVP 的后端闭环已经跑通；Windows x64 release 与 NSIS 安装包已成功构建，并完成隔离目录中的安装、启动、sidecar 退出和卸载烟雾测试。桌面端采用 Windows GUI 子系统、无控制台的 Python sidecar，以及无窗口运行的 Git/Maven 后台进程，已安装应用在启动和执行任务时不会额外弹出命令行窗口。当前版本支持普通对话的 SSE 流式输出，并让“对话 / 分析代码 / 修改代码”共享同一会话上下文；只读工具研究、写入审批与验证过程默认折叠，主界面优先展示结果。当前代码版本的 15 项端到端评测已一次性执行并全部符合预期，升级迁移等交付验收仍在进行，尚不建议用于生产仓库。
+当前候选版本：`0.1.18 / Pre-Alpha`。第一版 MVP 的后端闭环已经跑通；Windows x64 release 与 NSIS 安装包已成功构建，并完成隔离目录中的安装、启动、sidecar 退出和卸载烟雾测试。桌面端采用 Windows GUI 子系统、无控制台的 Python sidecar，以及无窗口运行的 Git/Maven 后台进程，已安装应用在启动和执行任务时不会额外弹出命令行窗口。当前版本支持普通对话的 SSE 流式输出，并让“对话 / 分析代码 / 修改代码”共享同一会话上下文；只读工具研究、写入审批与验证过程默认折叠，主界面优先展示结果。当前代码版本的 15 项端到端评测已一次性执行并全部符合预期，升级迁移等交付验收仍在进行，尚不建议用于生产仓库。
 
 ## 目录
 
@@ -512,6 +512,8 @@ Tauri 会优先复用已运行的本机 API；没有 API 时，开发模式会�
 ### 原生安装包状态
 
 Tauri 工程、图标、后端 sidecar 构建脚本和环境诊断已经具备。当前已成功生成 Windows x64 NSIS 安装包，并在隔离安装目录验证安装、首次启动、回环 API、sidecar 进程树回收和静默卸载；关闭主窗口后，8765 端口会被释放。除 Python sidecar 外，Git、Worktree、Maven 与桌面诊断命令在 Windows 上也统一以隐藏窗口方式启动，避免用户发送消息或执行任务时出现控制台闪烁。正式交付仍需验证版本升级、应用数据目录迁移和多次启动回归，不能只以 WebView 或编译成功作为验收依据。
+
+最新 Windows x64 安装包从 [GitHub Releases](https://github.com/JX05120LLL/RepoPilot/releases/latest) 下载。安装前请同时核对发布页提供的 SHA-256；当前 Pre-Alpha 安装包尚未配置 Windows 代码签名。
 
 安装包与 CLI 使用同一稳定数据目录 `APPDATA\\com.repopilot.desktop`。需要在升级或测试时固定到其他位置，可在启动前设置绝对路径环境变量 `REPOPILOT_DESKTOP_DATA_DIR`；相对路径会被桌面端拒绝并回退默认目录。桌面端同一用户只允许一个实例，重复启动会聚焦现有窗口，避免两个窗口争抢同一个 sidecar。
 
