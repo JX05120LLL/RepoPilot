@@ -204,6 +204,7 @@ def create_app(
     runtime_health_checks: Callable[[], tuple[ComponentCheck, ...]] | None = None,
     runtime_configuration_manager: RuntimeConfigurationManager | None = None,
     conversation_reply: Callable[[str, str, str | None], str] | None = None,
+    conversation_reply_stream: Callable[[str, str, str | None], Iterator[str]] | None = None,
 ) -> FastAPI:
     """创建 API；调用者负责复用 SQLite graph runner 与项目注册表。"""
 
@@ -432,6 +433,81 @@ def create_app(
             "message": response.to_dict(),
             "context": conversations.context_for_next_task(conversation_id).to_dict(),
         }
+
+    @app.post("/api/conversations/{conversation_id}/chat/stream")
+    def stream_chat_in_conversation(
+        conversation_id: str,
+        body: ConversationChatBody,
+    ) -> StreamingResponse:
+        """以 SSE 输出普通对话增量，完整回复只在正常结束后写入会话历史。"""
+
+        try:
+            conversation = conversations.get(conversation_id)
+        except ValueError as error:
+            raise HTTPException(404, "CONVERSATION_NOT_FOUND") from error
+        if conversation.archived_at:
+            raise HTTPException(409, "CONVERSATION_ARCHIVED")
+        if any(item.status not in _TERMINAL_TASK_STATUSES for item in store.list_for_conversation(conversation_id)):
+            raise HTTPException(409, "CONVERSATION_TASK_RUNNING")
+
+        project_name: str | None = None
+        if conversation.project_id:
+            try:
+                project_name = registry.get(conversation.project_id).display_name
+            except ValueError:
+                project_name = None
+        history = conversations.context_for_next_task(conversation_id)
+        request_message = conversations.append_chat_request(conversation_id, content=body.content)
+        history_text = history.model_message() if history.summary or history.messages else ""
+
+        def stream() -> Iterator[str]:
+            parts: list[str] = []
+            emitted_length = 0
+            try:
+                reply_stream = conversation_reply_stream
+                if reply_stream is not None:
+                    chunks = reply_stream(history_text, body.content, project_name)
+                elif conversation_reply is not None:
+                    chunks = _chunk_text(conversation_reply(history_text, body.content, project_name))
+                else:
+                    chunks = _default_conversation_reply_stream(history_text, body.content, project_name)
+                yield _named_sse_event("message", {"message": request_message.to_dict()})
+                for chunk in chunks:
+                    if not isinstance(chunk, str) or not chunk:
+                        continue
+                    remaining = 8_000 - emitted_length
+                    if remaining <= 0:
+                        break
+                    safe_chunk = chunk[:remaining]
+                    parts.append(safe_chunk)
+                    emitted_length += len(safe_chunk)
+                    yield _named_sse_event("delta", {"content": safe_chunk})
+                reply = "".join(parts).strip()
+                if not reply:
+                    reply = "本轮对话没有生成可展示的文本。请换一种说法后重试。"
+                response = conversations.append_chat_response(conversation_id, content=reply)
+                yield _named_sse_event(
+                    "done",
+                    {
+                        "status": "READY",
+                        "message": response.to_dict(),
+                        "context": conversations.context_for_next_task(conversation_id).to_dict(),
+                    },
+                )
+            except Exception:
+                # 不把 Provider 的异常或配置内容暴露到桌面端，也不伪造模型已经完成的结果。
+                fallback = "本轮回复在生成过程中中断，未完成的内容没有写入会话记录。请检查模型配置后重试。"
+                response = conversations.append_chat_response(conversation_id, content=fallback)
+                yield _named_sse_event(
+                    "error",
+                    {"code": "CHAT_STREAM_FAILED", "message": fallback, "message_record": response.to_dict()},
+                )
+
+        return StreamingResponse(
+            stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.get("/api/projects/{project_id}/diagnostics")
     def project_diagnostics(project_id: str) -> dict[str, object]:
@@ -1198,10 +1274,24 @@ def _default_conversation_reply(history: str, content: str, project_name: str | 
     """调用普通对话模型；不可用时返回明确边界，绝不伪造代码检索或执行结果。"""
 
     try:
+        return "".join(_default_conversation_reply_stream(history, content, project_name)).strip()
+    except Exception:
+        return "普通对话模型暂时不可用。你可以稍后重试；RepoPilot 没有执行任何代码操作。"
+
+
+def _default_conversation_reply_stream(
+    history: str,
+    content: str,
+    project_name: str | None,
+) -> Iterator[str]:
+    """输出 OpenAI-compatible 模型文本分片；普通对话不注册仓库或系统工具。"""
+
+    try:
         provider = OpenAICompatibleProvider(AppSettings())
         readiness = provider.chat_check()
         if not readiness.ready:
-            return "对话模型尚未配置。你仍可以选择项目并发起受控代码分析或修复任务；配置完成后，我可以处理普通对话。"
+            yield "对话模型尚未配置。你仍可以选择项目并发起受控代码分析或修复任务；配置完成后，我可以处理普通对话。"
+            return
         messages: list[dict[str, str]] = [
             {
                 "role": "system",
@@ -1218,12 +1308,41 @@ def _default_conversation_reply(history: str, content: str, project_name: str | 
         if history:
             messages.append({"role": "user", "content": history})
         messages.append({"role": "user", "content": content})
-        raw_content = provider.create_chat_model().invoke(messages).content
-        if isinstance(raw_content, str) and raw_content.strip():
-            return raw_content.strip()[:8_000]
-        return "我收到了这条消息，但模型没有返回可展示的文本。你可以换一种说法，或发起代码分析任务。"
+        emitted = False
+        for message_chunk in provider.create_chat_model().stream(messages):
+            chunk = _chat_chunk_text(message_chunk.content)
+            if chunk:
+                emitted = True
+                yield chunk
+        if not emitted:
+            yield "我收到了这条消息，但模型没有返回可展示的文本。你可以换一种说法，或发起代码分析任务。"
     except Exception:
-        return "普通对话模型暂时不可用。你可以稍后重试；RepoPilot 没有执行任何代码操作。"
+        raise
+
+
+def _chat_chunk_text(raw_content: object) -> str:
+    """兼容 LangChain 在少数兼容模型中返回的多段 content 格式。"""
+
+    if isinstance(raw_content, str):
+        return raw_content
+    if not isinstance(raw_content, list):
+        return ""
+    return "".join(
+        item.get("text", "")
+        for item in raw_content
+        if isinstance(item, dict) and isinstance(item.get("text"), str)
+    )
+
+
+def _chunk_text(content: str, *, size: int = 96) -> Iterator[str]:
+    """使测试替身和非流式注入回调也遵循稳定的增量事件协议。"""
+
+    for index in range(0, len(content), size):
+        yield content[index : index + size]
+
+
+def _named_sse_event(event: str, payload: dict[str, object]) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
 def _event_cursor(after_sequence: int, last_event_id: str | None) -> int:

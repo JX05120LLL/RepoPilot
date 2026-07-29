@@ -12,6 +12,7 @@ from pathlib import Path
 from repopilot_guard.models import TaskRequest, WorkspaceMode
 from repopilot_guard.permissions import PermissionGrant
 from repopilot_guard.policy import PolicyGuard, ToolName
+from repopilot_guard.processes import hidden_process_kwargs
 
 
 class GitCommandError(RuntimeError):
@@ -31,6 +32,7 @@ class GitClient:
             errors="replace",
             timeout=20,
             input=input_text,
+            **hidden_process_kwargs(),
         )
         if completed.returncode != 0:
             message = completed.stderr.strip() or "Git 命令执行失败。"

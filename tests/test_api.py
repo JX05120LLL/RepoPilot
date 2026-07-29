@@ -276,6 +276,168 @@ class ApiTests(unittest.TestCase):
             finally:
                 registry.close()
 
+    def test_plain_chat_streams_deltas_and_persists_final_response(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            registry = ProjectRegistry(root / "state.sqlite")
+            runner = FakeRunner(delay=0)
+            try:
+                with TestClient(
+                    create_app(
+                        runner,
+                        registry,
+                        root / "runs",
+                        conversation_reply_stream=lambda _history, _content, _project: iter(("实时", "回复")),
+                    )
+                ) as client:
+                    created = client.post("/api/conversations", json={"display_title": "流式对话"})
+                    conversation_id = created.json()["conversation"]["conversation_id"]
+
+                    with client.stream(
+                        "POST",
+                        f"/api/conversations/{conversation_id}/chat/stream",
+                        json={"content": "请实时回复"},
+                    ) as response:
+                        self.assertEqual(200, response.status_code)
+                        payload = "".join(response.iter_text())
+
+                    self.assertIn("event: message", payload)
+                    self.assertIn('"content": "实时"', payload)
+                    self.assertIn('"content": "回复"', payload)
+                    self.assertIn("event: done", payload)
+                    self.assertFalse(runner.ran)
+                    messages = client.get(
+                        f"/api/conversations/{conversation_id}/messages"
+                    ).json()["messages"]
+                    self.assertEqual(
+                        ["chat_request", "chat_response"],
+                        [item["kind"] for item in messages],
+                    )
+                    self.assertEqual("实时回复", messages[-1]["content"])
+            finally:
+                registry.close()
+
+    def test_plain_chat_stream_failure_does_not_persist_partial_answer_as_success(self) -> None:
+        def interrupted_stream(_history: str, _content: str, _project: str | None):
+            yield "未完成片段"
+            raise RuntimeError("provider disconnected")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            registry = ProjectRegistry(root / "state.sqlite")
+            try:
+                with TestClient(
+                    create_app(
+                        FakeRunner(delay=0),
+                        registry,
+                        root / "runs",
+                        conversation_reply_stream=interrupted_stream,
+                    )
+                ) as client:
+                    created = client.post("/api/conversations", json={"display_title": "中断测试"})
+                    conversation_id = created.json()["conversation"]["conversation_id"]
+
+                    with client.stream(
+                        "POST",
+                        f"/api/conversations/{conversation_id}/chat/stream",
+                        json={"content": "触发中断"},
+                    ) as response:
+                        payload = "".join(response.iter_text())
+
+                    self.assertIn("event: delta", payload)
+                    self.assertIn("event: error", payload)
+                    self.assertNotIn("event: done", payload)
+                    self.assertNotIn("provider disconnected", payload)
+                    messages = client.get(
+                        f"/api/conversations/{conversation_id}/messages"
+                    ).json()["messages"]
+                    self.assertEqual(2, len(messages))
+                    self.assertNotIn("未完成片段", messages[-1]["content"])
+                    self.assertIn("中断", messages[-1]["content"])
+            finally:
+                registry.close()
+
+    def test_chat_research_and_change_share_one_conversation_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repository = root / "repo"
+            repository.mkdir()
+            _initialize_git_repository(repository)
+            registry = ProjectRegistry(root / "state.sqlite")
+            project = registry.add(repository, "跨模式项目")
+            runner = MultiTurnFakeRunner()
+            try:
+                with TestClient(
+                    create_app(
+                        runner,
+                        registry,
+                        root / "runs",
+                        conversation_reply_stream=lambda _history, _content, _project: iter(("这是普通对话结论",)),
+                    )
+                ) as client:
+                    created = client.post(
+                        "/api/conversations",
+                        json={"project_id": project.project_id, "display_title": "跨模式会话"},
+                    )
+                    conversation_id = created.json()["conversation"]["conversation_id"]
+                    with client.stream(
+                        "POST",
+                        f"/api/conversations/{conversation_id}/chat/stream",
+                        json={"content": "先记住订单模块背景"},
+                    ) as response:
+                        self.assertIn("event: done", "".join(response.iter_text()))
+
+                    research = client.post(
+                        "/api/tasks",
+                        json={
+                            "project_id": project.project_id,
+                            "conversation_id": conversation_id,
+                            "description": "分析订单查询链路",
+                            "operation": "research",
+                            "thread_id": "thread-cross-mode-research",
+                        },
+                    )
+                    self.assertEqual(200, research.status_code)
+                    deadline = time.monotonic() + 2
+                    while len(runner.requests) < 1 and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertIn("先记住订单模块背景", runner.requests[0].conversation_context)
+                    self.assertIn("这是普通对话结论", runner.requests[0].conversation_context)
+
+                    client.post(
+                        "/api/tasks/thread-cross-mode-research/approval",
+                        json={"decision": "approve"},
+                    )
+                    deadline = time.monotonic() + 2
+                    while time.monotonic() < deadline:
+                        messages = client.get(
+                            f"/api/conversations/{conversation_id}/messages"
+                        ).json()["messages"]
+                        if any(item["kind"] == "task_summary" for item in messages):
+                            break
+                        time.sleep(0.01)
+
+                    change = client.post(
+                        "/api/tasks",
+                        json={
+                            "project_id": project.project_id,
+                            "conversation_id": conversation_id,
+                            "description": "根据刚才结论修改订单查询",
+                            "operation": "change",
+                            "thread_id": "thread-cross-mode-change",
+                        },
+                    )
+                    self.assertEqual(200, change.status_code)
+                    deadline = time.monotonic() + 2
+                    while len(runner.requests) < 2 and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    inherited = runner.requests[1].conversation_context
+                    self.assertIn("先记住订单模块背景", inherited)
+                    self.assertIn("分析订单查询链路", inherited)
+                    self.assertIn("这是普通对话结论", inherited)
+            finally:
+                registry.close()
+
     def test_sse_closes_immediately_for_failed_task(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

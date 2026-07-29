@@ -36,6 +36,7 @@ from repopilot_guard.models import TaskMode, TaskOperation, TaskRequest, Workspa
 from repopilot_guard.mcp import McpCapabilityRegistry, McpConfigError, McpConfigLoader
 from repopilot_guard.mcp_runtime import MAX_MCP_INPUT_CHARS, McpRuntime, McpRuntimeError
 from repopilot_guard.permissions import FULL_ACCESS_CONFIRMATION, PermissionGrant, PermissionMode
+from repopilot_guard.processes import hidden_process_kwargs
 from repopilot_guard.plugins import PluginError, PluginRegistry
 from repopilot_guard.preflight import PreflightInspector
 from repopilot_guard.project_diagnostics import assess_task_admission, diagnose_project
@@ -858,6 +859,7 @@ def _desktop_command_version(*candidates: str) -> str | None:
                     errors="replace",
                     timeout=5,
                     check=False,
+                    **hidden_process_kwargs(),
                 )
             except (OSError, subprocess.TimeoutExpired):
                 continue

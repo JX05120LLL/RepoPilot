@@ -108,6 +108,10 @@ type ConversationContextState = {
   estimated_tokens: number;
   budget_tokens: number;
 };
+type StreamingChat = {
+  conversationId: string;
+  content: string;
+};
 type RenameTarget =
   | { kind: "project"; id: string; title: string }
   | { kind: "task"; id: string; title: string }
@@ -654,6 +658,7 @@ export function App() {
   const [conversationContext, setConversationContext] =
     useState<ConversationContextState | null>(null);
   const [conversationMessagesLoading, setConversationMessagesLoading] = useState(false);
+  const [streamingChat, setStreamingChat] = useState<StreamingChat | null>(null);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [showArchived, setShowArchived] = useState(false);
   const [showTaskSearch, setShowTaskSearch] = useState(false);
@@ -1946,6 +1951,7 @@ export function App() {
 
   async function sendChat() {
     if (chatBusy || taskBlocksNewTurn || !description.trim()) return;
+    const submittedContent = description.trim();
     setChatBusy(true);
     setRequestError("");
     try {
@@ -1955,7 +1961,8 @@ export function App() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            display_title: description.trim().slice(0, 80),
+            project_id: projectId || null,
+            display_title: submittedContent.slice(0, 80),
             mode: "goal",
           }),
         });
@@ -1966,26 +1973,89 @@ export function App() {
         activeConversation = createdPayload.conversation as Conversation;
         activateConversation(activeConversation);
       }
+      setDescription("");
+      setStreamingChat({ conversationId: activeConversation.conversation_id, content: "" });
       const response = await fetch(
-        `${API}/conversations/${encodeURIComponent(activeConversation.conversation_id)}/chat`,
+        `${API}/conversations/${encodeURIComponent(activeConversation.conversation_id)}/chat/stream`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ content: description.trim() }),
+          body: JSON.stringify({ content: submittedContent }),
         },
       );
-      const payload = await response.json();
       if (!response.ok) {
+        const payload = await response.json().catch(() => ({}));
         throw new Error(typeof payload.detail === "string" ? payload.detail : "普通对话失败");
       }
-      setDescription("");
-      await Promise.all([
-        loadConversations(showArchived),
-        loadConversationMessages(activeConversation.conversation_id),
-      ]);
+      if (!response.body) throw new Error("浏览器不支持对话流式响应");
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let completed = false;
+      const appendMessage = (message: ConversationMessage) => {
+        setConversationMessages((current) =>
+          current.some((item) => item.message_id === message.message_id)
+            ? current
+            : [...current, message],
+        );
+      };
+      const consumeEvent = (frame: string) => {
+        const eventName = frame.match(/^event:\s*(.+)$/m)?.[1]?.trim() ?? "message";
+        const data = frame
+          .split("\n")
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).trimStart())
+          .join("\n");
+        if (!data) return;
+        const payload = JSON.parse(data) as Record<string, unknown>;
+        if (eventName === "message" && payload.message && typeof payload.message === "object") {
+          appendMessage(payload.message as ConversationMessage);
+          return;
+        }
+        if (eventName === "delta" && typeof payload.content === "string") {
+          setStreamingChat((current) =>
+            current?.conversationId === activeConversation?.conversation_id
+              ? { ...current, content: current.content + payload.content }
+              : current,
+          );
+          return;
+        }
+        if (eventName === "done") {
+          if (payload.message && typeof payload.message === "object") {
+            appendMessage(payload.message as ConversationMessage);
+          }
+          if (payload.context && typeof payload.context === "object") {
+            setConversationContext(payload.context as ConversationContextState);
+          }
+          completed = true;
+          return;
+        }
+        if (eventName === "error") {
+          if (payload.message_record && typeof payload.message_record === "object") {
+            appendMessage(payload.message_record as ConversationMessage);
+          }
+          const message = typeof payload.message === "string" ? payload.message : "普通对话流式响应中断";
+          throw new Error(message);
+        }
+      };
+      while (true) {
+        const { value, done } = await reader.read();
+        if (value) {
+          buffer += decoder.decode(value, { stream: !done });
+          const frames = buffer.split("\n\n");
+          buffer = frames.pop() ?? "";
+          for (const frame of frames) consumeEvent(frame);
+        }
+        if (done) break;
+      }
+      if (buffer.trim()) consumeEvent(buffer);
+      if (!completed) throw new Error("对话流式响应未正常结束");
+      await loadConversations(showArchived);
     } catch (error) {
       setRequestError(error instanceof Error ? error.message : "普通对话失败");
     } finally {
+      setStreamingChat(null);
       setChatBusy(false);
     }
   }
@@ -2165,6 +2235,7 @@ export function App() {
     setConversationMessages([]);
     setConversationContext(null);
     setConversationMessagesLoading(false);
+    setStreamingChat(null);
     summarizedTaskRef.current = null;
     setEvents([]);
     setArtifacts([]);
@@ -2260,6 +2331,7 @@ export function App() {
     activateConversation(selected);
     setConversationMessages([]);
     setConversationContext(null);
+    setStreamingChat(null);
     setEvents([]);
     setArtifacts([]);
     setArtifactVersions([]);
@@ -2526,6 +2598,10 @@ export function App() {
   const showLiveTaskResponse = Boolean(
     task && (taskBlocksNewTurn || !currentTaskSummaryPersisted),
   );
+  const activeStreamingChat =
+    streamingChat?.conversationId === conversation?.conversation_id
+      ? streamingChat
+      : null;
   const researchPlanApproval = Boolean(
     task?.pending_approval &&
       activeTaskOperation === "research" &&
@@ -3121,6 +3197,24 @@ export function App() {
                   ),
                 )}
 
+                {activeStreamingChat && (
+                  <article className="conversation-turn assistant-turn conversation-chat-turn streaming-chat-turn">
+                    <div className="agent-response">
+                      <div className="agent-response-header">
+                        <strong>RepoPilot</strong>
+                        <span className="streaming-answer-status" aria-live="polite">
+                          <CircleNotch className="spin" size={13} />正在回复
+                        </span>
+                      </div>
+                      <div className="conversation-chat-markdown streaming-chat-content">
+                        {activeStreamingChat.content
+                          ? <ReactMarkdown>{activeStreamingChat.content}</ReactMarkdown>
+                          : <p>正在生成回答...</p>}
+                      </div>
+                    </div>
+                  </article>
+                )}
+
                 {task && (
                   <>
                     {!currentTaskRequestPersisted && (
@@ -3188,8 +3282,8 @@ export function App() {
                           )}
                         </div>
                         {(taskIsRunning || visibleEvents.length > 0 || task.diagnostic) && (
-                          <details className="execution-details" open={taskIsRunning}>
-                            <summary>{taskIsRunning ? "查看正在执行的步骤" : `查看执行记录${visibleEvents.length ? `（${visibleEvents.length}）` : ""}`}</summary>
+                          <details className="execution-details">
+                            <summary>{taskIsRunning ? "执行过程与工具调用" : `执行记录${visibleEvents.length ? `（${visibleEvents.length}）` : ""}`}</summary>
                             <div className="execution-details-body">
                               {task.progress && task.progress.stages.length > 0 && (
                                 <TaskProgressTrail summary={task.progress.summary} stages={task.progress.stages} running={taskIsRunning} />

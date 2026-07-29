@@ -1711,6 +1711,38 @@ textarea::placeholder {
   padding-top: 3px;
 }
 
+.streaming-chat-turn .agent-response {
+  min-width: min(320px, 82vw);
+}
+
+.streaming-answer-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.streaming-chat-content {
+  position: relative;
+}
+
+.streaming-chat-content::after {
+  display: inline-block;
+  width: 5px;
+  height: 1em;
+  margin-left: 3px;
+  vertical-align: -0.16em;
+  background: #4f5965;
+  content: "";
+  animation: repopilot-stream-caret 1s steps(2, start) infinite;
+}
+
+@keyframes repopilot-stream-caret {
+  50% { opacity: 0; }
+}
+
 .conversation-chat-markdown {
   color: #2c3035;
   font-size: 15px;

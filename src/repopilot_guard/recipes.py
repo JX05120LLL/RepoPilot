@@ -12,6 +12,7 @@ from pathlib import Path
 
 from repopilot_guard.permissions import PermissionGrant
 from repopilot_guard.policy import MavenRecipeName, PolicyGuard
+from repopilot_guard.processes import hidden_process_kwargs
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +110,7 @@ class MavenRecipeRunner:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                **hidden_process_kwargs(),
             )
         except OSError as error:
             return MavenExecutionResult(
