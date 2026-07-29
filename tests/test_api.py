@@ -85,7 +85,14 @@ class FakeRunner:
         self.result.status = "REPORT"
         return self.result
 
-    def resume(self, thread_id: str, approved: bool) -> object:
+    def resume(
+        self,
+        thread_id: str,
+        approved: bool,
+        *,
+        decision: str | None = None,
+        comment: str | None = None,
+    ) -> object:
         self.result.pending_approval = False
         self.result.status = "REPORT"
         self.result.verdict = "BLOCKED" if not approved else "UNVERIFIED"
@@ -93,6 +100,72 @@ class FakeRunner:
 
     def request_cancellation(self, thread_id: str, reason: str | None = None) -> None:
         self.cancellation_requests.append((thread_id, reason))
+
+
+class MultiTurnFakeRunner:
+    """为 API 多轮会话测试保存每个 thread 的独立图结果。"""
+
+    def __init__(self) -> None:
+        self.requests: list[object] = []
+        self.results: dict[str, SimpleNamespace] = {}
+
+    @staticmethod
+    def _serialize(result: SimpleNamespace) -> dict[str, object]:
+        return {
+            "thread_id": result.thread_id,
+            "task_id": result.task_id,
+            "status": result.status,
+            "pending_approval": result.pending_approval,
+            "verdict": result.verdict,
+            "interrupts": list(result.interrupts),
+            "state": result.state,
+        }
+
+    def run(self, request: object, thread_id: str | None, permission: object) -> object:
+        resolved_thread_id = str(thread_id)
+        result = SimpleNamespace(
+            thread_id=resolved_thread_id,
+            task_id=request.task_id,
+            status="WAITING_APPROVAL",
+            pending_approval=True,
+            verdict=None,
+            state={
+                "task_operation": request.operation.value,
+                "task_description": request.description,
+                "tool_events": [{"type": "PLAN_GENERATED"}],
+                "plan": {"summary": f"已分析：{request.description}"},
+                "verification_result": None,
+                "error_summary": None,
+                "git_diff": "",
+            },
+            interrupts=({"type": "PLAN_APPROVAL_REQUIRED"},),
+        )
+        result.to_dict = lambda item=result: self._serialize(item)
+        self.requests.append(request)
+        self.results[resolved_thread_id] = result
+        return result
+
+    def get(self, thread_id: str) -> object:
+        try:
+            return self.results[thread_id]
+        except KeyError as error:
+            raise ValueError("NOT_FOUND") from error
+
+    def resume(
+        self,
+        thread_id: str,
+        approved: bool,
+        *,
+        decision: str | None = None,
+        comment: str | None = None,
+    ) -> object:
+        result = self.results[thread_id]
+        accepted = decision == "approve" if decision is not None else approved is True
+        result.pending_approval = False
+        result.status = "REPORT"
+        result.verdict = "UNVERIFIED" if accepted else "BLOCKED"
+        result.interrupts = ()
+        return result
 
 
 class CheckpointThenFailingRunner(FakeRunner):
@@ -1009,6 +1082,122 @@ class ApiTests(unittest.TestCase):
                     self.assertEqual("验证运行时失败状态", snapshot["task_description"])
                     self.assertEqual("验证运行时失败状态", snapshot["display_title"])
                     self.assertNotIn("不得返回给客户端的内部错误", json.dumps(snapshot, ensure_ascii=False))
+            finally:
+                registry.close()
+
+    def test_conversation_runs_multiple_tasks_and_injects_prior_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repository = root / "repo"
+            repository.mkdir()
+            _initialize_git_repository(repository)
+            registry = ProjectRegistry(root / "state.sqlite")
+            project = registry.add(repository, "多轮任务项目")
+            runner = MultiTurnFakeRunner()
+            try:
+                with TestClient(create_app(runner, registry, root / "runs")) as client:
+                    created_conversation = client.post(
+                        "/api/conversations",
+                        json={
+                            "project_id": project.project_id,
+                            "display_title": "连续排查订单模块",
+                            "mode": "plan",
+                        },
+                    )
+                    self.assertEqual(200, created_conversation.status_code)
+                    conversation_id = created_conversation.json()["conversation"]["conversation_id"]
+
+                    first = client.post(
+                        "/api/tasks",
+                        json={
+                            "project_id": project.project_id,
+                            "conversation_id": conversation_id,
+                            "description": "先梳理订单模块结构",
+                            "operation": "research",
+                            "thread_id": "thread-conversation-first",
+                        },
+                    )
+                    self.assertEqual(200, first.status_code)
+                    self.assertEqual(conversation_id, first.json()["conversation_id"])
+
+                    deadline = time.monotonic() + 2
+                    first_snapshot: dict[str, object] = {}
+                    while time.monotonic() < deadline:
+                        first_snapshot = client.get(
+                            "/api/tasks/thread-conversation-first"
+                        ).json()
+                        if first_snapshot.get("pending_approval"):
+                            break
+                        time.sleep(0.01)
+                    self.assertTrue(first_snapshot.get("pending_approval"))
+                    self.assertEqual("", runner.requests[0].conversation_context)
+
+                    messages = client.get(
+                        f"/api/conversations/{conversation_id}/messages"
+                    ).json()["messages"]
+                    self.assertEqual(["task_request"], [item["kind"] for item in messages])
+                    self.assertEqual("先梳理订单模块结构", messages[0]["content"])
+
+                    concurrent = client.post(
+                        "/api/tasks",
+                        json={
+                            "project_id": project.project_id,
+                            "conversation_id": conversation_id,
+                            "description": "不应并行创建",
+                            "operation": "research",
+                            "thread_id": "thread-conversation-concurrent",
+                        },
+                    )
+                    self.assertEqual(409, concurrent.status_code)
+                    self.assertEqual("CONVERSATION_TASK_RUNNING", concurrent.json()["detail"])
+
+                    approved = client.post(
+                        "/api/tasks/thread-conversation-first/approval",
+                        json={"decision": "approve"},
+                    )
+                    self.assertEqual(200, approved.status_code)
+
+                    deadline = time.monotonic() + 2
+                    first_messages: list[dict[str, object]] = []
+                    while time.monotonic() < deadline:
+                        response = client.get(
+                            f"/api/conversations/{conversation_id}/messages"
+                        )
+                        self.assertEqual(200, response.status_code)
+                        first_messages = response.json()["messages"]
+                        if len(first_messages) == 2:
+                            break
+                        time.sleep(0.01)
+                    self.assertEqual(["user", "assistant"], [item["role"] for item in first_messages])
+                    self.assertIn("处理总结", first_messages[-1]["content"])
+                    self.assertIn("已分析：先梳理订单模块结构", first_messages[-1]["content"])
+
+                    second = client.post(
+                        "/api/tasks",
+                        json={
+                            "project_id": project.project_id,
+                            "conversation_id": conversation_id,
+                            "description": "继续定位订单查询入口",
+                            "operation": "research",
+                            "thread_id": "thread-conversation-second",
+                        },
+                    )
+                    self.assertEqual(200, second.status_code)
+
+                    deadline = time.monotonic() + 2
+                    while len(runner.requests) < 2 and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertEqual(2, len(runner.requests))
+                    inherited_context = runner.requests[-1].conversation_context
+                    self.assertIn("先梳理订单模块结构", inherited_context)
+                    self.assertIn("已分析：先梳理订单模块结构", inherited_context)
+                    self.assertIn("不可信上下文", inherited_context)
+
+                    all_messages = client.get(
+                        f"/api/conversations/{conversation_id}/messages"
+                    ).json()["messages"]
+                    self.assertEqual(3, len(all_messages))
+                    self.assertEqual("继续定位订单查询入口", all_messages[-1]["content"])
             finally:
                 registry.close()
 

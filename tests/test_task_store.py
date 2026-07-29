@@ -91,6 +91,82 @@ class TaskStoreTests(unittest.TestCase):
             finally:
                 reopened.close()
 
+    def test_conversation_allows_only_one_active_task_and_preserves_task_history(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            database = root / "state.sqlite"
+            store = TaskStore(database)
+            try:
+                first = store.create(
+                    thread_id="thread-conversation-1",
+                    task_id="task-conversation-1",
+                    project_id="project-1",
+                    conversation_id="conversation-demo",
+                    repository=root / "repo",
+                    output_root=root / "runs",
+                    task_mode="safe-isolated",
+                    permission_mode="safe",
+                    workspace_mode="worktree",
+                )
+                self.assertEqual("conversation-demo", first.conversation_id)
+                with self.assertRaisesRegex(ValueError, "CONVERSATION_TASK_RUNNING"):
+                    store.create(
+                        thread_id="thread-conversation-2",
+                        task_id="task-conversation-2",
+                        project_id="project-1",
+                        conversation_id="conversation-demo",
+                        repository=root / "repo",
+                        output_root=root / "runs",
+                        task_mode="safe-isolated",
+                        permission_mode="safe",
+                        workspace_mode="worktree",
+                    )
+
+                store.sync_graph_result(
+                    {
+                        "thread_id": first.thread_id,
+                        "status": "REPORT",
+                        "pending_approval": False,
+                        "verdict": "UNVERIFIED",
+                        "state": {"tool_events": []},
+                    },
+                    execution_finished=True,
+                )
+                second = store.create(
+                    thread_id="thread-conversation-2",
+                    task_id="task-conversation-2",
+                    project_id="project-1",
+                    conversation_id="conversation-demo",
+                    repository=root / "repo",
+                    output_root=root / "runs",
+                    task_mode="safe-isolated",
+                    permission_mode="safe",
+                    workspace_mode="worktree",
+                )
+                self.assertEqual(
+                    [first.thread_id, second.thread_id],
+                    [item.thread_id for item in store.list_for_conversation("conversation-demo")],
+                )
+            finally:
+                store.close()
+
+            reopened = TaskStore(database)
+            try:
+                with self.assertRaisesRegex(ValueError, "CONVERSATION_TASK_RUNNING"):
+                    reopened.create(
+                        thread_id="thread-conversation-3",
+                        task_id="task-conversation-3",
+                        project_id="project-1",
+                        conversation_id="conversation-demo",
+                        repository=root / "repo",
+                        output_root=root / "runs",
+                        task_mode="safe-isolated",
+                        permission_mode="safe",
+                        workspace_mode="worktree",
+                    )
+            finally:
+                reopened.close()
+
     def test_recent_events_returns_bounded_tail_in_chronological_order(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

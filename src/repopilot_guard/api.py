@@ -35,13 +35,17 @@ from repopilot_guard.skills import SkillRegistry
 from repopilot_guard.task_export import TaskEvidenceExporter
 from repopilot_guard.task_diagnostics import build_task_diagnostic, extract_diagnostic_codes
 from repopilot_guard.task_progress import build_task_progress
-from repopilot_guard.task_store import StoredTaskEvent, TaskStore
+from repopilot_guard.task_store import StoredTask, StoredTaskEvent, TaskStore
+
+
+_TERMINAL_TASK_STATUSES = frozenset({"REPORT", "BLOCKED", "FAILED", "CANCELLED"})
 
 
 class CreateTaskBody(BaseModel):
     project_id: str | None = None
+    conversation_id: str | None = Field(default=None, max_length=128)
     repository: str | None = None
-    description: str = Field(min_length=1)
+    description: str = Field(min_length=1, max_length=12_000)
     task_mode: TaskMode = TaskMode.SAFE_ISOLATED
     operation: TaskOperation = TaskOperation.CHANGE
     confirmation: str | None = None
@@ -238,7 +242,13 @@ def create_app(
             "version": __version__,
             "scope": "127.0.0.1-only",
             # 前端按能力而非包版本启用可选操作，避免开发预览前后端热更新不同步。
-            "capabilities": ["task_artifacts", "task_artifact_versions", "task_evidence_export", "runtime_configuration"],
+            "capabilities": [
+                "task_artifacts",
+                "task_artifact_versions",
+                "task_evidence_export",
+                "runtime_configuration",
+                "conversation_messages",
+            ],
             "dependencies": [check.to_dict() for check in checks],
         }
 
@@ -360,6 +370,23 @@ def create_app(
         except ValueError as error:
             raise HTTPException(404, str(error)) from error
 
+    @app.get("/api/conversations/{conversation_id}/messages")
+    def conversation_messages(conversation_id: str) -> dict[str, object]:
+        try:
+            _backfill_conversation_task_summaries(
+                conversations,
+                store,
+                runner,
+                conversation_id,
+            )
+            context = conversations.context_for_next_task(conversation_id)
+            return {
+                "messages": [item.to_dict() for item in conversations.messages(conversation_id)],
+                "context": context.to_dict(),
+            }
+        except ValueError as error:
+            raise HTTPException(404, str(error)) from error
+
     @app.get("/api/projects/{project_id}/diagnostics")
     def project_diagnostics(project_id: str) -> dict[str, object]:
         """只读返回项目是否满足两种任务模式与 Java/Maven Profile 的前置条件。"""
@@ -467,6 +494,19 @@ def create_app(
             raise HTTPException(400, "PROJECT_ID_OR_REPOSITORY_REQUIRED")
         try:
             repository = registry.get(body.project_id).root_path if body.project_id else Path(str(body.repository))
+            conversation_context = ""
+            if body.conversation_id:
+                try:
+                    conversation = conversations.get(body.conversation_id)
+                except ValueError as error:
+                    raise HTTPException(404, "CONVERSATION_NOT_FOUND") from error
+                if conversation.archived_at:
+                    raise HTTPException(409, "CONVERSATION_ARCHIVED")
+                if conversation.project_id != body.project_id:
+                    raise HTTPException(409, "CONVERSATION_PROJECT_MISMATCH")
+                history = conversations.context_for_next_task(body.conversation_id)
+                if history.summary or history.messages:
+                    conversation_context = history.model_message()
             grant = _grant_for_mode(body.task_mode, body.confirmation)
             attached_document_ids = tuple(body.attached_document_ids)
             if attached_document_ids:
@@ -492,6 +532,8 @@ def create_app(
                 description=body.description,
                 output_root=Path(body.output_root) if body.output_root else default_output_root,
                 project_id=body.project_id,
+                conversation_id=body.conversation_id,
+                conversation_context=conversation_context,
                 workspace_selection=WorkspaceSelection(mode=body.task_mode.workspace_mode),
                 approved_mcp_tools=tuple(body.approved_mcp_tools),
                 attached_document_ids=attached_document_ids,
@@ -502,6 +544,7 @@ def create_app(
                 thread_id=thread_id,
                 task_id=request.task_id,
                 project_id=body.project_id,
+                conversation_id=body.conversation_id,
                 repository=repository,
                 output_root=request.output_root,
                 task_mode=body.task_mode.value,
@@ -510,6 +553,12 @@ def create_app(
                 workspace_mode=request.workspace_selection.mode.value,
                 display_title=body.description,
             )
+            if body.conversation_id:
+                conversations.append_task_request(
+                    body.conversation_id,
+                    content=body.description,
+                    task_thread_id=thread_id,
+                )
 
             def run_in_background() -> None:
                 if not _begin_execution(store, thread_id):
@@ -521,6 +570,8 @@ def create_app(
                     stored = store.sync_graph_result(result, execution_finished=True)
                     if stored.cancellation_requested_at:
                         store.complete_cancellation(thread_id)
+                        stored = store.get(thread_id)
+                    _append_conversation_task_summary(conversations, stored, result)
                 except Exception as error:
                     # 不把异常细节或环境变量返回给桌面端；图自身的 BLOCKED 事件仍在 checkpoint 中。
                     try:
@@ -528,6 +579,7 @@ def create_app(
                             store.complete_cancellation(thread_id)
                         else:
                             store.mark_runtime_failure(thread_id, f"TASK_RUNTIME_FAILED: {type(error).__name__}")
+                        _append_conversation_task_summary(conversations, store.get(thread_id), {})
                     except ValueError:
                         return
                 finally:
@@ -541,14 +593,16 @@ def create_app(
             snapshot.setdefault("task_description", body.description)
             return snapshot
         except ValueError as error:
-            raise HTTPException(400, str(error)) from error
+            status = 409 if str(error) == "CONVERSATION_TASK_RUNNING" else 400
+            raise HTTPException(status, str(error)) from error
 
     @app.get("/api/tasks")
     def list_tasks(
         limit: int = Query(default=50, ge=1, le=200),
         include_archived: bool = Query(default=False),
     ) -> dict[str, object]:
-        store.reap_expired_leases()
+        for recovered in store.reap_expired_leases():
+            _append_conversation_task_summary(conversations, recovered, {})
         return {"tasks": [item.to_dict() for item in store.list(limit, include_archived=include_archived)]}
 
     @app.get("/api/tasks/{thread_id}")
@@ -579,12 +633,15 @@ def create_app(
                     stored = store.sync_graph_result(result, execution_finished=True)
                     if stored.cancellation_requested_at:
                         store.complete_cancellation(thread_id)
+                        stored = store.get(thread_id)
+                    _append_conversation_task_summary(conversations, stored, result)
                 except Exception as error:
                     try:
                         if store.get(thread_id).cancellation_requested_at:
                             store.complete_cancellation(thread_id)
                         else:
                             store.mark_runtime_failure(thread_id, f"TASK_RUNTIME_FAILED: {type(error).__name__}")
+                        _append_conversation_task_summary(conversations, store.get(thread_id), {})
                     except ValueError:
                         return
                 finally:
@@ -603,6 +660,8 @@ def create_app(
             request_cancellation = getattr(runner, "request_cancellation", None)
             if callable(request_cancellation):
                 request_cancellation(thread_id, task.cancellation_reason)
+            if task.status == "CANCELLED":
+                _append_conversation_task_summary(conversations, task, {})
             return task.to_dict()
         except ValueError as error:
             raise HTTPException(409, str(error)) from error
@@ -921,6 +980,7 @@ def _task_snapshot(
                 "task_id": indexed.task_id,
                 "display_title": indexed.display_title,
                 "project_id": indexed.project_id,
+                "conversation_id": indexed.conversation_id,
                 "task_mode": indexed.task_mode,
                 "created_at": indexed.created_at,
                 "updated_at": indexed.updated_at,
@@ -1003,6 +1063,89 @@ def _safe_task_plan(value: object) -> dict[str, object] | None:
             continue
         safe[key] = [entry[:2_000] for entry in item if isinstance(entry, str)][:100]
     return safe
+
+
+def _backfill_conversation_task_summaries(
+    conversations: ConversationStore,
+    store: TaskStore,
+    runner: GraphRunner,
+    conversation_id: str,
+) -> None:
+    """服务重启或终态竞态后，按持久任务补齐尚未写入的助手总结。"""
+
+    for task in store.list_for_conversation(conversation_id):
+        if task.status not in _TERMINAL_TASK_STATUSES:
+            continue
+        graph_result: dict[str, object] = {}
+        try:
+            checkpoint = runner.get(task.thread_id)
+        except (KeyError, ValueError, sqlite3.Error):
+            checkpoint = None
+        if checkpoint is not None:
+            to_dict = getattr(checkpoint, "to_dict", None)
+            if callable(to_dict):
+                candidate = to_dict()
+                if isinstance(candidate, dict):
+                    graph_result = candidate
+        _append_conversation_task_summary(conversations, task, graph_result)
+
+
+def _append_conversation_task_summary(
+    conversations: ConversationStore,
+    task: StoredTask,
+    graph_result: dict[str, object],
+) -> bool:
+    """将终态任务写入会话；总结只取受控状态，不读取工具原文或文件内容。"""
+
+    if not task.conversation_id or task.status not in _TERMINAL_TASK_STATUSES:
+        return False
+    state = graph_result.get("state")
+    safe_state = state if isinstance(state, dict) else {}
+    try:
+        conversations.append_task_summary(
+            task.conversation_id,
+            content=_conversation_task_summary(task, safe_state),
+            task_thread_id=task.thread_id,
+            task_status=task.status,
+            task_verdict=task.verdict,
+        )
+    except (ValueError, sqlite3.Error):
+        # 会话投影故障不能篡改已经由 Diff/Maven 证据确定的任务结论；读取接口会再次补齐。
+        return False
+    return True
+
+
+def _conversation_task_summary(task: StoredTask, state: dict[str, object]) -> str:
+    """生成面向用户的稳定结论，不将模型计划等同于修复成功。"""
+
+    outcome = {
+        "PASSED": "任务已完成：已记录真实代码修改且 Maven 验证通过。",
+        "UNVERIFIED": "已完成分析，但尚未获得足够的修复与验证证据。",
+        "FAILED": "任务尚未完成：补丁、测试或行为验证失败。",
+        "BLOCKED": "任务暂时无法继续：权限、审批、配置或运行环境阻断了执行。",
+        "CANCELLED": "任务已停止，未继续执行后续修改或验证。",
+    }.get(task.verdict or "", "任务已结束，尚未形成可验证的成功结论。")
+    lines = ["处理总结", "", f"结论：{outcome}"]
+    plan = state.get("plan")
+    if isinstance(plan, dict) and isinstance(plan.get("summary"), str):
+        lines.extend(("", "分析摘要：", str(plan["summary"])[:4_000]))
+    if state.get("git_diff"):
+        lines.extend(("", "修改证据：已生成真实 Git Diff。"))
+    verification = state.get("verification_result")
+    if isinstance(verification, dict):
+        status = verification.get("status")
+        recipe = verification.get("recipe")
+        detail = f"验证结果：{status or 'UNKNOWN'}"
+        if isinstance(recipe, str) and recipe:
+            detail += f"（{recipe}）"
+        lines.extend(("", detail + "。"))
+    elif task.verdict != "PASSED":
+        lines.extend(("", "验证结果：本轮没有可证明成功的 Maven 验证记录。"))
+    if task.verdict == "UNVERIFIED":
+        lines.extend(("", "下一步：可以继续同一对话补充目标，或切换到目标模式执行受控修复。"))
+    elif task.verdict in {"BLOCKED", "FAILED"}:
+        lines.extend(("", "下一步：查看详情中的诊断与证据后，补充条件或调整目标再继续。"))
+    return "\n".join(lines)
 
 
 def _event_cursor(after_sequence: int, last_event_id: str | None) -> int:

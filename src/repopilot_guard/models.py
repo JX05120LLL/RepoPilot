@@ -177,6 +177,8 @@ class TaskRequest:
     task_id: str = field(default_factory=lambda: f"task-{uuid4().hex[:12]}")
     max_steps: int = 12
     project_id: str | None = None
+    conversation_id: str | None = None
+    conversation_context: str = ""
     workspace_selection: WorkspaceSelection = field(default_factory=WorkspaceSelection)
     verification_contract: VerificationContract | None = None
     approved_mcp_tools: tuple[str, ...] = ()
@@ -187,6 +189,12 @@ class TaskRequest:
     def __post_init__(self) -> None:
         if not self.description.strip():
             raise ValueError("Task description must not be blank.")
+        if self.conversation_id is not None and (
+            not self.conversation_id.startswith("conversation-") or len(self.conversation_id) > 128
+        ):
+            raise ValueError("conversation_id must be a RepoPilot conversation ID.")
+        if len(self.conversation_context) > 48_000:
+            raise ValueError("conversation_context exceeds the supported size.")
         if not isinstance(self.operation, TaskOperation):
             raise ValueError("Task operation must be change or research.")
         if self.max_steps < 1:

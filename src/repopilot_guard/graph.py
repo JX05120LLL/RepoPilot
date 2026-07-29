@@ -188,6 +188,8 @@ class GraphState(TypedDict, total=False):
     attached_document_ids: list[str]
     attached_documents: list[dict[str, str]]
     project_id: str | None
+    conversation_id: str | None
+    conversation_context: str
     permission_mode: str
     permission_confirmation: str | None
     permission_snapshot: dict[str, object]
@@ -1673,7 +1675,14 @@ class GraphRunner:
                 "task_id": request.task_id,
                 "status": "INTAKE",
                 "verdict": None,
-                "messages": [{"role": "user", "content": request.description}],
+                "messages": [
+                    *(
+                        [{"role": "user", "content": request.conversation_context}]
+                        if request.conversation_context
+                        else []
+                    ),
+                    {"role": "user", "content": request.description},
+                ],
                 "tool_events": [{"type": "TASK_BUDGET_SNAPSHOT", **budget.to_dict()}],
                 "pending_approval": False,
                 "repository": str(request.repository),
@@ -1686,6 +1695,8 @@ class GraphRunner:
                 "attached_document_ids": list(request.attached_document_ids),
                 "attached_documents": [],
                 "project_id": request.project_id,
+                "conversation_id": request.conversation_id,
+                "conversation_context": request.conversation_context,
                 "permission_mode": grant.mode.value,
                 "permission_confirmation": grant.confirmation,
                 "permission_snapshot": permission_snapshot.to_dict(),

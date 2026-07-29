@@ -31,6 +31,7 @@ class StoredTask:
     task_id: str
     display_title: str | None
     project_id: str | None
+    conversation_id: str | None
     repository: str
     output_root: str
     task_mode: str
@@ -56,6 +57,7 @@ class StoredTask:
             "task_id": self.task_id,
             "display_title": self.display_title,
             "project_id": self.project_id,
+            "conversation_id": self.conversation_id,
             "repository": self.repository,
             "output_root": self.output_root,
             "task_mode": self.task_mode,
@@ -182,6 +184,7 @@ class TaskStore:
         thread_id: str,
         task_id: str,
         project_id: str | None,
+        conversation_id: str | None = None,
         repository: Path,
         output_root: Path,
         task_mode: str,
@@ -198,14 +201,16 @@ class TaskStore:
         now = self._now()
         resolved_trace_id = trace_id or self._new_trace_id()
         with self._lock:
+            if conversation_id and self._active_conversation_task_locked(conversation_id):
+                raise ValueError("CONVERSATION_TASK_RUNNING")
             try:
                 self._connection.execute(
                     """
                     INSERT INTO tasks(
-                        thread_id, trace_id, task_id, display_title, project_id, repository, output_root, task_mode,
+                        thread_id, trace_id, task_id, display_title, project_id, conversation_id, repository, output_root, task_mode,
                         task_operation, permission_mode, workspace_mode, status, pending_approval, verdict,
                         error_summary, created_at, updated_at, heartbeat_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING', 0, NULL, NULL, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RUNNING', 0, NULL, NULL, ?, ?, ?)
                     """,
                     (
                         thread_id,
@@ -213,6 +218,7 @@ class TaskStore:
                         task_id,
                         _normalize_task_title(display_title),
                         project_id,
+                        conversation_id,
                         str(repository),
                         str(output_root),
                         task_mode,
@@ -225,6 +231,8 @@ class TaskStore:
                     ),
                 )
             except sqlite3.IntegrityError as error:
+                if conversation_id and self._active_conversation_task_locked(conversation_id):
+                    raise ValueError("CONVERSATION_TASK_RUNNING") from error
                 raise ValueError("THREAD_ID_ALREADY_EXISTS") from error
             self._append_event_locked(
                 thread_id,
@@ -245,6 +253,36 @@ class TaskStore:
                 query += " WHERE archived_at IS NULL"
             rows = self._connection.execute(f"{query} ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
             return tuple(self._task_from_row(row) for row in rows)
+
+    def list_for_conversation(
+        self, conversation_id: str, *, limit: int = 500
+    ) -> tuple[StoredTask, ...]:
+        """按时间返回一个会话关联的任务，用于恢复对话流和补齐终态总结。"""
+
+        if not conversation_id or limit < 1:
+            raise ValueError("CONVERSATION_TASK_QUERY_INVALID")
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM tasks
+                WHERE conversation_id = ?
+                ORDER BY created_at ASC
+                LIMIT ?
+                """,
+                (conversation_id, limit),
+            ).fetchall()
+            return tuple(self._task_from_row(row) for row in rows)
+
+    def _active_conversation_task_locked(self, conversation_id: str) -> sqlite3.Row | None:
+        return self._connection.execute(
+            """
+            SELECT thread_id FROM tasks
+            WHERE conversation_id = ?
+              AND status NOT IN ('REPORT', 'BLOCKED', 'FAILED', 'CANCELLED')
+            LIMIT 1
+            """,
+            (conversation_id,),
+        ).fetchone()
 
     def begin_execution(self, thread_id: str, *, lease_seconds: int = DEFAULT_LEASE_SECONDS) -> StoredTask:
         """取得短租约后才允许后台执行，服务重启遗留任务可被超时回收。"""
@@ -463,6 +501,11 @@ class TaskStore:
                     thread_id=thread_id,
                     task_id=str(result["task_id"]),
                     project_id=graph_state.get("project_id") if isinstance(graph_state.get("project_id"), str) else None,
+                    conversation_id=(
+                        graph_state.get("conversation_id")
+                        if isinstance(graph_state.get("conversation_id"), str)
+                        else None
+                    ),
                     repository=Path(str(graph_state.get("repository") or "")),
                     output_root=Path(str(graph_state.get("output_root") or "")),
                     task_mode=task_mode,
@@ -890,6 +933,7 @@ class TaskStore:
                     task_id TEXT NOT NULL UNIQUE,
                     display_title TEXT,
                     project_id TEXT,
+                    conversation_id TEXT,
                     repository TEXT NOT NULL,
                     output_root TEXT NOT NULL,
                     task_mode TEXT NOT NULL,
@@ -956,7 +1000,16 @@ class TaskStore:
             self._ensure_column_locked("tasks", "archived_at", "TEXT")
             self._ensure_column_locked("tasks", "trace_id", "TEXT")
             self._ensure_column_locked("tasks", "display_title", "TEXT")
+            self._ensure_column_locked("tasks", "conversation_id", "TEXT")
             self._ensure_column_locked("tasks", "task_operation", "TEXT NOT NULL DEFAULT 'change'")
+            self._connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_active_conversation
+                ON tasks(conversation_id)
+                WHERE conversation_id IS NOT NULL
+                  AND status NOT IN ('REPORT', 'BLOCKED', 'FAILED', 'CANCELLED')
+                """
+            )
             self._backfill_trace_ids_locked()
             self._connection.commit()
 
@@ -987,6 +1040,7 @@ class TaskStore:
             task_id=row["task_id"],
             display_title=row["display_title"],
             project_id=row["project_id"],
+            conversation_id=row["conversation_id"],
             repository=row["repository"],
             output_root=row["output_root"],
             task_mode=row["task_mode"],

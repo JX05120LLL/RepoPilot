@@ -46,6 +46,14 @@ const API_UNAVAILABLE_MESSAGE = "本机 API 尚未启动或无法访问。";
 const EVIDENCE_STREAM_ERROR =
   "证据流连接中断，请检查本机 API。任务状态会继续尝试轮询。";
 const TASK_EVIDENCE_EXPORT_CAPABILITY = "task_evidence_export";
+const terminalTaskStatuses = new Set([
+  "REPORT",
+  "FAILED",
+  "PASSED",
+  "BLOCKED",
+  "CANCELLED",
+  "UNVERIFIED",
+]);
 const capabilityKindLabels = {
   builtin_tool: "内置工具",
   skill: "Skill",
@@ -80,6 +88,24 @@ type Conversation = {
   updated_at: string;
   archived_at?: string | null;
 };
+type ConversationMessage = {
+  message_id: string;
+  conversation_id: string;
+  sequence: number;
+  role: "user" | "assistant";
+  kind: "task_request" | "task_summary";
+  content: string;
+  task_thread_id?: string | null;
+  task_status?: string | null;
+  task_verdict?: string | null;
+  created_at: string;
+};
+type ConversationContextState = {
+  compacted: boolean;
+  compacted_through_sequence: number;
+  estimated_tokens: number;
+  budget_tokens: number;
+};
 type RenameTarget =
   | { kind: "project"; id: string; title: string }
   | { kind: "task"; id: string; title: string }
@@ -113,6 +139,7 @@ type Task = {
   task_id?: string;
   display_title?: string | null;
   project_id?: string | null;
+  conversation_id?: string | null;
   task_mode?: string;
   task_operation?: Operation;
   task_description?: string;
@@ -616,6 +643,13 @@ export function App() {
   const [confirmed, setConfirmed] = useState(false);
   const [task, setTask] = useState<Task | null>(null);
   const [conversation, setConversation] = useState<Conversation | null>(null);
+  const selectedConversationIdRef = useRef<string | null>(null);
+  const conversationMessageRequestRef = useRef(0);
+  const taskSelectionRequestRef = useRef(0);
+  const [conversationMessages, setConversationMessages] = useState<ConversationMessage[]>([]);
+  const [conversationContext, setConversationContext] =
+    useState<ConversationContextState | null>(null);
+  const [conversationMessagesLoading, setConversationMessagesLoading] = useState(false);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [showArchived, setShowArchived] = useState(false);
   const [showTaskSearch, setShowTaskSearch] = useState(false);
@@ -698,6 +732,14 @@ export function App() {
   const [sidebarMenu, setSidebarMenu] = useState<SidebarMenu | null>(null);
   const [renameTarget, setRenameTarget] = useState<RenameTarget | null>(null);
   const [renameValue, setRenameValue] = useState("");
+  const conversationEndRef = useRef<HTMLDivElement | null>(null);
+  const summarizedTaskRef = useRef<string | null>(null);
+  const taskBlocksNewTurn = Boolean(task && !terminalTaskStatuses.has(task.status));
+
+  function activateConversation(next: Conversation | null) {
+    selectedConversationIdRef.current = next?.conversation_id ?? null;
+    setConversation(next);
+  }
 
   async function loadProjects() {
     const response = await fetch(`${API}/projects`);
@@ -719,6 +761,38 @@ export function App() {
     if (!response.ok) throw new Error("无法读取对话列表");
     const data = (await response.json()) as { conversations?: Conversation[] };
     setConversations(data.conversations ?? []);
+  }
+
+  async function loadConversationMessages(conversationId: string) {
+    if (selectedConversationIdRef.current !== conversationId) return null;
+    const requestSequence = ++conversationMessageRequestRef.current;
+    setConversationMessagesLoading(true);
+    try {
+      const response = await fetch(
+        `${API}/conversations/${encodeURIComponent(conversationId)}/messages`,
+      );
+      if (!response.ok) throw new Error("无法读取对话消息");
+      const data = (await response.json()) as {
+        messages?: ConversationMessage[];
+        context?: ConversationContextState;
+      };
+      if (
+        selectedConversationIdRef.current !== conversationId ||
+        conversationMessageRequestRef.current !== requestSequence
+      ) {
+        return null;
+      }
+      setConversationMessages(data.messages ?? []);
+      setConversationContext(data.context ?? null);
+      return data;
+    } finally {
+      if (
+        selectedConversationIdRef.current === conversationId &&
+        conversationMessageRequestRef.current === requestSequence
+      ) {
+        setConversationMessagesLoading(false);
+      }
+    }
   }
 
   async function loadTasks(includeArchived = showArchived) {
@@ -1040,7 +1114,7 @@ export function App() {
   }, [projectId]);
 
   useEffect(() => {
-    if (task || !projectDiagnosis) return;
+    if (taskBlocksNewTurn || !projectDiagnosis) return;
     const recommendedOperation =
       projectDiagnosis.recommended_task_operation ??
       (projectDiagnosis.task_modes.full_local.code === "FULL_LOCAL_RESEARCH_ONLY"
@@ -1049,7 +1123,7 @@ export function App() {
     setMode(projectDiagnosis.recommended_task_mode);
     setOperation(recommendedOperation);
     setConfirmed(false);
-  }, [projectDiagnosis, task?.thread_id]);
+  }, [projectDiagnosis, task?.thread_id, taskBlocksNewTurn]);
 
   useEffect(() => {
     if (!task) return;
@@ -1092,10 +1166,18 @@ export function App() {
           (event as MessageEvent<string>).data,
         ) as Pick<Task, "status" | "pending_approval" | "verdict">;
         setTask((current) => (current ? { ...current, ...snapshot } : current));
-        if (["REPORT", "BLOCKED", "FAILED", "CANCELLED"].includes(snapshot.status)) {
+        if (terminalTaskStatuses.has(snapshot.status)) {
           completed = true;
           setEventStreamState("closed");
           source.close();
+          if (task.conversation_id) {
+            void Promise.all([
+              loadConversationMessages(task.conversation_id),
+              loadConversations(showArchived),
+            ]).catch(() =>
+              setRequestError("任务已结束，但暂时无法刷新对话记录。"),
+            );
+          }
         }
       } catch {
         // 事件保留在时间线，任务详情仍会由轮询同步。
@@ -1119,6 +1201,14 @@ export function App() {
   }, [task?.thread_id]);
 
   useEffect(() => {
+    if (!conversationMessages.length && !task) return;
+    const frame = window.requestAnimationFrame(() =>
+      conversationEndRef.current?.scrollIntoView({ block: "end" }),
+    );
+    return () => window.cancelAnimationFrame(frame);
+  }, [conversationMessages.length, task?.thread_id, task?.status, task?.pending_approval]);
+
+  useEffect(() => {
     if (task?.pending_approval) setActiveView("task");
   }, [task?.pending_approval]);
 
@@ -1134,6 +1224,7 @@ export function App() {
     if (!task) return;
     const threadId = task.thread_id;
     let active = true;
+    let timer: number | undefined;
     async function refreshTask() {
       try {
         const response = await fetch(`${API}/tasks/${threadId}`);
@@ -1178,16 +1269,32 @@ export function App() {
           setContextSnapshot(contextPayload.context_snapshot ?? null);
           setTaskAttachments(contextPayload.attached_documents ?? []);
           setTelemetry(telemetryPayload);
+          if (
+            snapshot.conversation_id &&
+            terminalTaskStatuses.has(snapshot.status)
+          ) {
+            const summaryKey = `${snapshot.thread_id}:${snapshot.status}:${snapshot.verdict ?? ""}`;
+            if (summarizedTaskRef.current !== summaryKey) {
+              summarizedTaskRef.current = summaryKey;
+              void Promise.all([
+                loadConversationMessages(snapshot.conversation_id),
+                loadConversations(showArchived),
+              ]).catch(() =>
+                setRequestError("任务已结束，但暂时无法刷新对话记录。"),
+              );
+            }
+            if (timer !== undefined) window.clearInterval(timer);
+          }
         }
       } catch {
         // SSE 是首选通道；轮询失败不覆盖已显示的证据或产物。
       }
     }
     void refreshTask();
-    const timer = window.setInterval(() => void refreshTask(), 2000);
+    timer = window.setInterval(() => void refreshTask(), 2000);
     return () => {
       active = false;
-      window.clearInterval(timer);
+      if (timer !== undefined) window.clearInterval(timer);
     };
   }, [task?.thread_id]);
 
@@ -1337,7 +1444,7 @@ export function App() {
         (event.ctrlKey || event.metaKey) &&
         event.key === "Enter" &&
         event.target === taskDescriptionRef.current &&
-        !task &&
+        !taskBlocksNewTurn &&
         Boolean(projectId && description.trim()) &&
         runtimeHealth.status === "READY" &&
         !(mode === "full-local" && !confirmed)
@@ -1370,6 +1477,7 @@ export function App() {
     showTaskTerminal,
     showTaskSearch,
     task,
+    taskBlocksNewTurn,
   ]);
 
   async function addProject(path: string) {
@@ -1395,7 +1503,7 @@ export function App() {
         );
         if (!association.ok) throw new Error("项目已添加，但当前对话未能关联。");
         const associationPayload = (await association.json()) as { conversation: Conversation };
-        setConversation(associationPayload.conversation);
+        activateConversation(associationPayload.conversation);
         await loadConversations(showArchived);
       }
       await loadProjects();
@@ -1749,6 +1857,7 @@ export function App() {
 
   async function start() {
     if (
+      taskBlocksNewTurn ||
       !projectId ||
       !description.trim() ||
       (mode === "full-local" && !confirmed)
@@ -1778,11 +1887,45 @@ export function App() {
     setTelemetry(null);
     setRequestError("");
     try {
+      let activeConversation = conversation;
+      if (!activeConversation) {
+        const created = await fetch(`${API}/conversations`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            project_id: projectId,
+            display_title: description.trim().slice(0, 80),
+            mode: operation === "research" ? "plan" : "goal",
+          }),
+        });
+        const createdPayload = await created.json();
+        if (!created.ok) {
+          throw new Error(createdPayload.detail ?? "无法创建任务会话");
+        }
+        activeConversation = createdPayload.conversation as Conversation;
+        activateConversation(activeConversation);
+      } else if (activeConversation.project_id !== projectId) {
+        const associated = await fetch(
+          `${API}/conversations/${encodeURIComponent(activeConversation.conversation_id)}`,
+          {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ project_id: projectId }),
+          },
+        );
+        const associatedPayload = await associated.json();
+        if (!associated.ok) {
+          throw new Error(associatedPayload.detail ?? "当前对话无法关联到选择的项目");
+        }
+        activeConversation = associatedPayload.conversation as Conversation;
+        activateConversation(activeConversation);
+      }
       const response = await fetch(`${API}/tasks`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           project_id: projectId,
+          conversation_id: activeConversation.conversation_id,
           description,
           task_mode: mode,
           operation,
@@ -1801,16 +1944,15 @@ export function App() {
         );
       }
       setTask(payload as Task);
-      if (conversation) {
-        // 执行后的真实 Agent 任务接管会话历史，草稿仅归档而不删除。
-        await fetch(`${API}/conversations/${encodeURIComponent(conversation.conversation_id)}/archive`, {
-          method: "POST",
-        });
-        setConversation(null);
-        await loadConversations(showArchived);
-      }
+      setDescription("");
+      setAttachedDocumentIds([]);
+      summarizedTaskRef.current = null;
       setActiveView("task");
-      await loadTasks();
+      await Promise.all([
+        loadTasks(),
+        loadConversations(showArchived),
+        loadConversationMessages(activeConversation.conversation_id),
+      ]);
     } catch (error) {
       setRequestError(error instanceof Error ? error.message : "任务创建失败");
     }
@@ -1964,7 +2106,7 @@ export function App() {
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.detail ?? "新建对话失败");
       const created = payload.conversation as Conversation;
-      setConversation(created);
+      activateConversation(created);
       setProjectId(created.project_id ?? "");
       setOperation(created.mode === "plan" ? "research" : "change");
       await loadConversations(showArchived);
@@ -1975,8 +2117,14 @@ export function App() {
   }
 
   function beginNewTask() {
+    conversationMessageRequestRef.current += 1;
+    taskSelectionRequestRef.current += 1;
     setTask(null);
-    setConversation(null);
+    activateConversation(null);
+    setConversationMessages([]);
+    setConversationContext(null);
+    setConversationMessagesLoading(false);
+    summarizedTaskRef.current = null;
     setEvents([]);
     setArtifacts([]);
     setArtifactVersions([]);
@@ -2004,7 +2152,12 @@ export function App() {
   }
 
   function switchProject(nextProjectId: string) {
-    if (task?.project_id && task.project_id !== nextProjectId) beginNewTask();
+    if (
+      (task?.project_id && task.project_id !== nextProjectId) ||
+      (conversation?.project_id && conversation.project_id !== nextProjectId)
+    ) {
+      beginNewTask();
+    }
     setProjectId(nextProjectId);
     setApprovedMcpTools([]);
     setMcpResult(null);
@@ -2017,16 +2170,35 @@ export function App() {
     window.requestAnimationFrame(() => taskDescriptionRef.current?.focus());
   }
 
-  async function selectTask(selected: Task, view: WorkspaceView = "task") {
+  async function selectTask(
+    selected: Task,
+    view: WorkspaceView = "task",
+    preserveConversation = false,
+  ) {
+    const selectionRequest = ++taskSelectionRequestRef.current;
     setRequestError("");
     setEvents([]);
     try {
       const response = await fetch(`${API}/tasks/${selected.thread_id}`);
       if (!response.ok) throw new Error("任务详情不可恢复");
       const snapshot = (await response.json()) as Task;
+      if (taskSelectionRequestRef.current !== selectionRequest) return;
       const merged = { ...selected, ...snapshot };
       setTask(merged);
-      setConversation(null);
+      if (!preserveConversation) {
+        const linkedConversation = merged.conversation_id
+          ? conversations.find(
+              (item) => item.conversation_id === merged.conversation_id,
+            ) ?? null
+          : null;
+        activateConversation(linkedConversation);
+        if (linkedConversation) {
+          await loadConversationMessages(linkedConversation.conversation_id);
+        } else {
+          setConversationMessages([]);
+          setConversationContext(null);
+        }
+      }
       setProjectId(merged.project_id ?? projectId);
       if (merged.task_mode === "safe-isolated" || merged.task_mode === "full-local") {
         setMode(merged.task_mode);
@@ -2041,15 +2213,49 @@ export function App() {
     }
   }
 
-  function selectConversation(selected: Conversation) {
+  async function selectConversation(selected: Conversation) {
+    taskSelectionRequestRef.current += 1;
     setTask(null);
-    setConversation(selected);
+    activateConversation(selected);
+    setConversationMessages([]);
+    setConversationContext(null);
+    setEvents([]);
+    setArtifacts([]);
+    setArtifactVersions([]);
+    setSelectedArtifact("");
+    setSelectedArtifactVersion(null);
+    setArtifactContent("");
+    setContextSnapshot(null);
+    setTaskAttachments([]);
+    setTelemetry(null);
     setProjectId(selected.project_id ?? "");
     setOperation(selected.mode === "plan" ? "research" : "change");
     setDescription("");
     setRequestError("");
     setActiveView("task");
     setShowTaskTerminal(false);
+    try {
+      const payload = await loadConversationMessages(selected.conversation_id);
+      if (
+        !payload ||
+        selectedConversationIdRef.current !== selected.conversation_id
+      ) {
+        return;
+      }
+      const latestThreadId = [...(payload.messages ?? [])]
+        .reverse()
+        .find((item) => item.task_thread_id)?.task_thread_id;
+      if (latestThreadId) {
+        const latestTask = tasks.find((item) => item.thread_id === latestThreadId) ?? {
+          thread_id: latestThreadId,
+          status: "RUNNING",
+          pending_approval: false,
+        };
+        await selectTask(latestTask, "task", true);
+      }
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "无法读取对话记录");
+    }
   }
 
   function selectOperation(nextOperation: Operation) {
@@ -2064,7 +2270,7 @@ export function App() {
         const payload = await response.json();
         if (!response.ok) throw new Error(payload.detail ?? "对话模式更新失败");
         const updated = payload.conversation as Conversation;
-        setConversation(updated);
+        activateConversation(updated);
         await loadConversations(showArchived);
       })
       .catch((error: unknown) =>
@@ -2205,12 +2411,7 @@ export function App() {
             value: "分析当前变更涉及的行为边界，定位已有测试并补充最小的 Maven 回归测试。",
           },
         ];
-  const taskIsRunning = Boolean(
-    task &&
-      !["REPORT", "FAILED", "PASSED", "BLOCKED", "CANCELLED", "UNVERIFIED"].includes(
-        task.status,
-      ),
-  );
+  const taskIsRunning = taskBlocksNewTurn;
   const taskOutcome = task ? resolveTaskOutcome(task, taskIsRunning) : null;
   const taskCanExportEvidence = Boolean(
     task &&
@@ -2257,6 +2458,23 @@ export function App() {
     task?.task_description ??
     task?.state?.task_description ??
     (task ? task.display_title : description.trim());
+  const currentTaskRequestPersisted = Boolean(
+    task &&
+      conversationMessages.some(
+        (item) =>
+          item.task_thread_id === task.thread_id && item.kind === "task_request",
+      ),
+  );
+  const currentTaskSummaryPersisted = Boolean(
+    task &&
+      conversationMessages.some(
+        (item) =>
+          item.task_thread_id === task.thread_id && item.kind === "task_summary",
+      ),
+  );
+  const showLiveTaskResponse = Boolean(
+    task && (taskBlocksNewTurn || !currentTaskSummaryPersisted),
+  );
   const researchPlanApproval = Boolean(
     task?.pending_approval &&
       activeTaskOperation === "research" &&
@@ -2276,7 +2494,7 @@ export function App() {
   const approvalSteps = readStringList(approvalPlan?.steps);
   const executionApproval = interrupt?.type === "EXECUTION_APPROVAL_REQUIRED";
   const canStart =
-    !task &&
+    !taskBlocksNewTurn &&
     Boolean(projectId && description.trim()) &&
     runtimeHealth.status === "READY" &&
     operationAllowed &&
@@ -2543,7 +2761,7 @@ export function App() {
                           key={item.conversation_id}
                           onContextMenu={(event) => openSidebarMenu(event, "conversation", item.conversation_id)}
                         >
-                          <button type="button" onClick={() => selectConversation(item)}>
+                          <button type="button" onClick={() => void selectConversation(item)}>
                             <ChatCircle size={15} />
                             <span>{item.display_title}</span>
                             <small>{item.mode === "plan" ? "计划" : "目标"}</small>
@@ -2589,7 +2807,7 @@ export function App() {
                   key={item.conversation_id}
                   onContextMenu={(event) => openSidebarMenu(event, "conversation", item.conversation_id)}
                 >
-                  <button type="button" onClick={() => selectConversation(item)}>
+                  <button type="button" onClick={() => void selectConversation(item)}>
                     <ChatCircle size={15} />
                     <span>
                       <strong>{item.display_title}</strong>
@@ -2742,7 +2960,7 @@ export function App() {
             <section className="session-view">
             <div className="conversation-scroll">
               <div className="conversation-column">
-                {!task && (
+                {!task && conversationMessages.length === 0 && !conversationMessagesLoading && (
                   <div className="new-task-state">
                     <p className="new-task-kicker">当前工作区</p>
                     <h2>{operation === "research" ? "先制定可信计划" : "明确目标，持续推进"}</h2>
@@ -2788,19 +3006,77 @@ export function App() {
                   </div>
                 )}
 
-                {task && (
-                  <>
-                    <article className="conversation-turn user-turn">
+                {conversationMessagesLoading && conversationMessages.length === 0 && (
+                  <div className="conversation-loading" aria-live="polite">
+                    <CircleNotch className="spin" size={18} />正在恢复对话记录
+                  </div>
+                )}
+
+                {conversationContext?.compacted && (
+                  <p className="conversation-context-notice">
+                    早期会话已自动压缩为上下文摘要，原始对话仍保留。
+                  </p>
+                )}
+
+                {conversationMessages.map((message) =>
+                  message.role === "user" ? (
+                    <article className="conversation-turn user-turn" key={message.message_id}>
                       <span className="turn-avatar">你</span>
                       <div>
-                        <p>{displayedTaskDescription || "继续任务 " + compactTaskLabel(task)}</p>
-                        <small>
-                          {activeTaskOperation === "research" ? "计划模式" : "目标模式"}
-                          {" · "}
-                          {activeTaskMode === "safe-isolated" ? "安全隔离修复" : "完全本机控制"}
-                        </small>
+                        <p>{message.content}</p>
+                        <small>代码任务 · 第 {message.sequence} 条消息</small>
                       </div>
                     </article>
+                  ) : (
+                    <article className="conversation-turn assistant-turn conversation-summary-turn" key={message.message_id}>
+                      <span className="turn-avatar agent-avatar"><TerminalWindow size={15} weight="bold" /></span>
+                      <div className="agent-response">
+                        <div className="agent-response-header">
+                          <strong>RepoPilot</strong>
+                          <span className="conversation-summary-status">
+                            {message.task_verdict ?? message.task_status ?? "已结束"}
+                          </span>
+                        </div>
+                        <p className="conversation-summary-content">{message.content}</p>
+                        {message.task_thread_id && (
+                          <button
+                            className="conversation-detail-button"
+                            type="button"
+                            onClick={() => {
+                              const linkedTask = tasks.find(
+                                (item) => item.thread_id === message.task_thread_id,
+                              ) ?? {
+                                thread_id: message.task_thread_id as string,
+                                status: "REPORT",
+                                pending_approval: false,
+                              };
+                              void selectTask(linkedTask, "task", true);
+                            }}
+                          >
+                            <ListMagnifyingGlass size={15} />查看任务详情
+                          </button>
+                        )}
+                      </div>
+                    </article>
+                  ),
+                )}
+
+                {task && (
+                  <>
+                    {!currentTaskRequestPersisted && (
+                      <article className="conversation-turn user-turn">
+                        <span className="turn-avatar">你</span>
+                        <div>
+                          <p>{displayedTaskDescription || "继续任务 " + compactTaskLabel(task)}</p>
+                          <small>
+                            {activeTaskOperation === "research" ? "计划模式" : "目标模式"}
+                            {" · "}
+                            {activeTaskMode === "safe-isolated" ? "安全隔离修复" : "完全本机控制"}
+                          </small>
+                        </div>
+                      </article>
+                    )}
+                    {showLiveTaskResponse && (
                     <article className="conversation-turn assistant-turn">
                       <span className="turn-avatar agent-avatar"><TerminalWindow size={15} weight="bold" /></span>
                       <div className="agent-response">
@@ -2889,6 +3165,7 @@ export function App() {
                         )}
                       </div>
                     </article>
+                    )}
                   </>
                 )}
 
@@ -2996,11 +3273,12 @@ export function App() {
                     </section>
                   </div>
                 )}
+                <div ref={conversationEndRef} aria-hidden="true" />
               </div>
             </div>
 
             <div className="composer-region">
-              {task ? (
+              {task && taskBlocksNewTurn ? (
                 <div className="task-command-bar">
                   <span className="task-command-hint">
                     {task.pending_approval
