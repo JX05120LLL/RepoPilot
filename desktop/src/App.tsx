@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type MouseEvent } from "react";
+import ReactMarkdown from "react-markdown";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { ArtifactContent } from "./components/ArtifactContent";
 import { CommandPalette, type CommandPaletteItem } from "./components/CommandPalette";
@@ -69,6 +70,7 @@ const capabilityRiskLabels: Record<string, string> = {
 type Mode = "safe-isolated" | "full-local";
 type Operation = "change" | "research";
 type ConversationMode = "goal" | "plan";
+type ComposerMode = "chat" | "research" | "change";
 type WorkspaceView = "task" | "context" | "settings" | "review";
 type EvidenceScope = "key" | "all";
 type EventStreamState = "idle" | "connecting" | "connected" | "reconnecting" | "offline" | "closed";
@@ -93,7 +95,7 @@ type ConversationMessage = {
   conversation_id: string;
   sequence: number;
   role: "user" | "assistant";
-  kind: "task_request" | "task_summary";
+  kind: "chat_request" | "chat_response" | "task_request" | "task_summary";
   content: string;
   task_thread_id?: string | null;
   task_status?: string | null;
@@ -637,6 +639,8 @@ export function App() {
   const [description, setDescription] = useState("");
   const [mode, setMode] = useState<Mode>("safe-isolated");
   const [operation, setOperation] = useState<Operation>("change");
+  const [composerMode, setComposerMode] = useState<ComposerMode>("chat");
+  const [chatBusy, setChatBusy] = useState(false);
   const [activeView, setActiveView] = useState<WorkspaceView>(
     () => savedWorkbenchPreferences.activeView ?? "task",
   );
@@ -851,7 +855,7 @@ export function App() {
   }
 
   async function loadProjectDiagnosis(targetProjectId: string) {
-    if (!targetProjectId) {
+    if (!targetProjectId || !projects.some((project) => project.project_id === targetProjectId)) {
       setProjectDiagnosis(null);
       return;
     }
@@ -866,7 +870,7 @@ export function App() {
   }
 
   async function loadCapabilityDirectory(targetProjectId: string) {
-    if (!targetProjectId) {
+    if (!targetProjectId || !projects.some((project) => project.project_id === targetProjectId)) {
       setCapabilityDirectory(null);
       return;
     }
@@ -1099,19 +1103,19 @@ export function App() {
         error instanceof Error ? error.message : "无法读取已导入研发文档",
       ),
     );
-  }, [projectId]);
+  }, [projectId, projects]);
 
   useEffect(() => {
     void loadProjectDiagnosis(projectId).catch((error) =>
       setRequestError(error instanceof Error ? error.message : "无法读取项目诊断"),
     );
-  }, [projectId]);
+  }, [projectId, projects]);
 
   useEffect(() => {
     void loadCapabilityDirectory(projectId).catch((error) =>
       setRequestError(error instanceof Error ? error.message : "无法读取项目能力目录"),
     );
-  }, [projectId]);
+  }, [projectId, projects]);
 
   useEffect(() => {
     if (taskBlocksNewTurn || !projectDiagnosis) return;
@@ -1442,19 +1446,6 @@ export function App() {
       }
       if (
         (event.ctrlKey || event.metaKey) &&
-        event.key === "Enter" &&
-        event.target === taskDescriptionRef.current &&
-        !taskBlocksNewTurn &&
-        Boolean(projectId && description.trim()) &&
-        runtimeHealth.status === "READY" &&
-        !(mode === "full-local" && !confirmed)
-      ) {
-        event.preventDefault();
-        void start();
-        return;
-      }
-      if (
-        (event.ctrlKey || event.metaKey) &&
         key === "n" &&
         !isEditableTarget(event.target)
       ) {
@@ -1466,11 +1457,6 @@ export function App() {
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
   }, [
-    confirmed,
-    description,
-    mode,
-    projectId,
-    runtimeHealth.status,
     activeView,
     showCommandPalette,
     showTaskInspector,
@@ -1958,6 +1944,60 @@ export function App() {
     }
   }
 
+  async function sendChat() {
+    if (chatBusy || taskBlocksNewTurn || !description.trim()) return;
+    setChatBusy(true);
+    setRequestError("");
+    try {
+      let activeConversation = conversation;
+      if (!activeConversation) {
+        const created = await fetch(`${API}/conversations`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            display_title: description.trim().slice(0, 80),
+            mode: "goal",
+          }),
+        });
+        const createdPayload = await created.json();
+        if (!created.ok) {
+          throw new Error(createdPayload.detail ?? "无法创建对话");
+        }
+        activeConversation = createdPayload.conversation as Conversation;
+        activateConversation(activeConversation);
+      }
+      const response = await fetch(
+        `${API}/conversations/${encodeURIComponent(activeConversation.conversation_id)}/chat`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: description.trim() }),
+        },
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(typeof payload.detail === "string" ? payload.detail : "普通对话失败");
+      }
+      setDescription("");
+      await Promise.all([
+        loadConversations(showArchived),
+        loadConversationMessages(activeConversation.conversation_id),
+      ]);
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "普通对话失败");
+    } finally {
+      setChatBusy(false);
+    }
+  }
+
+  function sendComposerMessage() {
+    if (composerMode === "chat") {
+      void sendChat();
+      return;
+    }
+    void start();
+  }
+
   async function probeMcp() {
     if (
       !projectId ||
@@ -2093,6 +2133,7 @@ export function App() {
   async function beginNewConversation(project: string | null = projectId || null) {
     const conversationMode: ConversationMode = operation === "research" ? "plan" : "goal";
     beginNewTask();
+    setComposerMode("chat");
     setRequestError("");
     try {
       const response = await fetch(`${API}/conversations`, {
@@ -2230,6 +2271,7 @@ export function App() {
     setTelemetry(null);
     setProjectId(selected.project_id ?? "");
     setOperation(selected.mode === "plan" ? "research" : "change");
+    setComposerMode("chat");
     setDescription("");
     setRequestError("");
     setActiveView("task");
@@ -2259,7 +2301,13 @@ export function App() {
   }
 
   function selectOperation(nextOperation: Operation) {
+    const fullLocalOperations = projectDiagnosis?.task_modes.full_local.allowed_operations ?? [];
+    if (!allowedOperations.includes(nextOperation) && fullLocalOperations.includes(nextOperation)) {
+      setMode("full-local");
+      setConfirmed(false);
+    }
     setOperation(nextOperation);
+    setComposerMode(nextOperation);
     if (!conversation) return;
     void fetch(`${API}/conversations/${encodeURIComponent(conversation.conversation_id)}`, {
       method: "PATCH",
@@ -2338,6 +2386,9 @@ export function App() {
           ? ["change", "research"]
           : ["research"]
       : []);
+  const fullLocalOperations = projectDiagnosis?.task_modes.full_local.allowed_operations ?? [];
+  const canSelectResearch = allowedOperations.includes("research") || fullLocalOperations.includes("research");
+  const canSelectChange = allowedOperations.includes("change") || fullLocalOperations.includes("change");
   const operationAllowed = allowedOperations.includes(operation);
   const taskAdmissionMessage = operationAllowed
     ? ""
@@ -2500,6 +2551,9 @@ export function App() {
     operationAllowed &&
     !(safeModeBlockedByProject && mode === "safe-isolated") &&
     !(mode === "full-local" && !confirmed);
+  const canSubmit = composerMode === "chat"
+    ? !taskBlocksNewTurn && Boolean(description.trim()) && !chatBusy
+    : canStart;
   const commandItems: CommandPaletteItem[] = [
     {
       id: "new-conversation",
@@ -3021,23 +3075,29 @@ export function App() {
                 {conversationMessages.map((message) =>
                   message.role === "user" ? (
                     <article className="conversation-turn user-turn" key={message.message_id}>
-                      <span className="turn-avatar">你</span>
                       <div>
                         <p>{message.content}</p>
-                        <small>代码任务 · 第 {message.sequence} 条消息</small>
+                        {message.kind === "task_request" && <small>代码任务</small>}
                       </div>
                     </article>
                   ) : (
-                    <article className="conversation-turn assistant-turn conversation-summary-turn" key={message.message_id}>
-                      <span className="turn-avatar agent-avatar"><TerminalWindow size={15} weight="bold" /></span>
+                    <article className={`conversation-turn assistant-turn ${message.kind === "task_summary" ? "conversation-summary-turn" : "conversation-chat-turn"}`} key={message.message_id}>
                       <div className="agent-response">
-                        <div className="agent-response-header">
-                          <strong>RepoPilot</strong>
-                          <span className="conversation-summary-status">
-                            {message.task_verdict ?? message.task_status ?? "已结束"}
-                          </span>
-                        </div>
-                        <p className="conversation-summary-content">{message.content}</p>
+                        {message.kind === "task_summary" && (
+                          <div className="agent-response-header">
+                            <strong>RepoPilot</strong>
+                            <span className="conversation-summary-status">
+                              {message.task_verdict ?? message.task_status ?? "已结束"}
+                            </span>
+                          </div>
+                        )}
+                        {message.kind === "chat_response" ? (
+                          <div className="conversation-chat-markdown">
+                            <ReactMarkdown>{message.content}</ReactMarkdown>
+                          </div>
+                        ) : (
+                          <p className="conversation-summary-content">{message.content}</p>
+                        )}
                         {message.task_thread_id && (
                           <button
                             className="conversation-detail-button"
@@ -3314,9 +3374,9 @@ export function App() {
                 <>
                   <div className="composer">
                     {(requestError ||
-                      (apiReady && runtimeHealth.status !== "READY") ||
-                      (Boolean(currentProject) && !operationAllowed) ||
-                      (mode === "safe-isolated" && safeModeBlockedByProject)) && (
+                      (composerMode !== "chat" && apiReady && runtimeHealth.status !== "READY") ||
+                      (composerMode !== "chat" && Boolean(currentProject) && !operationAllowed) ||
+                      (composerMode !== "chat" && mode === "safe-isolated" && safeModeBlockedByProject)) && (
                       <div className="composer-error">
                         <WarningCircle size={16} />
                         <span>
@@ -3335,13 +3395,13 @@ export function App() {
                         </span>
                       </div>
                     )}
-                    {mode === "full-local" && !confirmed && (
+                    {composerMode !== "chat" && mode === "full-local" && !confirmed && (
                       <label className="full-access-confirmation">
                         <input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />
                         <span><b>确认完全本机访问</b>Agent 将直接在当前项目目录中执行已实现的高风险操作。</span>
                       </label>
                     )}
-                    {attachedDocuments.length > 0 && (
+                    {composerMode !== "chat" && attachedDocuments.length > 0 && (
                       <div className="attachment-row">
                         <FileArrowUp size={16} />
                         <span className="attachment-label">已加入当前上下文</span>
@@ -3366,48 +3426,60 @@ export function App() {
                       value={description}
                       onChange={(event) => setDescription(event.target.value)}
                       onKeyDown={(event) => {
-                        if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && canStart) {
+                        if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && canSubmit) {
                           event.preventDefault();
-                          void start();
+                          sendComposerMessage();
                         }
                       }}
-                      placeholder={operation === "research"
-                        ? "描述要理解、定位或评估的代码问题"
-                        : "描述最终想实现的代码目标"}
-                      aria-label="代码任务描述"
+                      placeholder={composerMode === "chat"
+                        ? "向 RepoPilot 提问"
+                        : composerMode === "research"
+                          ? "描述要理解、定位或评估的代码问题"
+                          : "描述最终想实现的代码目标"}
+                      aria-label={composerMode === "chat" ? "对话消息" : "代码任务描述"}
                     />
                     <div className="composer-toolbar">
                       <div className="composer-tools">
-                        <button className="icon-button" type="button" title="上传 MD 或 TXT 并直接加入当前上下文" onClick={() => void chooseDocument()} disabled={!projectId || documentBusy || attachedDocumentIds.length >= 4}>
-                          <Paperclip size={19} />
-                        </button>
-                        <div className="operation-control" role="group" aria-label="任务类型">
+                        <div className="operation-control" role="group" aria-label="输入模式">
                           <button
-                            className={operation === "change" ? "active" : ""}
+                            className={composerMode === "chat" ? "active" : ""}
                             type="button"
-                            disabled={!allowedOperations.includes("change")}
+                            onClick={() => setComposerMode("chat")}
+                            aria-label="对话模式"
+                            aria-pressed={composerMode === "chat"}
+                            title="普通对话，不读取仓库、不创建任务"
+                          >
+                            <span>对话</span>
+                          </button>
+                          <button
+                            className={composerMode === "change" ? "active" : ""}
+                            type="button"
+                            disabled={!canSelectChange}
                             onClick={() => selectOperation("change")}
-                            aria-label="目标模式"
-                            aria-pressed={operation === "change"}
+                            aria-label="修改代码模式"
+                            aria-pressed={composerMode === "change"}
                             title="围绕一个代码目标完成计划、受控修改和 Maven 验证"
                           >
                             <Target size={15} />
-                            <span>目标模式</span>
+                            <span>修改代码</span>
                           </button>
                           <button
-                            className={operation === "research" ? "active" : ""}
+                            className={composerMode === "research" ? "active" : ""}
                             type="button"
-                            disabled={!allowedOperations.includes("research")}
+                            disabled={!canSelectResearch}
                             onClick={() => selectOperation("research")}
-                            aria-label="计划模式"
-                            aria-pressed={operation === "research"}
+                            aria-label="分析代码模式"
+                            aria-pressed={composerMode === "research"}
                             title="只研究代码并输出证据化计划，不写入文件、不运行 Maven"
                           >
                             <ListMagnifyingGlass size={15} />
-                            <span>计划模式</span>
+                            <span>分析代码</span>
                           </button>
                         </div>
-                        <label className={"permission-control mode-" + mode}>
+                        {composerMode !== "chat" && <button className="icon-button" type="button" title="上传 MD 或 TXT 并直接加入当前上下文" onClick={() => void chooseDocument()} disabled={!projectId || documentBusy || attachedDocumentIds.length >= 4}>
+                          <Paperclip size={19} />
+                        </button>}
+                        {composerMode !== "chat" && <label className={"permission-control mode-" + mode}>
                           {mode === "safe-isolated" ? <ShieldCheck size={17} /> : <WarningCircle size={17} />}
                           <select
                             value={mode}
@@ -3430,14 +3502,14 @@ export function App() {
                             </option>
                             <option value="full-local">完全本机</option>
                           </select>
-                        </label>
+                        </label>}
                       </div>
-                      <button className="send-button" type="button" title="开始任务（Ctrl + Enter）" onClick={() => void start()} disabled={!canStart}>
+                      <button className="send-button" type="button" title={composerMode === "chat" ? "发送消息（Ctrl + Enter）" : "开始代码任务（Ctrl + Enter）"} onClick={sendComposerMessage} disabled={!canSubmit}>
                         <ArrowUp size={19} weight="bold" />
                       </button>
                     </div>
                   </div>
-                  <p className="composer-caption">{currentProject ? projectStatusLabel : conversation ? "未关联项目的对话不会执行代码；选择项目后才能启动 Agent。" : "选择项目后即可创建任务"}</p>
+                  <p className="composer-caption">{composerMode === "chat" ? "普通对话不会读取仓库、创建任务或执行命令。" : currentProject ? projectStatusLabel : "代码任务需要先选择项目。"}</p>
                 </>
               )}
             </div>

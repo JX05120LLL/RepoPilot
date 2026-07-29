@@ -238,6 +238,44 @@ class FakeApiMcpConnector:
 
 
 class ApiTests(unittest.TestCase):
+    def test_plain_chat_persists_messages_without_creating_a_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            registry = ProjectRegistry(root / "state.sqlite")
+            runner = FakeRunner(delay=0)
+            try:
+                with TestClient(
+                    create_app(
+                        runner,
+                        registry,
+                        root / "runs",
+                        conversation_reply=lambda history, content, project: f"回复：{content}",
+                    )
+                ) as client:
+                    created = client.post("/api/conversations", json={"display_title": "普通对话"})
+                    self.assertEqual(200, created.status_code)
+                    conversation_id = created.json()["conversation"]["conversation_id"]
+
+                    response = client.post(
+                        f"/api/conversations/{conversation_id}/chat",
+                        json={"content": "你好"},
+                    )
+
+                    self.assertEqual(200, response.status_code)
+                    self.assertEqual("READY", response.json()["status"])
+                    self.assertEqual("回复：你好", response.json()["message"]["content"])
+                    self.assertFalse(runner.ran)
+                    self.assertEqual([], client.get("/api/tasks").json()["tasks"])
+                    messages = client.get(
+                        f"/api/conversations/{conversation_id}/messages"
+                    ).json()["messages"]
+                    self.assertEqual(
+                        ["chat_request", "chat_response"],
+                        [item["kind"] for item in messages],
+                    )
+            finally:
+                registry.close()
+
     def test_sse_closes_immediately_for_failed_task(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

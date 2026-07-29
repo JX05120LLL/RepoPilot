@@ -13,7 +13,7 @@ from uuid import uuid4
 
 _MODES = frozenset({"goal", "plan"})
 _MESSAGE_ROLES = frozenset({"user", "assistant"})
-_MESSAGE_KINDS = frozenset({"task_request", "task_summary"})
+_MESSAGE_KINDS = frozenset({"chat_request", "chat_response", "task_request", "task_summary"})
 DEFAULT_CONTEXT_TOKEN_BUDGET = 12_000
 _MESSAGE_MAX_LENGTH = 12_000
 _SUMMARY_MAX_ITEM_LENGTH = 900
@@ -237,12 +237,34 @@ class ConversationStore:
             task_thread_id=task_thread_id,
         )
 
+    def append_chat_request(self, conversation_id: str, *, content: str) -> ConversationMessageRecord:
+        """保存普通对话输入；它不创建任务、工作区或审批状态。"""
+
+        return self._append_message(
+            conversation_id,
+            role="user",
+            kind="chat_request",
+            content=content,
+            task_thread_id=None,
+        )
+
+    def append_chat_response(self, conversation_id: str, *, content: str) -> ConversationMessageRecord:
+        """保存普通对话回复；模型输出仍经过统一脱敏与长度限制。"""
+
+        return self._append_message(
+            conversation_id,
+            role="assistant",
+            kind="chat_response",
+            content=content,
+            task_thread_id=None,
+        )
+
     def append_task_summary(
         self,
         conversation_id: str,
         *,
         content: str,
-        task_thread_id: str,
+        task_thread_id: str | None,
         task_status: str,
         task_verdict: str | None,
     ) -> ConversationMessageRecord:
@@ -282,7 +304,7 @@ class ConversationStore:
         role: str,
         kind: str,
         content: str,
-        task_thread_id: str,
+        task_thread_id: str | None,
         task_status: str | None = None,
         task_verdict: str | None = None,
     ) -> ConversationMessageRecord:
@@ -309,7 +331,7 @@ class ConversationStore:
         role: str,
         kind: str,
         content: str,
-        task_thread_id: str,
+        task_thread_id: str | None,
         task_status: str | None,
         task_verdict: str | None,
     ) -> ConversationMessageRecord:
@@ -368,6 +390,7 @@ class ConversationStore:
             self._connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_conversations_project_updated ON conversations(project_id, updated_at DESC)"
             )
+            self._migrate_conversation_message_kinds_locked()
             self._connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS conversation_messages (
@@ -375,7 +398,7 @@ class ConversationStore:
                     conversation_id TEXT NOT NULL,
                     sequence INTEGER NOT NULL,
                     role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
-                    kind TEXT NOT NULL CHECK(kind IN ('task_request', 'task_summary')),
+                    kind TEXT NOT NULL CHECK(kind IN ('chat_request', 'chat_response', 'task_request', 'task_summary')),
                     content TEXT NOT NULL,
                     task_thread_id TEXT,
                     task_status TEXT,
@@ -400,6 +423,44 @@ class ConversationStore:
                 """
             )
             self._connection.commit()
+
+    def _migrate_conversation_message_kinds_locked(self) -> None:
+        """SQLite 不能原地修改 CHECK 约束，保留旧消息后重建该小表。"""
+
+        row = self._connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'conversation_messages'"
+        ).fetchone()
+        if not row or "chat_request" in str(row["sql"]):
+            return
+        self._connection.executescript(
+            """
+            DROP INDEX IF EXISTS idx_conversation_messages_conversation_sequence;
+            DROP INDEX IF EXISTS idx_conversation_messages_task_kind;
+            ALTER TABLE conversation_messages RENAME TO conversation_messages_legacy;
+            CREATE TABLE conversation_messages (
+                message_id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+                kind TEXT NOT NULL CHECK(kind IN ('chat_request', 'chat_response', 'task_request', 'task_summary')),
+                content TEXT NOT NULL,
+                task_thread_id TEXT,
+                task_status TEXT,
+                task_verdict TEXT,
+                created_at TEXT NOT NULL,
+                UNIQUE(conversation_id, sequence),
+                FOREIGN KEY(conversation_id) REFERENCES conversations(conversation_id)
+            );
+            INSERT INTO conversation_messages(
+                message_id, conversation_id, sequence, role, kind, content, task_thread_id,
+                task_status, task_verdict, created_at
+            )
+            SELECT message_id, conversation_id, sequence, role, kind, content, task_thread_id,
+                   task_status, task_verdict, created_at
+            FROM conversation_messages_legacy;
+            DROP TABLE conversation_messages_legacy;
+            """
+        )
 
     def _get_locked(self, conversation_id: str) -> ConversationRecord:
         row = self._connection.execute(

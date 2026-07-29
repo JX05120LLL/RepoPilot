@@ -1647,9 +1647,8 @@ textarea::placeholder {
 }
 
 .conversation-turn {
-  display: grid;
-  grid-template-columns: 30px minmax(0, 1fr);
-  gap: 13px;
+  display: flex;
+  align-items: flex-start;
 }
 
 .conversation-turn + .conversation-turn {
@@ -1675,12 +1674,21 @@ textarea::placeholder {
   border-color: #25282d;
 }
 
+.user-turn {
+  justify-content: flex-end;
+}
+
 .user-turn > div {
-  padding-top: 3px;
+  width: fit-content;
+  max-width: min(72%, 720px);
+  padding: 10px 13px;
+  background: #f1f2f3;
+  border: 1px solid #e4e6e8;
+  border-radius: 14px 14px 4px 14px;
 }
 
 .user-turn p {
-  max-width: 720px;
+  max-width: none;
   margin: 0;
   color: #24272b;
   font-size: 15px;
@@ -1695,7 +1703,37 @@ textarea::placeholder {
 }
 
 .agent-response {
+  max-width: min(82%, 820px);
   min-width: 0;
+}
+
+.conversation-chat-turn .agent-response {
+  padding-top: 3px;
+}
+
+.conversation-chat-markdown {
+  color: #2c3035;
+  font-size: 15px;
+  line-height: 1.7;
+}
+
+.conversation-chat-markdown > :first-child {
+  margin-top: 0;
+}
+
+.conversation-chat-markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.conversation-chat-markdown p,
+.conversation-chat-markdown ul,
+.conversation-chat-markdown ol {
+  margin: 0 0 10px;
+}
+
+.conversation-chat-markdown ul,
+.conversation-chat-markdown ol {
+  padding-left: 22px;
 }
 
 .agent-response-header {

@@ -633,7 +633,9 @@ class PhaseFourGraphTests(unittest.TestCase):
             finally:
                 store.close()
 
-        self.assertEqual("WAITING_APPROVAL", result.status)
+        self.assertEqual("REPORT", result.status)
+        self.assertEqual("UNVERIFIED", result.verdict)
+        self.assertFalse(result.pending_approval)
         preflight = next(event for event in result.state["tool_events"] if event["type"] == "PREFLIGHT_COMPLETED")
         repository_check = next(check for check in preflight["checks"] if check["component"] == "repository")
         self.assertEqual("NON_GIT_LOCAL_READY", repository_check["code"])
@@ -726,7 +728,7 @@ class PhaseFourGraphTests(unittest.TestCase):
         )
         self.assertEqual(["a" * 64], resumed.state["attached_document_ids"])
 
-    def test_research_operation_reports_after_plan_approval_without_patch_or_maven(self) -> None:
+    def test_research_operation_reports_without_approval_patch_or_maven(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             model = PlannedResearchModel()
@@ -741,16 +743,15 @@ class PhaseFourGraphTests(unittest.TestCase):
                     ),
                     "research-operation-thread",
                 )
-                completed = runner.resume("research-operation-thread", approved=True)
             finally:
                 store.close()
 
-        self.assertTrue(initial.pending_approval)
-        self.assertEqual("REPORT", completed.status)
-        self.assertEqual("UNVERIFIED", completed.verdict)
-        self.assertFalse(completed.pending_approval)
-        event_types = {str(event.get("type")) for event in completed.state["tool_events"]}
-        self.assertIn("RESEARCH_PLAN_APPROVED", event_types)
+        self.assertEqual("REPORT", initial.status)
+        self.assertEqual("UNVERIFIED", initial.verdict)
+        self.assertFalse(initial.pending_approval)
+        event_types = {str(event.get("type")) for event in initial.state["tool_events"]}
+        self.assertIn("RESEARCH_COMPLETED", event_types)
+        self.assertNotIn("PLAN_APPROVAL_REQUIRED", event_types)
         self.assertNotIn("PATCH_APPLIED", event_types)
         self.assertNotIn("VERIFICATION_COMPLETED", event_types)
 

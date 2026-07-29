@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field, SecretStr
 
 from repopilot_guard import __version__
 from repopilot_guard.capabilities import CapabilityDescriptor, CapabilityPolicy
-from repopilot_guard.config import ComponentCheck, RuntimeConfigurationError, RuntimeConfigurationManager
+from repopilot_guard.config import AppSettings, ComponentCheck, RuntimeConfigurationError, RuntimeConfigurationManager
 from repopilot_guard.conversation_store import ConversationStore
 from repopilot_guard.context import ManagedDocumentStore
 from repopilot_guard.document_indexing import index_uploaded_document
@@ -31,6 +31,7 @@ from repopilot_guard.permissions import FULL_ACCESS_CONFIRMATION, PermissionGran
 from repopilot_guard.plugins import PluginError, PluginRegistry
 from repopilot_guard.project_diagnostics import assess_task_admission, diagnose_project
 from repopilot_guard.project_registry import ProjectRegistry
+from repopilot_guard.providers import OpenAICompatibleProvider
 from repopilot_guard.skills import SkillRegistry
 from repopilot_guard.task_export import TaskEvidenceExporter
 from repopilot_guard.task_diagnostics import build_task_diagnostic, extract_diagnostic_codes
@@ -108,6 +109,12 @@ class ConversationUpdateBody(BaseModel):
     project_id: str | None = Field(default=None, max_length=128)
     display_title: str | None = Field(default=None, max_length=80)
     mode: str | None = Field(default=None, pattern="^(goal|plan)$")
+
+
+class ConversationChatBody(BaseModel):
+    """普通会话只接收自然语言，不能在此入口传入工具、权限或工作区参数。"""
+
+    content: str = Field(min_length=1, max_length=12_000)
 
 
 class TaskRenameBody(BaseModel):
@@ -196,6 +203,7 @@ def create_app(
     document_indexer: Callable[[str, Path], dict[str, object]] | None = None,
     runtime_health_checks: Callable[[], tuple[ComponentCheck, ...]] | None = None,
     runtime_configuration_manager: RuntimeConfigurationManager | None = None,
+    conversation_reply: Callable[[str, str, str | None], str] | None = None,
 ) -> FastAPI:
     """创建 API；调用者负责复用 SQLite graph runner 与项目注册表。"""
 
@@ -386,6 +394,44 @@ def create_app(
             }
         except ValueError as error:
             raise HTTPException(404, str(error)) from error
+
+    @app.post("/api/conversations/{conversation_id}/chat")
+    def chat_in_conversation(conversation_id: str, body: ConversationChatBody) -> dict[str, object]:
+        """处理不涉及仓库工具的自然语言对话，不创建 LangGraph 任务。"""
+
+        try:
+            conversation = conversations.get(conversation_id)
+        except ValueError as error:
+            raise HTTPException(404, "CONVERSATION_NOT_FOUND") from error
+        if conversation.archived_at:
+            raise HTTPException(409, "CONVERSATION_ARCHIVED")
+        if any(item.status not in _TERMINAL_TASK_STATUSES for item in store.list_for_conversation(conversation_id)):
+            raise HTTPException(409, "CONVERSATION_TASK_RUNNING")
+
+        project_name: str | None = None
+        if conversation.project_id:
+            try:
+                project_name = registry.get(conversation.project_id).display_name
+            except ValueError:
+                # 项目可能在历史会话仍存在时被归档或移除；普通聊天不读取仓库，不应因此失败。
+                project_name = None
+        history = conversations.context_for_next_task(conversation_id)
+        conversations.append_chat_request(conversation_id, content=body.content)
+        history_text = history.model_message() if history.summary or history.messages else ""
+        try:
+            reply = (conversation_reply or _default_conversation_reply)(
+                history_text,
+                body.content,
+                project_name,
+            )
+        except Exception:
+            reply = "本轮普通对话暂时无法生成回复。代码任务和已保存的会话记录没有受到影响，请稍后重试。"
+        response = conversations.append_chat_response(conversation_id, content=reply)
+        return {
+            "status": "READY",
+            "message": response.to_dict(),
+            "context": conversations.context_for_next_task(conversation_id).to_dict(),
+        }
 
     @app.get("/api/projects/{project_id}/diagnostics")
     def project_diagnostics(project_id: str) -> dict[str, object]:
@@ -1146,6 +1192,38 @@ def _conversation_task_summary(task: StoredTask, state: dict[str, object]) -> st
     elif task.verdict in {"BLOCKED", "FAILED"}:
         lines.extend(("", "下一步：查看详情中的诊断与证据后，补充条件或调整目标再继续。"))
     return "\n".join(lines)
+
+
+def _default_conversation_reply(history: str, content: str, project_name: str | None) -> str:
+    """调用普通对话模型；不可用时返回明确边界，绝不伪造代码检索或执行结果。"""
+
+    try:
+        provider = OpenAICompatibleProvider(AppSettings())
+        readiness = provider.chat_check()
+        if not readiness.ready:
+            return "对话模型尚未配置。你仍可以选择项目并发起受控代码分析或修复任务；配置完成后，我可以处理普通对话。"
+        messages: list[dict[str, str]] = [
+            {
+                "role": "system",
+                "content": (
+                    "你是 RepoPilot 的本地 Coding Assistant，正在普通对话模式。"
+                    "请使用中文、简洁自然地回答。当前模式不读取仓库、不调用工具、不创建任务，"
+                    "不能声称已经检查代码、执行命令或完成修复。"
+                    "当用户明确希望分析项目、定位代码或修改代码时，提示可以切换到对应代码任务模式。"
+                ),
+            }
+        ]
+        if project_name:
+            messages.append({"role": "system", "content": f"当前关联项目名称：{project_name}。"})
+        if history:
+            messages.append({"role": "user", "content": history})
+        messages.append({"role": "user", "content": content})
+        raw_content = provider.create_chat_model().invoke(messages).content
+        if isinstance(raw_content, str) and raw_content.strip():
+            return raw_content.strip()[:8_000]
+        return "我收到了这条消息，但模型没有返回可展示的文本。你可以换一种说法，或发起代码分析任务。"
+    except Exception:
+        return "普通对话模型暂时不可用。你可以稍后重试；RepoPilot 没有执行任何代码操作。"
 
 
 def _event_cursor(after_sequence: int, last_event_id: str | None) -> int:

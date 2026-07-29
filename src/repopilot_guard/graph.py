@@ -845,7 +845,7 @@ class CodingGraphFactory:
         graph.add_edge("RETRIEVE", "ANALYZE")
         graph.add_conditional_edges("ANALYZE", self._route_after_analyze, {"tools": "RESEARCH_TOOLS", "plan": "PLAN", "report": "REPORT"})
         graph.add_edge("RESEARCH_TOOLS", "ANALYZE")
-        graph.add_conditional_edges("PLAN", self._route_ready, {"next": "PLAN_APPROVAL", "report": "REPORT"})
+        graph.add_conditional_edges("PLAN", self._route_after_plan, {"next": "PLAN_APPROVAL", "report": "REPORT"})
         graph.add_conditional_edges(
             "PLAN_APPROVAL",
             self._route_after_plan_approval,
@@ -1197,10 +1197,11 @@ class CodingGraphFactory:
                 "PLAN_VERIFICATION_CONTRACT_MISMATCH",
                 "模型计划违反任务验证契约，未进入审批或执行。",
             )
+        research_only = TaskOperation(state["task_operation"]) is TaskOperation.RESEARCH
         next_state: GraphState = {
-            "status": "WAITING_APPROVAL",
-            "pending_approval": True,
-            "pending_approval_action": "PLAN_REVIEW",
+            "status": "REPORT" if research_only else "WAITING_APPROVAL",
+            "pending_approval": not research_only,
+            "pending_approval_action": None if research_only else "PLAN_REVIEW",
             "plan": plan.model_dump(mode="json"),
             "approval_feedback": None,
             "candidate_files": sorted(set([*state["candidate_files"], *plan.candidate_files])),
@@ -1209,7 +1210,7 @@ class CodingGraphFactory:
                 *state["tool_events"],
                 _model_usage_event("plan", generation.usage),
                 {
-                    "type": "PLAN_GENERATED",
+                    "type": "RESEARCH_COMPLETED" if research_only else "PLAN_GENERATED",
                     "candidate_files": plan.candidate_files,
                     "revision": state["plan_revision"],
                     "attempts": generation.attempts,
@@ -1587,6 +1588,12 @@ class CodingGraphFactory:
         if state["status"] == "BLOCKED":
             return "report"
         return "tools" if state["status"] == "RESEARCH_TOOLS" and state["pending_tool_calls"] else "plan"
+
+    @staticmethod
+    def _route_after_plan(state: GraphState) -> str:
+        if state["status"] in {"BLOCKED", "REPORT"}:
+            return "report"
+        return "next"
 
     @staticmethod
     def _route_after_plan_approval(state: GraphState) -> str:

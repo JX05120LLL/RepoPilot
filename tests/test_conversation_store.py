@@ -112,6 +112,37 @@ class ConversationStoreTests(unittest.TestCase):
             finally:
                 reopened.close()
 
+    def test_chat_messages_are_persisted_and_available_to_later_task_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            database = Path(temporary_directory) / "state.sqlite"
+            store = ConversationStore(database)
+            conversation = store.create(project_id=None, display_title="普通对话", mode="goal")
+            try:
+                request = store.append_chat_request(
+                    conversation.conversation_id,
+                    content="你好，api_key=must-not-persist",
+                )
+                response = store.append_chat_response(
+                    conversation.conversation_id,
+                    content="你好，我是 RepoPilot。token=must-not-persist",
+                )
+                context = store.context_for_next_task(conversation.conversation_id)
+
+                self.assertEqual("chat_request", request.kind)
+                self.assertEqual("chat_response", response.kind)
+                self.assertIsNone(request.task_thread_id)
+                self.assertNotIn("must-not-persist", context.model_message())
+            finally:
+                store.close()
+
+            reopened = ConversationStore(database)
+            try:
+                messages = reopened.messages(conversation.conversation_id)
+                self.assertEqual(["chat_request", "chat_response"], [item.kind for item in messages])
+                self.assertEqual([1, 2], [item.sequence for item in messages])
+            finally:
+                reopened.close()
+
     def test_context_compaction_keeps_original_messages_and_marks_history_untrusted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             store = ConversationStore(
