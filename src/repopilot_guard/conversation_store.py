@@ -17,6 +17,7 @@ _MESSAGE_KINDS = frozenset({"chat_request", "chat_response", "task_request", "ta
 DEFAULT_CONTEXT_TOKEN_BUDGET = 12_000
 _MESSAGE_MAX_LENGTH = 12_000
 _SUMMARY_MAX_ITEM_LENGTH = 900
+_UNTITLED_CONVERSATION = "未命名对话"
 _INLINE_SECRET = re.compile(
     r"(?i)\b(api[_-]?key|token|password|secret|authorization)\b\s*[:=]\s*([^\s,;]+)"
 )
@@ -33,6 +34,8 @@ class ConversationRecord:
     created_at: str
     updated_at: str
     archived_at: str | None
+    parent_conversation_id: str | None
+    branched_from_sequence: int | None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -43,6 +46,8 @@ class ConversationRecord:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "archived_at": self.archived_at,
+            "parent_conversation_id": self.parent_conversation_id,
+            "branched_from_sequence": self.branched_from_sequence,
         }
 
 
@@ -137,18 +142,90 @@ class ConversationStore:
         resolved_mode = self._normalize_mode(mode)
         now = self._now()
         conversation_id = f"conversation-{uuid4().hex[:12]}"
-        title = self._normalize_title(display_title) or "未命名对话"
+        title = self._normalize_title(display_title) or _UNTITLED_CONVERSATION
         with self._lock:
             self._connection.execute(
                 """
                 INSERT INTO conversations(
-                    conversation_id, project_id, display_title, mode, created_at, updated_at, archived_at
-                ) VALUES (?, ?, ?, ?, ?, ?, NULL)
+                    conversation_id, project_id, display_title, mode, created_at, updated_at, archived_at,
+                    parent_conversation_id, branched_from_sequence
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
                 """,
                 (conversation_id, project_id, title, resolved_mode, now, now),
             )
             self._connection.commit()
             return self._get_locked(conversation_id)
+
+    def fork(
+        self,
+        conversation_id: str,
+        *,
+        from_message_id: str | None = None,
+    ) -> ConversationRecord:
+        """复制指定消息之前的脱敏历史，创建拥有独立后续状态的分支会话。"""
+
+        with self._lock:
+            source = self._get_locked(conversation_id)
+            messages = self._messages_locked(conversation_id)
+            branch_sequence = messages[-1].sequence if messages else 0
+            if from_message_id is not None:
+                selected = next(
+                    (item for item in messages if item.message_id == from_message_id),
+                    None,
+                )
+                if selected is None:
+                    raise ValueError("CONVERSATION_BRANCH_MESSAGE_NOT_FOUND")
+                branch_sequence = selected.sequence
+
+            now = self._now()
+            branch_id = f"conversation-{uuid4().hex[:12]}"
+            branch_title = self._branch_title(source.display_title)
+            self._connection.execute(
+                """
+                INSERT INTO conversations(
+                    conversation_id, project_id, display_title, mode, created_at, updated_at, archived_at,
+                    parent_conversation_id, branched_from_sequence
+                ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?)
+                """,
+                (
+                    branch_id,
+                    source.project_id,
+                    branch_title,
+                    source.mode,
+                    now,
+                    now,
+                    source.conversation_id,
+                    branch_sequence,
+                ),
+            )
+            for item in messages:
+                if item.sequence > branch_sequence:
+                    break
+                self._connection.execute(
+                    """
+                    INSERT INTO conversation_messages(
+                        message_id, conversation_id, sequence, role, kind, content, task_thread_id,
+                        task_status, task_verdict, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        f"message-{uuid4().hex[:12]}",
+                        branch_id,
+                        item.sequence,
+                        item.role,
+                        item.kind,
+                        item.content,
+                        item.task_thread_id,
+                        item.task_status,
+                        item.task_verdict,
+                        item.created_at,
+                    ),
+                )
+            self._connection.commit()
+            # 两边分别维护上下文预算；原始消息仍完整保留，不共享可变 checkpoint。
+            self._compact_locked(conversation_id)
+            self._compact_locked(branch_id)
+            return self._get_locked(branch_id)
 
     def list(self, *, include_archived: bool = False) -> tuple[ConversationRecord, ...]:
         with self._lock:
@@ -335,7 +412,7 @@ class ConversationStore:
         task_status: str | None,
         task_verdict: str | None,
     ) -> ConversationMessageRecord:
-        self._get_locked(conversation_id)
+        conversation = self._get_locked(conversation_id)
         sequence_row = self._connection.execute(
             "SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence FROM conversation_messages WHERE conversation_id = ?",
             (conversation_id,),
@@ -362,10 +439,16 @@ class ConversationStore:
                 now,
             ),
         )
-        self._connection.execute(
-            "UPDATE conversations SET updated_at = ? WHERE conversation_id = ?",
-            (now, conversation_id),
-        )
+        if role == "user" and conversation.display_title == _UNTITLED_CONVERSATION:
+            self._connection.execute(
+                "UPDATE conversations SET display_title = ?, updated_at = ? WHERE conversation_id = ?",
+                (self._title_from_message(content), now, conversation_id),
+            )
+        else:
+            self._connection.execute(
+                "UPDATE conversations SET updated_at = ? WHERE conversation_id = ?",
+                (now, conversation_id),
+            )
         self._connection.commit()
         row = self._connection.execute(
             "SELECT * FROM conversation_messages WHERE message_id = ?", (message_id,)
@@ -383,10 +466,13 @@ class ConversationStore:
                     mode TEXT NOT NULL CHECK(mode IN ('goal', 'plan')),
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    archived_at TEXT
+                    archived_at TEXT,
+                    parent_conversation_id TEXT,
+                    branched_from_sequence INTEGER
                 )
                 """
             )
+            self._migrate_conversation_lineage_locked()
             self._connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_conversations_project_updated ON conversations(project_id, updated_at DESC)"
             )
@@ -423,6 +509,20 @@ class ConversationStore:
                 """
             )
             self._connection.commit()
+
+    def _migrate_conversation_lineage_locked(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(conversations)").fetchall()
+        }
+        if "parent_conversation_id" not in columns:
+            self._connection.execute(
+                "ALTER TABLE conversations ADD COLUMN parent_conversation_id TEXT"
+            )
+        if "branched_from_sequence" not in columns:
+            self._connection.execute(
+                "ALTER TABLE conversations ADD COLUMN branched_from_sequence INTEGER"
+            )
 
     def _migrate_conversation_message_kinds_locked(self) -> None:
         """SQLite 不能原地修改 CHECK 约束，保留旧消息后重建该小表。"""
@@ -480,6 +580,12 @@ class ConversationStore:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             archived_at=row["archived_at"],
+            parent_conversation_id=row["parent_conversation_id"],
+            branched_from_sequence=(
+                int(row["branched_from_sequence"])
+                if row["branched_from_sequence"] is not None
+                else None
+            ),
         )
 
     def _messages_locked(self, conversation_id: str) -> tuple[ConversationMessageRecord, ...]:
@@ -573,6 +679,18 @@ class ConversationStore:
         if not 1 <= len(redacted) <= 80:
             raise ValueError("CONVERSATION_TITLE_INVALID")
         return redacted
+
+    @classmethod
+    def _title_from_message(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        candidate = normalized if len(normalized) <= 80 else normalized[:77].rstrip() + "..."
+        return cls._normalize_title(candidate, required=True) or _UNTITLED_CONVERSATION
+
+    @classmethod
+    def _branch_title(cls, source_title: str) -> str:
+        suffix = " · 分支"
+        base = source_title[: 80 - len(suffix)].rstrip()
+        return cls._normalize_title(base + suffix, required=True) or _UNTITLED_CONVERSATION
 
     @staticmethod
     def _normalize_message(value: str) -> str:

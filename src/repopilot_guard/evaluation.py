@@ -17,6 +17,7 @@ from repopilot_guard import __version__
 from repopilot_guard.models import TaskOperation, TaskRequest, VerificationContract, WorkspaceMode, WorkspaceSelection
 from repopilot_guard.permissions import PermissionGrant
 from repopilot_guard.policy import MavenRecipeName
+from repopilot_guard.processes import hidden_process_kwargs
 from repopilot_guard.recipes import MavenExecutionResult, MavenRecipeRunner
 
 
@@ -518,6 +519,7 @@ class UnrelatedFailureTest {
             capture_output=True,
             text=True,
             encoding="utf-8",
+            **hidden_process_kwargs(),
         )
         if completed.returncode != 0:
             raise ValueError("FIXTURE_GIT_FAILED")
@@ -625,6 +627,7 @@ class BaselineValidator:
             text=True,
             encoding="utf-8",
             errors="replace",
+            **hidden_process_kwargs(),
         )
         if completed.returncode != 0:
             raise ValueError("EVALUATION_BASELINE_CLONE_FAILED")
@@ -879,6 +882,7 @@ def _source_fingerprint(catalog_path: Path) -> tuple[str | None, str]:
         text=True,
         encoding="utf-8",
         errors="replace",
+        **hidden_process_kwargs(),
     )
     status = subprocess.run(
         ("git", "-C", str(repository), "status", "--porcelain"),
@@ -887,6 +891,7 @@ def _source_fingerprint(catalog_path: Path) -> tuple[str | None, str]:
         text=True,
         encoding="utf-8",
         errors="replace",
+        **hidden_process_kwargs(),
     )
     if revision.returncode != 0 or status.returncode != 0:
         return None, "UNAVAILABLE"

@@ -727,6 +727,7 @@ def _run_desktop_preview(port: int, ui_port: int = 1420) -> int:
             ),
             cwd=script.parents[1],
             check=False,
+            **hidden_process_kwargs(),
         )
     except OSError:
         return _print_json_result(

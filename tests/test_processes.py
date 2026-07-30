@@ -10,6 +10,7 @@ import repopilot_guard.processes as process_options
 from repopilot_guard.permissions import PermissionGrant
 from repopilot_guard.policy import MavenRecipeName
 from repopilot_guard.recipes import MavenRecipeRunner, RecipeCommand
+from repopilot_guard.evaluation import FixtureBuilder
 from repopilot_guard.workspace import GitClient
 
 
@@ -66,6 +67,17 @@ class HiddenProcessTests(unittest.TestCase):
 
         self.assertEqual("PASSED", result.status)
         self.assertEqual(456, popen.call_args.kwargs["creationflags"])
+
+    def test_evaluation_git_applies_hidden_process_options(self) -> None:
+        completed = SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
+        with (
+            patch("repopilot_guard.evaluation.hidden_process_kwargs", return_value={"creationflags": 789}),
+            patch("repopilot_guard.evaluation.subprocess.run", return_value=completed) as run,
+        ):
+            output = FixtureBuilder._git(Path("."), "status", "--porcelain")
+
+        self.assertEqual("ok\n", output)
+        self.assertEqual(789, run.call_args.kwargs["creationflags"])
 
 
 class _FixedRecipeCatalog:

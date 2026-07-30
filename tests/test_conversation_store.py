@@ -8,6 +8,68 @@ from repopilot_guard.conversation_store import ConversationStore
 
 
 class ConversationStoreTests(unittest.TestCase):
+    def test_first_user_message_names_untitled_conversation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = ConversationStore(Path(temporary_directory) / "state.sqlite")
+            try:
+                conversation = store.create(project_id=None, display_title=None, mode="goal")
+                self.assertEqual("未命名对话", conversation.display_title)
+
+                store.append_chat_request(
+                    conversation.conversation_id,
+                    content="请帮我梳理订单模块的入口和主要职责",
+                )
+                renamed = store.get(conversation.conversation_id)
+
+                self.assertEqual("请帮我梳理订单模块的入口和主要职责", renamed.display_title)
+                self.assertIsNone(renamed.project_id)
+                self.assertIsNone(renamed.parent_conversation_id)
+            finally:
+                store.close()
+
+    def test_branch_copies_selected_history_and_then_evolves_independently(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = ConversationStore(
+                Path(temporary_directory) / "state.sqlite",
+                context_token_budget=256,
+            )
+            try:
+                source = store.create(
+                    project_id=None,
+                    display_title="讨论订单查询优化",
+                    mode="goal",
+                )
+                store.append_chat_request(source.conversation_id, content="先分析当前查询流程")
+                first_answer = store.append_chat_response(
+                    source.conversation_id,
+                    content="当前流程经过 Controller 和 Service。" + "上下文" * 300,
+                )
+                store.append_chat_request(source.conversation_id, content="再讨论缓存方案")
+                store.append_chat_response(source.conversation_id, content="可以增加本地缓存。")
+
+                branch = store.fork(
+                    source.conversation_id,
+                    from_message_id=first_answer.message_id,
+                )
+                branch_messages = store.messages(branch.conversation_id)
+
+                self.assertEqual(source.conversation_id, branch.parent_conversation_id)
+                self.assertEqual(first_answer.sequence, branch.branched_from_sequence)
+                self.assertEqual("讨论订单查询优化 · 分支", branch.display_title)
+                self.assertEqual(2, len(branch_messages))
+                self.assertNotIn("缓存方案", store.context_for_next_task(branch.conversation_id).model_message())
+                self.assertTrue(store.context_for_next_task(branch.conversation_id).to_dict()["compacted"])
+
+                store.append_chat_request(branch.conversation_id, content="分支只考虑数据库索引")
+                self.assertEqual(3, len(store.messages(branch.conversation_id)))
+                self.assertEqual(4, len(store.messages(source.conversation_id)))
+                self.assertNotIn(
+                    "数据库索引",
+                    store.context_for_next_task(source.conversation_id).model_message(),
+                )
+            finally:
+                store.close()
+
     def test_unassigned_conversation_can_be_renamed_archived_and_restored(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             store = ConversationStore(Path(temporary_directory) / "state.sqlite")

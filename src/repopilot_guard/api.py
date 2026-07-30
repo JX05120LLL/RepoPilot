@@ -117,6 +117,12 @@ class ConversationChatBody(BaseModel):
     content: str = Field(min_length=1, max_length=12_000)
 
 
+class ConversationBranchBody(BaseModel):
+    """分支只能选择当前会话中的消息，不能注入外部历史或权限状态。"""
+
+    from_message_id: str | None = Field(default=None, max_length=128)
+
+
 class TaskRenameBody(BaseModel):
     display_title: str = Field(min_length=1, max_length=80)
 
@@ -378,6 +384,30 @@ def create_app(
             return {"conversation": conversations.restore(conversation_id).to_dict()}
         except ValueError as error:
             raise HTTPException(404, str(error)) from error
+
+    @app.post("/api/conversations/{conversation_id}/branches")
+    def branch_conversation(
+        conversation_id: str,
+        body: ConversationBranchBody,
+    ) -> dict[str, object]:
+        try:
+            branch = conversations.fork(
+                conversation_id,
+                from_message_id=body.from_message_id,
+            )
+            return {
+                "conversation": branch.to_dict(),
+                "context": conversations.context_for_next_task(
+                    branch.conversation_id
+                ).to_dict(),
+            }
+        except ValueError as error:
+            code = str(error)
+            status = 404 if code in {
+                "CONVERSATION_NOT_FOUND",
+                "CONVERSATION_BRANCH_MESSAGE_NOT_FOUND",
+            } else 400
+            raise HTTPException(status, code) from error
 
     @app.get("/api/conversations/{conversation_id}/messages")
     def conversation_messages(conversation_id: str) -> dict[str, object]:

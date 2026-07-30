@@ -317,6 +317,74 @@ class ApiTests(unittest.TestCase):
             finally:
                 registry.close()
 
+    def test_unassigned_chat_uses_first_message_title_and_can_branch_with_context(self) -> None:
+        observed_history: list[str] = []
+
+        def reply_stream(history: str, content: str, _project: str | None):
+            observed_history.append(history)
+            yield f"回复：{content}"
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            registry = ProjectRegistry(root / "state.sqlite")
+            try:
+                with TestClient(
+                    create_app(
+                        FakeRunner(delay=0),
+                        registry,
+                        root / "runs",
+                        conversation_reply_stream=reply_stream,
+                    )
+                ) as client:
+                    created = client.post("/api/conversations", json={})
+                    self.assertEqual(200, created.status_code)
+                    source_id = created.json()["conversation"]["conversation_id"]
+
+                    with client.stream(
+                        "POST",
+                        f"/api/conversations/{source_id}/chat/stream",
+                        json={"content": "介绍一下你能做什么"},
+                    ) as response:
+                        self.assertIn("event: done", "".join(response.iter_text()))
+
+                    source = next(
+                        item
+                        for item in client.get("/api/conversations").json()["conversations"]
+                        if item["conversation_id"] == source_id
+                    )
+                    self.assertEqual("介绍一下你能做什么", source["display_title"])
+                    self.assertIsNone(source["project_id"])
+                    source_messages = client.get(
+                        f"/api/conversations/{source_id}/messages"
+                    ).json()["messages"]
+
+                    branched = client.post(
+                        f"/api/conversations/{source_id}/branches",
+                        json={"from_message_id": source_messages[-1]["message_id"]},
+                    )
+                    self.assertEqual(200, branched.status_code)
+                    branch = branched.json()["conversation"]
+                    self.assertEqual(source_id, branch["parent_conversation_id"])
+                    self.assertEqual(2, branch["branched_from_sequence"])
+
+                    with client.stream(
+                        "POST",
+                        f"/api/conversations/{branch['conversation_id']}/chat/stream",
+                        json={"content": "在分支里继续说明"},
+                    ) as response:
+                        self.assertIn("event: done", "".join(response.iter_text()))
+
+                    self.assertIn("介绍一下你能做什么", observed_history[-1])
+                    self.assertIn("回复：介绍一下你能做什么", observed_history[-1])
+                    self.assertNotIn(
+                        "在分支里继续说明",
+                        client.get(
+                            f"/api/conversations/{source_id}/messages"
+                        ).text,
+                    )
+            finally:
+                registry.close()
+
     def test_plain_chat_stream_failure_does_not_persist_partial_answer_as_success(self) -> None:
         def interrupted_stream(_history: str, _content: str, _project: str | None):
             yield "未完成片段"

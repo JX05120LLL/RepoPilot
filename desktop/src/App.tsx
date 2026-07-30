@@ -23,10 +23,12 @@ import {
   CheckCircle,
   ChatCircle,
   CircleNotch,
+  Copy,
   DotsThree,
   FileArrowUp,
   FileCode,
   FolderOpen,
+  GitBranch,
   ListMagnifyingGlass,
   MagnifyingGlass,
   Paperclip,
@@ -89,6 +91,8 @@ type Conversation = {
   created_at: string;
   updated_at: string;
   archived_at?: string | null;
+  parent_conversation_id?: string | null;
+  branched_from_sequence?: number | null;
 };
 type ConversationMessage = {
   message_id: string;
@@ -560,6 +564,29 @@ function eventSummary(event: TimelineEvent): string {
   return summary;
 }
 
+const eventFactLabels: Record<string, string> = {
+  tool_name: "工具",
+  node: "节点",
+  status: "状态",
+  code: "代码",
+  duration_ms: "耗时",
+  source_count: "来源",
+  input_tokens: "输入 token",
+  output_tokens: "输出 token",
+  total_tokens: "总 token",
+};
+
+function eventFacts(event: TimelineEvent): Array<{ label: string; value: string }> {
+  return Object.entries(eventFactLabels).flatMap(([key, label]) => {
+    const value = event.payload[key];
+    if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
+      return [];
+    }
+    const displayValue = key === "duration_ms" ? `${value} ms` : String(value);
+    return [{ label, value: displayValue }];
+  });
+}
+
 function resolveTaskOutcome(item: Task, running: boolean): TaskOutcome {
   if (item.pending_approval) {
     return {
@@ -659,6 +686,8 @@ export function App() {
     useState<ConversationContextState | null>(null);
   const [conversationMessagesLoading, setConversationMessagesLoading] = useState(false);
   const [streamingChat, setStreamingChat] = useState<StreamingChat | null>(null);
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  const [branchingMessageId, setBranchingMessageId] = useState<string | null>(null);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [showArchived, setShowArchived] = useState(false);
   const [showTaskSearch, setShowTaskSearch] = useState(false);
@@ -962,14 +991,14 @@ export function App() {
     }
   }
 
-  async function copyTerminalCommand(command: string): Promise<boolean> {
+  async function copyText(value: string, failureMessage: string): Promise<boolean> {
     try {
       if (navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(command);
+        await navigator.clipboard.writeText(value);
         return true;
       }
       const field = document.createElement("textarea");
-      field.value = command;
+      field.value = value;
       field.setAttribute("readonly", "");
       field.style.position = "fixed";
       field.style.opacity = "0";
@@ -980,9 +1009,26 @@ export function App() {
       if (!copied) throw new Error("COPY_FAILED");
       return true;
     } catch {
-      setRequestError("无法复制受控终端命令，请手动选择后复制。");
+      setRequestError(failureMessage);
       return false;
     }
+  }
+
+  async function copyTerminalCommand(command: string): Promise<boolean> {
+    return copyText(command, "无法复制受控终端命令，请手动选择后复制。");
+  }
+
+  async function copyConversationMessage(message: ConversationMessage): Promise<void> {
+    const copied = await copyText(
+      message.content,
+      "无法复制这条回复，请手动选择文本后复制。",
+    );
+    if (!copied) return;
+    setCopiedMessageId(message.message_id);
+    window.setTimeout(
+      () => setCopiedMessageId((current) => current === message.message_id ? null : current),
+      1600,
+    );
   }
 
   async function runTerminalCommand(command: TerminalCommand): Promise<TerminalResult> {
@@ -1052,15 +1098,23 @@ export function App() {
   useEffect(() => {
     void Promise.all([
       loadProjects(),
-      loadTasks(showArchived),
-      loadConversations(showArchived),
+      loadTasks(false),
+      loadConversations(false),
       loadPlugins(),
       loadRuntimeConfiguration(),
       checkApiHealth(),
     ])
       .then(() => setInitialDataReady(true))
       .catch(() => setRequestError(API_UNAVAILABLE_MESSAGE));
-  }, [showArchived]);
+  }, []);
+
+  useEffect(() => {
+    if (!initialDataReady) return;
+    void Promise.all([
+      loadTasks(showArchived),
+      loadConversations(showArchived),
+    ]).catch(() => setRequestError("无法刷新归档记录，请检查本机 API。"));
+  }, [showArchived, initialDataReady]);
 
   useEffect(() => {
     if (!initialDataReady || restoreStartedRef.current) return;
@@ -2200,30 +2254,49 @@ export function App() {
     }
   }
 
-  async function beginNewConversation(project: string | null = projectId || null) {
-    const conversationMode: ConversationMode = operation === "research" ? "plan" : "goal";
+  async function beginNewConversation(project: string | null = null) {
     beginNewTask();
+    setProjectId(project ?? "");
     setComposerMode("chat");
     setRequestError("");
+    window.requestAnimationFrame(() => taskDescriptionRef.current?.focus());
+  }
+
+  async function branchConversation(
+    source: Conversation,
+    fromMessageId: string | null = null,
+  ) {
+    if (branchingMessageId) return;
+    const operationId = fromMessageId ?? source.conversation_id;
+    setSidebarMenu(null);
+    setBranchingMessageId(operationId);
+    setRequestError("");
     try {
-      const response = await fetch(`${API}/conversations`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          project_id: project,
-          mode: conversationMode,
-        }),
-      });
+      const response = await fetch(
+        `${API}/conversations/${encodeURIComponent(source.conversation_id)}/branches`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ from_message_id: fromMessageId }),
+        },
+      );
       const payload = await response.json();
-      if (!response.ok) throw new Error(payload.detail ?? "新建对话失败");
-      const created = payload.conversation as Conversation;
-      activateConversation(created);
-      setProjectId(created.project_id ?? "");
-      setOperation(created.mode === "plan" ? "research" : "change");
-      await loadConversations(showArchived);
+      if (!response.ok) throw new Error(payload.detail ?? "创建分支对话失败");
+      const branch = payload.conversation as Conversation;
+      beginNewTask();
+      activateConversation(branch);
+      setProjectId(branch.project_id ?? "");
+      setOperation(branch.mode === "plan" ? "research" : "change");
+      setComposerMode("chat");
+      await Promise.all([
+        loadConversations(showArchived),
+        loadConversationMessages(branch.conversation_id),
+      ]);
       window.requestAnimationFrame(() => taskDescriptionRef.current?.focus());
     } catch (error) {
-      setRequestError(error instanceof Error ? error.message : "新建对话失败");
+      setRequestError(error instanceof Error ? error.message : "创建分支对话失败");
+    } finally {
+      setBranchingMessageId(null);
     }
   }
 
@@ -2236,6 +2309,8 @@ export function App() {
     setConversationContext(null);
     setConversationMessagesLoading(false);
     setStreamingChat(null);
+    setCopiedMessageId(null);
+    setBranchingMessageId(null);
     summarizedTaskRef.current = null;
     setEvents([]);
     setArtifacts([]);
@@ -2554,7 +2629,7 @@ export function App() {
     : runtimeHealth.status === "READY"
       ? "ready"
       : "degraded";
-  const visibleEvents = events.slice(-14);
+  const visibleEvents = events;
   const hasGitDiff = artifacts.some((artifact) => artifact.kind === "git_diff");
   const hasVerification = artifacts.some((artifact) => artifact.kind === "verification");
   const hasPlan = artifacts.some((artifact) => artifact.kind === "plan_markdown");
@@ -2894,7 +2969,7 @@ export function App() {
                           <button type="button" onClick={() => void selectConversation(item)}>
                             <ChatCircle size={15} />
                             <span>{item.display_title}</span>
-                            <small>{item.mode === "plan" ? "计划" : "目标"}</small>
+                            <small>{item.parent_conversation_id ? "分支" : item.mode === "plan" ? "计划" : "目标"}</small>
                           </button>
                           <button className="tree-menu-button" type="button" title={`${item.display_title} 操作`} onClick={(event) => openSidebarMenu(event, "conversation", item.conversation_id)}>
                             <DotsThree size={16} weight="bold" />
@@ -2941,7 +3016,7 @@ export function App() {
                     <ChatCircle size={15} />
                     <span>
                       <strong>{item.display_title}</strong>
-                      <small>{item.mode === "plan" ? "计划模式" : "目标模式"} · 未关联项目</small>
+                      <small>{item.parent_conversation_id ? "分支对话" : item.mode === "plan" ? "计划模式" : "目标模式"} · 未关联项目</small>
                     </span>
                   </button>
                   <button className="tree-menu-button" type="button" title={`${item.display_title} 操作`} onClick={(event) => openSidebarMenu(event, "conversation", item.conversation_id)}>
@@ -2997,6 +3072,7 @@ export function App() {
               if (!item) return null;
               return <>
                 <button type="button" role="menuitem" onClick={() => openRename({ kind: "conversation", id: item.conversation_id, title: item.display_title })}><PencilSimple size={16} />重命名对话</button>
+                <button type="button" role="menuitem" onClick={() => void branchConversation(item)}><GitBranch size={16} />从最新位置创建分支</button>
                 {item.project_id ? (
                   <button type="button" role="menuitem" onClick={() => void moveConversation(item.conversation_id, null)}><FolderOpen size={16} />移至未归属对话</button>
                 ) : currentProject ? (
@@ -3174,24 +3250,51 @@ export function App() {
                         ) : (
                           <p className="conversation-summary-content">{message.content}</p>
                         )}
-                        {message.task_thread_id && (
+                        <div className="message-actions" aria-label="回复操作">
                           <button
-                            className="conversation-detail-button"
                             type="button"
-                            onClick={() => {
-                              const linkedTask = tasks.find(
-                                (item) => item.thread_id === message.task_thread_id,
-                              ) ?? {
-                                thread_id: message.task_thread_id as string,
-                                status: "REPORT",
-                                pending_approval: false,
-                              };
-                              void selectTask(linkedTask, "task", true);
-                            }}
+                            title={copiedMessageId === message.message_id ? "已复制" : "复制回复"}
+                            aria-label={copiedMessageId === message.message_id ? "回复已复制" : "复制回复"}
+                            onClick={() => void copyConversationMessage(message)}
                           >
-                            <ListMagnifyingGlass size={15} />查看任务详情
+                            {copiedMessageId === message.message_id
+                              ? <CheckCircle size={15} weight="fill" />
+                              : <Copy size={15} />}
                           </button>
-                        )}
+                          {conversation && (
+                            <button
+                              type="button"
+                              title="从这条回复创建分支对话"
+                              aria-label="从这条回复创建分支对话"
+                              disabled={Boolean(branchingMessageId)}
+                              onClick={() => void branchConversation(conversation, message.message_id)}
+                            >
+                              {branchingMessageId === message.message_id
+                                ? <CircleNotch className="spin" size={15} />
+                                : <GitBranch size={15} />}
+                            </button>
+                          )}
+                          {message.task_thread_id && (
+                            <button
+                              className="conversation-detail-button"
+                              type="button"
+                              title="查看任务详情"
+                              aria-label="查看任务详情"
+                              onClick={() => {
+                                const linkedTask = tasks.find(
+                                  (item) => item.thread_id === message.task_thread_id,
+                                ) ?? {
+                                  thread_id: message.task_thread_id as string,
+                                  status: "REPORT",
+                                  pending_approval: false,
+                                };
+                                void selectTask(linkedTask, "task", true);
+                              }}
+                            >
+                              <ListMagnifyingGlass size={15} />
+                            </button>
+                          )}
+                        </div>
                       </div>
                     </article>
                   ),
@@ -3293,19 +3396,37 @@ export function App() {
                               )}
                               {visibleEvents.length > 0 && (
                                 <div className="agent-activity">
-                                  {visibleEvents.map((event, index) => (
-                                    <article key={event.id}>
-                                      <span className="activity-line">
-                                        {index === visibleEvents.length - 1 && taskIsRunning
-                                          ? <CircleNotch className="spin" size={15} />
-                                          : <CheckCircle size={15} weight="fill" />}
-                                      </span>
-                                      <div>
-                                        <b>{eventLabels[event.type] ?? event.type}</b>
-                                        <p>{eventSummary(event)}</p>
-                                      </div>
-                                    </article>
-                                  ))}
+                                  {visibleEvents.map((event, index) => {
+                                    const facts = eventFacts(event);
+                                    return (
+                                      <details className="process-event" key={event.id}>
+                                        <summary className="process-event-summary">
+                                          <span className="activity-line" aria-hidden="true">
+                                            {index === visibleEvents.length - 1 && taskIsRunning
+                                              ? <CircleNotch className="spin" size={15} />
+                                              : <CheckCircle size={15} weight="fill" />}
+                                          </span>
+                                          <span className="process-event-title">
+                                            <b>{eventLabels[event.type] ?? event.type}</b>
+                                            <small>{readString(event.payload.tool_name) ?? readString(event.payload.node) ?? event.type}</small>
+                                          </span>
+                                        </summary>
+                                        <div className="process-event-body">
+                                          <p>{eventSummary(event)}</p>
+                                          {facts.length > 0 && (
+                                            <dl className="process-event-meta">
+                                              {facts.map((fact) => (
+                                                <div key={`${event.id}-${fact.label}`}>
+                                                  <dt>{fact.label}</dt>
+                                                  <dd>{fact.value}</dd>
+                                                </div>
+                                              ))}
+                                            </dl>
+                                          )}
+                                        </div>
+                                      </details>
+                                    );
+                                  })}
                                 </div>
                               )}
                               <TaskDiagnosticPanel
@@ -3520,7 +3641,12 @@ export function App() {
                       value={description}
                       onChange={(event) => setDescription(event.target.value)}
                       onKeyDown={(event) => {
-                        if ((event.ctrlKey || event.metaKey) && event.key === "Enter" && canSubmit) {
+                        if (
+                          event.key === "Enter" &&
+                          !event.shiftKey &&
+                          !event.nativeEvent.isComposing &&
+                          canSubmit
+                        ) {
                           event.preventDefault();
                           sendComposerMessage();
                         }
@@ -3598,7 +3724,7 @@ export function App() {
                           </select>
                         </label>}
                       </div>
-                      <button className="send-button" type="button" title={composerMode === "chat" ? "发送消息（Ctrl + Enter）" : "开始代码任务（Ctrl + Enter）"} onClick={sendComposerMessage} disabled={!canSubmit}>
+                      <button className="send-button" type="button" title={composerMode === "chat" ? "发送消息" : "开始代码任务"} onClick={sendComposerMessage} disabled={!canSubmit}>
                         <ArrowUp size={19} weight="bold" />
                       </button>
                     </div>
