@@ -5,11 +5,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import re
+import tempfile
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Thread
-from typing import Any, TypeVar
+from threading import Event, RLock, Thread
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from langchain_core.tools import StructuredTool
 from pydantic import ConfigDict, create_model
@@ -22,14 +25,127 @@ from repopilot_guard.capabilities import (
     CapabilityScope,
 )
 from repopilot_guard.mcp import McpAccess, McpConfigError, McpConfigLoader, McpConfiguration
-from repopilot_guard.mcp_runtime import McpRuntime
+from repopilot_guard.mcp_runtime import McpRuntime, McpToolCallResult
 from repopilot_guard.permissions import PermissionGrant
+
+if TYPE_CHECKING:
+    from repopilot_guard.plugins import PluginRegistry
 
 
 MCP_CONFIG_RELATIVE_PATH = Path(".repopilot") / "mcp.toml"
 MAX_AGENT_MCP_RESULT_CHARS = 20_000
+MAX_MCP_TASK_ARTIFACT_CHARS = 512 * 1024
+_SAFE_TASK_ID = re.compile(r"^[^/\\\\]{1,128}$")
+_CONFIG_SOURCE_ID = re.compile(r"^(?:project|plugin:[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)$")
 _T = TypeVar("_T")
 McpRuntimeFactory = Callable[[McpConfiguration, Path], McpRuntime]
+
+
+@dataclass(frozen=True, slots=True)
+class McpConfigurationSource:
+    """已通过控制面筛选的 MCP 配置来源。
+
+    `config_path` 只在本机运行时使用；任务状态仅保存 source_id、配置哈希和
+    可选插件包哈希，避免泄漏项目或插件快照路径。
+    """
+
+    source_id: str
+    config_path: Path
+    plugin_package_sha256: str | None = None
+
+    def __post_init__(self) -> None:
+        if not _CONFIG_SOURCE_ID.fullmatch(self.source_id):
+            raise ValueError("MCP_CONFIG_SOURCE_INVALID")
+        if self.source_id == "project" and self.plugin_package_sha256 is not None:
+            raise ValueError("MCP_CONFIG_SOURCE_INVALID")
+        if self.source_id.startswith("plugin:") and (
+            self.plugin_package_sha256 is None or not re.fullmatch(r"[0-9a-f]{64}", self.plugin_package_sha256)
+        ):
+            raise ValueError("MCP_CONFIG_SOURCE_INVALID")
+
+
+class _TaskMcpRuntimeSession:
+    """让同一任务的 MCP Runtime 固定在单独事件循环，避免跨 loop 复用 Actor。"""
+
+    def __init__(
+        self,
+        runtime_factory: McpRuntimeFactory,
+        configuration: McpConfiguration,
+        workspace_root: Path,
+        source_id: str,
+        config_sha256: str,
+        full_access: bool,
+    ) -> None:
+        self._runtime_factory = runtime_factory
+        self._configuration = configuration
+        self.workspace_root = workspace_root.expanduser().resolve()
+        self.source_id = source_id
+        self.config_sha256 = config_sha256
+        self.full_access = full_access
+        self._lock = RLock()
+        self._ready = Event()
+        self._closed = False
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._runtime: McpRuntime | None = None
+        self._startup_error: BaseException | None = None
+        self._thread = Thread(target=self._run, name="repopilot-task-mcp", daemon=True)
+        self._thread.start()
+        if not self._ready.wait(timeout=10):
+            raise RuntimeError("MCP_TASK_RUNTIME_START_TIMEOUT")
+        if self._startup_error is not None:
+            raise RuntimeError("MCP_TASK_RUNTIME_START_FAILED") from self._startup_error
+
+    def matches(self, workspace_root: Path, source_id: str, config_sha256: str, full_access: bool) -> bool:
+        return (
+            self.workspace_root == workspace_root.expanduser().resolve()
+            and self.source_id == source_id
+            and self.config_sha256 == config_sha256
+            and self.full_access == full_access
+            and not self._closed
+        )
+
+    def invoke(self, operation: Callable[[McpRuntime], Awaitable[_T]]) -> _T:
+        with self._lock:
+            if self._closed or self._loop is None or self._runtime is None:
+                raise RuntimeError("MCP_TASK_RUNTIME_CLOSED")
+            future = asyncio.run_coroutine_threadsafe(operation(self._runtime), self._loop)
+            return future.result()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            loop = self._loop
+            runtime = self._runtime
+            if loop is not None and runtime is not None:
+                try:
+                    asyncio.run_coroutine_threadsafe(runtime.close(), loop).result(timeout=30)
+                except Exception:
+                    # 关闭失败也必须停止专用 loop，不能让任务资源在后台无限存活。
+                    pass
+                loop.call_soon_threadsafe(loop.stop)
+        self._thread.join(timeout=5)
+
+    def _run(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._loop = loop
+        try:
+            self._runtime = self._runtime_factory(self._configuration, self.workspace_root)
+        except BaseException as error:
+            self._startup_error = error
+        finally:
+            self._ready.set()
+        if self._startup_error is None:
+            loop.run_forever()
+        runtime = self._runtime
+        if runtime is not None:
+            try:
+                loop.run_until_complete(runtime.close())
+            except Exception:
+                pass
+        loop.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,9 +160,16 @@ class McpToolBinding:
     schema_sha256: str
     config_sha256: str
     risks: tuple[str, ...]
+    config_source_id: str = "project"
+    plugin_package_sha256: str | None = None
 
     @classmethod
-    def from_descriptor(cls, descriptor: CapabilityDescriptor, config_sha256: str) -> "McpToolBinding":
+    def from_descriptor(
+        cls,
+        descriptor: CapabilityDescriptor,
+        config_sha256: str,
+        source: McpConfigurationSource,
+    ) -> "McpToolBinding":
         schema = descriptor.metadata.get("input_schema")
         server_name = descriptor.metadata.get("server")
         if not isinstance(schema, dict) or not isinstance(server_name, str):
@@ -59,6 +182,8 @@ class McpToolBinding:
             input_schema=dict(schema),
             schema_sha256=_sha256_json(schema),
             config_sha256=config_sha256,
+            config_source_id=source.source_id,
+            plugin_package_sha256=source.plugin_package_sha256,
             risks=tuple(sorted(risk.value for risk in descriptor.risks)),
         )
 
@@ -78,6 +203,12 @@ class McpToolBinding:
                 input_schema=dict(schema),
                 schema_sha256=str(payload["schema_sha256"]),
                 config_sha256=str(payload["config_sha256"]),
+                config_source_id=str(payload.get("config_source_id", "project")),
+                plugin_package_sha256=(
+                    str(payload["plugin_package_sha256"])
+                    if payload.get("plugin_package_sha256") is not None
+                    else None
+                ),
                 risks=tuple(str(item) for item in payload["risks"]),
             )
         except (KeyError, TypeError, ValueError) as error:
@@ -88,6 +219,18 @@ class McpToolBinding:
             or not binding.tool_name
             or len(binding.schema_sha256) != 64
             or len(binding.config_sha256) != 64
+            or not _CONFIG_SOURCE_ID.fullmatch(binding.config_source_id)
+            or (
+                binding.config_source_id == "project"
+                and binding.plugin_package_sha256 is not None
+            )
+            or (
+                binding.config_source_id.startswith("plugin:")
+                and (
+                    binding.plugin_package_sha256 is None
+                    or not re.fullmatch(r"[0-9a-f]{64}", binding.plugin_package_sha256)
+                )
+            )
             or not binding.risks
             or any(item not in {risk.value for risk in CapabilityRisk} for item in binding.risks)
             or binding.schema_sha256 != _sha256_json(binding.input_schema)
@@ -103,9 +246,14 @@ class McpToolBinding:
             description=self.description,
             kind=CapabilityKind.MCP_TOOL,
             scope=CapabilityScope.PROJECT,
-            source=f"mcp:{self.server_name}",
+            source=f"mcp:{self.config_source_id}:{self.server_name}",
             risks=frozenset(CapabilityRisk(item) for item in self.risks),
-            metadata={"server": self.server_name, "input_schema": self.input_schema, "frozen": True},
+            metadata={
+                "server": self.server_name,
+                "input_schema": self.input_schema,
+                "frozen": True,
+                "config_source_id": self.config_source_id,
+            },
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -117,6 +265,8 @@ class McpToolBinding:
             "input_schema": self.input_schema,
             "schema_sha256": self.schema_sha256,
             "config_sha256": self.config_sha256,
+            "config_source_id": self.config_source_id,
+            "plugin_package_sha256": self.plugin_package_sha256,
             "risks": list(self.risks),
         }
 
@@ -143,62 +293,110 @@ class McpBindingResult:
 class TaskMcpBindingService:
     """在图外执行 MCP 连接，图内只接收经过冻结的工具清单。"""
 
-    def __init__(self, runtime_factory: McpRuntimeFactory | None = None) -> None:
+    def __init__(
+        self,
+        runtime_factory: McpRuntimeFactory | None = None,
+        plugin_registry: "PluginRegistry | None" = None,
+    ) -> None:
         self._runtime_factory = runtime_factory or (lambda configuration, root: McpRuntime(configuration, workspace_root=root))
+        self._plugin_registry = plugin_registry
+        self._lock = RLock()
+        self._task_sessions: dict[tuple[str, str], _TaskMcpRuntimeSession] = {}
 
     def discover(
         self,
         workspace_root: Path,
         permission: PermissionGrant,
         approved_mcp_tools: Iterable[str] = (),
+        *,
+        approved_mcp_sources: Iterable[str] = (),
+        task_id: str | None = None,
     ) -> McpBindingResult:
         approved = frozenset(approved_mcp_tools)
-        config_path = _config_path(workspace_root)
+        approved_sources = frozenset(approved_mcp_sources)
+        if any(not _CONFIG_SOURCE_ID.fullmatch(source_id) for source_id in approved_sources):
+            return McpBindingResult("BLOCKED", "MCP_APPROVED_SOURCE_INVALID", "任务 MCP 配置来源无效，未建立外部连接。")
+        if approved_sources and not approved:
+            return McpBindingResult("BLOCKED", "MCP_APPROVED_SOURCE_WITHOUT_TOOL", "MCP 来源审批必须同时指定允许的工具。")
         if not permission.is_full_access and not approved:
             return McpBindingResult("READY", "MCP_NOT_REQUESTED", "安全模式未显式批准 MCP 工具，未建立外部连接。")
-        if not config_path.is_file():
+        sources = self._configuration_sources(workspace_root)
+        if approved_sources:
+            available_sources = {source.source_id for source in sources}
+            missing_sources = sorted(approved_sources - available_sources)
+            if missing_sources:
+                return McpBindingResult(
+                    "BLOCKED",
+                    "MCP_APPROVED_SOURCE_UNAVAILABLE",
+                    "已批准的 MCP 配置来源不可用、已禁用或未通过完整性校验。",
+                )
+            sources = tuple(source for source in sources if source.source_id in approved_sources)
+        if not sources:
             if approved:
-                return McpBindingResult("BLOCKED", "MCP_CONFIG_NOT_FOUND", "已批准 MCP 工具，但项目未提供 MCP 配置。")
-            return McpBindingResult("READY", "MCP_NOT_CONFIGURED", "项目未配置 MCP，继续使用内置研究工具。")
-        try:
-            configuration = McpConfigLoader.load(config_path)
-            config_sha256 = _sha256_bytes(config_path.read_bytes())
-        except McpConfigError as error:
-            return McpBindingResult("BLOCKED", error.code, "MCP 配置无效，未建立外部连接。")
-        except OSError:
-            return McpBindingResult("BLOCKED", "MCP_CONFIG_READ_FAILED", "MCP 配置无法读取，未建立外部连接。")
+                return McpBindingResult("BLOCKED", "MCP_CONFIG_NOT_FOUND", "已批准 MCP 工具，但项目或已启用插件未提供可用 MCP 配置。")
+            return McpBindingResult("READY", "MCP_NOT_CONFIGURED", "项目和已启用插件未配置 MCP，继续使用内置研究工具。")
 
         bindings: list[McpToolBinding] = []
         issues: list[dict[str, str]] = []
         discovered_ids: set[str] = set()
-        for server in sorted(configuration.servers, key=lambda item: item.name):
-            requested_for_server = tuple(item for item in approved if item.startswith(f"mcp__{server.name}__"))
-            if not permission.is_full_access and not requested_for_server:
-                continue
-            if server.access is not McpAccess.READ_ONLY:
-                issues.append({"server_name": server.name, "code": "MCP_WRITE_SERVER_NOT_RESEARCH_BINDABLE"})
-                continue
+        binding_owners: dict[str, str] = {}
+        for source in sources:
             try:
-                result = _run_async(lambda: self._discover_server(configuration, workspace_root, server.name, permission))
-            except Exception:
-                issues.append({"server_name": server.name, "code": "MCP_DISCOVERY_UNAVAILABLE"})
+                configuration = McpConfigLoader.load(source.config_path)
+                config_sha256 = _sha256_bytes(source.config_path.read_bytes())
+            except McpConfigError as error:
+                issues.append({"source_id": source.source_id, "code": error.code})
                 continue
-            if result.status != "READY":
-                issues.append({"server_name": server.name, "code": result.code})
+            except OSError:
+                issues.append({"source_id": source.source_id, "code": "MCP_CONFIG_READ_FAILED"})
                 continue
-            for descriptor in result.tools:
-                if not permission.is_full_access and descriptor.capability_id not in approved:
+            for server in sorted(configuration.servers, key=lambda item: item.name):
+                requested_for_server = tuple(item for item in approved if item.startswith(f"mcp__{server.name}__"))
+                if not permission.is_full_access and not requested_for_server:
+                    continue
+                if server.access is not McpAccess.READ_ONLY:
+                    issues.append({"source_id": source.source_id, "server_name": server.name, "code": "MCP_WRITE_SERVER_NOT_RESEARCH_BINDABLE"})
                     continue
                 try:
-                    binding = McpToolBinding.from_descriptor(descriptor, config_sha256)
-                except ValueError:
-                    issues.append({"server_name": server.name, "code": "MCP_TOOL_BINDING_METADATA_INVALID"})
+                    result = self._connect_server(
+                        configuration,
+                        workspace_root,
+                        source.source_id,
+                        config_sha256,
+                        server.name,
+                        permission,
+                        task_id=task_id,
+                    )
+                except Exception:
+                    issues.append({"source_id": source.source_id, "server_name": server.name, "code": "MCP_DISCOVERY_UNAVAILABLE"})
                     continue
-                bindings.append(binding)
-                discovered_ids.add(binding.capability_id)
+                if result.status != "READY":
+                    issues.append({"source_id": source.source_id, "server_name": server.name, "code": result.code})
+                    continue
+                for descriptor in result.tools:
+                    if not permission.is_full_access and descriptor.capability_id not in approved:
+                        continue
+                    existing_source = binding_owners.get(descriptor.capability_id)
+                    if existing_source is not None and existing_source != source.source_id:
+                        self.release(task_id)
+                        return McpBindingResult(
+                            "BLOCKED",
+                            "MCP_CAPABILITY_ID_CONFLICT",
+                            "项目与插件 MCP 配置声明了相同工具 ID，任务不会猜测调用目标。",
+                            issues=tuple(issues),
+                        )
+                    try:
+                        binding = McpToolBinding.from_descriptor(descriptor, config_sha256, source)
+                    except ValueError:
+                        issues.append({"source_id": source.source_id, "server_name": server.name, "code": "MCP_TOOL_BINDING_METADATA_INVALID"})
+                        continue
+                    bindings.append(binding)
+                    binding_owners[binding.capability_id] = source.source_id
+                    discovered_ids.add(binding.capability_id)
 
         missing = sorted(approved - discovered_ids)
         if missing:
+            self.release(task_id)
             return McpBindingResult(
                 "BLOCKED",
                 "MCP_APPROVED_TOOL_NOT_DISCOVERED",
@@ -207,6 +405,7 @@ class TaskMcpBindingService:
                 tuple(issues),
             )
         if not bindings:
+            self.release(task_id)
             code = "MCP_BINDING_UNAVAILABLE" if issues else "MCP_NO_READ_ONLY_TOOLS"
             return McpBindingResult("READY", code, "没有可绑定的只读 MCP 工具，继续使用内置研究工具。", issues=tuple(issues))
         return McpBindingResult(
@@ -222,9 +421,23 @@ class TaskMcpBindingService:
         bindings: Iterable[McpToolBinding],
         permission: PermissionGrant,
         workspace_root: Path,
+        *,
+        task_id: str | None = None,
+        artifact_output_root: Path | None = None,
+        artifact_task_id: str | None = None,
     ) -> tuple[StructuredTool, ...]:
         root = workspace_root.expanduser().resolve()
-        return tuple(self._langchain_tool(binding, permission, root) for binding in bindings)
+        return tuple(
+            self._langchain_tool(
+                binding,
+                permission,
+                root,
+                task_id=task_id,
+                artifact_output_root=artifact_output_root,
+                artifact_task_id=artifact_task_id,
+            )
+            for binding in bindings
+        )
 
     def invoke_in_workspace(
         self,
@@ -232,23 +445,171 @@ class TaskMcpBindingService:
         arguments: dict[str, object],
         permission: PermissionGrant,
         workspace_root: Path,
+        *,
+        task_id: str | None = None,
+        artifact_output_root: Path | None = None,
+        artifact_task_id: str | None = None,
     ) -> dict[str, object]:
-        config_path = _config_path(workspace_root)
+        source = self._source_for_binding(binding, workspace_root)
+        if source is None:
+            return _blocked("MCP_CONFIG_SOURCE_CHANGED", "MCP 配置来源在任务开始后不可用、被禁用或版本发生变化，已阻断调用。")
         try:
-            if _sha256_bytes(config_path.read_bytes()) != binding.config_sha256:
+            if _sha256_bytes(source.config_path.read_bytes()) != binding.config_sha256:
                 return _blocked("MCP_CONFIG_CHANGED_AFTER_DISCOVERY", "MCP 配置在任务开始后发生变化，已阻断调用。")
-            configuration = McpConfigLoader.load(config_path)
+            configuration = McpConfigLoader.load(source.config_path)
         except McpConfigError as error:
             return _blocked(error.code, "MCP 配置无效，已阻断调用。")
         except OSError:
             return _blocked("MCP_CONFIG_READ_FAILED", "MCP 配置无法读取，已阻断调用。")
         try:
-            result = _run_async(
-                lambda: self._call_once(configuration, workspace_root, binding, arguments, permission)
+            result = self._call_server(
+                configuration,
+                workspace_root,
+                binding,
+                arguments,
+                permission,
+                source.source_id,
+                task_id=task_id,
             )
         except Exception:
             return _blocked("MCP_TOOL_CALL_UNAVAILABLE", "MCP 工具调用不可用，未返回伪造结果。")
-        return _bound_agent_result(result)
+        payload = result.to_dict()
+        artifact = _persist_large_mcp_output(
+            result,
+            output_root=artifact_output_root,
+            task_id=artifact_task_id,
+        )
+        if artifact is not None:
+            payload["artifact"] = artifact
+        return _bound_agent_result(payload)
+
+    def release(self, task_id: str | None) -> bool:
+        """仅释放指定任务的内存连接；不影响其他任务或持久化 MCP 配置。"""
+
+        if not task_id:
+            return False
+        with self._lock:
+            sessions = [
+                self._task_sessions.pop(key)
+                for key in tuple(self._task_sessions)
+                if key[0] == task_id
+            ]
+        if not sessions:
+            return False
+        for session in sessions:
+            session.close()
+        return True
+
+    def _configuration_sources(self, workspace_root: Path) -> tuple[McpConfigurationSource, ...]:
+        """枚举项目和已验证插件快照的配置，不把磁盘路径写入任务状态。"""
+
+        sources: list[McpConfigurationSource] = []
+        project_config = _config_path(workspace_root)
+        if project_config.is_file():
+            sources.append(McpConfigurationSource("project", project_config))
+        if self._plugin_registry is not None:
+            for plugin_source in self._plugin_registry.active_mcp_config_sources():
+                sources.append(
+                    McpConfigurationSource(
+                        f"plugin:{plugin_source.plugin_id}",
+                        plugin_source.config_path,
+                        plugin_source.package_sha256,
+                    )
+                )
+        return tuple(sorted(sources, key=lambda item: item.source_id))
+
+    def _source_for_binding(
+        self,
+        binding: McpToolBinding,
+        workspace_root: Path,
+    ) -> McpConfigurationSource | None:
+        """任务恢复或工具调用前复验被冻结的配置来源。"""
+
+        if binding.config_source_id == "project":
+            path = _config_path(workspace_root)
+            return McpConfigurationSource("project", path) if path.is_file() else None
+        if not binding.config_source_id.startswith("plugin:") or self._plugin_registry is None:
+            return None
+        plugin_id = binding.config_source_id.removeprefix("plugin:")
+        package_sha256 = binding.plugin_package_sha256
+        if package_sha256 is None:
+            return None
+        plugin_source = self._plugin_registry.mcp_config_source(plugin_id, package_sha256)
+        if plugin_source is None:
+            return None
+        return McpConfigurationSource(
+            binding.config_source_id,
+            plugin_source.config_path,
+            plugin_source.package_sha256,
+        )
+
+    def _connect_server(
+        self,
+        configuration: McpConfiguration,
+        workspace_root: Path,
+        source_id: str,
+        config_sha256: str,
+        server_name: str,
+        permission: PermissionGrant,
+        *,
+        task_id: str | None,
+    ) -> Any:
+        if task_id:
+            session = self._task_session(task_id, configuration, workspace_root, source_id, config_sha256, permission)
+            return session.invoke(lambda runtime: runtime.connect(server_name, permission, approved=True))
+        return _run_async(lambda: self._discover_server(configuration, workspace_root, server_name, permission))
+
+    def _call_server(
+        self,
+        configuration: McpConfiguration,
+        workspace_root: Path,
+        binding: McpToolBinding,
+        arguments: dict[str, object],
+        permission: PermissionGrant,
+        source_id: str,
+        *,
+        task_id: str | None,
+    ) -> McpToolCallResult:
+        if task_id:
+            session = self._task_session(task_id, configuration, workspace_root, source_id, binding.config_sha256, permission)
+            return session.invoke(lambda runtime: self._call_runtime(runtime, binding, arguments, permission))
+        return _run_async(lambda: self._call_once(configuration, workspace_root, binding, arguments, permission))
+
+    def _task_session(
+        self,
+        task_id: str,
+        configuration: McpConfiguration,
+        workspace_root: Path,
+        source_id: str,
+        config_sha256: str,
+        permission: PermissionGrant,
+    ) -> _TaskMcpRuntimeSession:
+        if not task_id.strip() or len(task_id) > 128:
+            raise ValueError("MCP_TASK_ID_INVALID")
+        stale: _TaskMcpRuntimeSession | None = None
+        with self._lock:
+            key = (task_id, source_id)
+            current = self._task_sessions.get(key)
+            if current is not None and current.matches(workspace_root, source_id, config_sha256, permission.is_full_access):
+                return current
+            stale = self._task_sessions.pop(key, None)
+        if stale is not None:
+            stale.close()
+        created = _TaskMcpRuntimeSession(
+            self._runtime_factory,
+            configuration,
+            workspace_root,
+            source_id,
+            config_sha256,
+            permission.is_full_access,
+        )
+        with self._lock:
+            existing = self._task_sessions.get(key)
+            if existing is None:
+                self._task_sessions[key] = created
+                return created
+        created.close()
+        return existing
 
     async def _discover_server(
         self,
@@ -270,34 +631,52 @@ class TaskMcpBindingService:
         binding: McpToolBinding,
         arguments: dict[str, object],
         permission: PermissionGrant,
-    ) -> dict[str, object]:
+    ) -> McpToolCallResult:
         runtime = self._runtime_factory(configuration, workspace_root)
         try:
-            connected = await runtime.connect(binding.server_name, permission, approved=True)
-            if connected.status != "READY":
-                return _blocked(connected.code, "MCP 服务无法连接，未执行工具调用。")
-            descriptor = runtime.capabilities.capabilities.get(binding.capability_id)
-            schema = descriptor.metadata.get("input_schema") if descriptor is not None else None
-            if not isinstance(schema, dict) or _sha256_json(schema) != binding.schema_sha256:
-                return _blocked("MCP_TOOL_CHANGED_AFTER_DISCOVERY", "MCP 工具 Schema 在任务开始后发生变化，已阻断调用。")
-            result = await runtime.call_tool(binding.capability_id, arguments, permission, approved=True)
-            payload = result.to_dict()
-            payload["message"] = "MCP 工具调用完成。" if result.status == "READY" else "MCP 工具未成功完成。"
-            return payload
+            return await self._call_runtime(runtime, binding, arguments, permission)
         finally:
             await runtime.close()
+
+    @staticmethod
+    async def _call_runtime(
+        runtime: McpRuntime,
+        binding: McpToolBinding,
+        arguments: dict[str, object],
+        permission: PermissionGrant,
+    ) -> McpToolCallResult:
+        connected = await runtime.connect(binding.server_name, permission, approved=True)
+        if connected.status != "READY":
+            return _blocked_runtime_call(connected.code, binding.server_name, binding.capability_id)
+        descriptor = runtime.capabilities.capabilities.get(binding.capability_id)
+        schema = descriptor.metadata.get("input_schema") if descriptor is not None else None
+        if not isinstance(schema, dict) or _sha256_json(schema) != binding.schema_sha256:
+            return _blocked_runtime_call("MCP_TOOL_CHANGED_AFTER_DISCOVERY", binding.server_name, binding.capability_id)
+        return await runtime.call_tool(binding.capability_id, arguments, permission, approved=True)
 
     def _langchain_tool(
         self,
         binding: McpToolBinding,
         permission: PermissionGrant,
         workspace_root: Path,
+        *,
+        task_id: str | None,
+        artifact_output_root: Path | None,
+        artifact_task_id: str | None,
     ) -> StructuredTool:
         arguments_model = _arguments_model(binding)
 
         def invoke_mcp(**arguments: object) -> dict[str, object]:
             # 动态 Tool 只接受 schema 中的字段，实际 Schema 仍由 MCP Runtime 二次校验。
-            return self.invoke_in_workspace(binding, dict(arguments), permission, workspace_root)
+            return self.invoke_in_workspace(
+                binding,
+                dict(arguments),
+                permission,
+                workspace_root,
+                task_id=task_id,
+                artifact_output_root=artifact_output_root,
+                artifact_task_id=artifact_task_id,
+            )
 
         return StructuredTool.from_function(
             invoke_mcp,
@@ -367,6 +746,22 @@ def _blocked(code: str, message: str) -> dict[str, object]:
     return {"status": "BLOCKED", "code": code, "message": message, "data": {}}
 
 
+def _blocked_runtime_call(code: str, server_name: str, tool_name: str) -> McpToolCallResult:
+    """将连接或 Schema 阻断保持为运行时领域结果，避免伪造外部工具数据。"""
+
+    return McpToolCallResult(
+        status="BLOCKED",
+        code=code,
+        server_name=server_name,
+        tool_name=tool_name,
+        data={},
+        truncated=False,
+        output_sha256=_sha256_bytes(b"{}"),
+        original_chars=0,
+        duration_ms=0,
+    )
+
+
 def _bound_agent_result(payload: dict[str, object]) -> dict[str, object]:
     """MCP 自身的上限可更大，但研究模型上下文必须有独立硬上限。"""
 
@@ -383,6 +778,94 @@ def _bound_agent_result(payload: dict[str, object]) -> dict[str, object]:
     bounded["agent_output_truncated"] = True
     bounded["agent_original_chars"] = len(serialized)
     return bounded
+
+
+def _persist_large_mcp_output(
+    result: McpToolCallResult,
+    *,
+    output_root: Path | None,
+    task_id: str | None,
+) -> dict[str, object] | None:
+    """把超过模型上下文上限的原始 MCP 输出写入任务目录，状态中只保留可核验引用。"""
+
+    content = result.artifact_content
+    if content is None or result.original_chars <= MAX_AGENT_MCP_RESULT_CHARS:
+        return None
+    if result.original_chars > MAX_MCP_TASK_ARTIFACT_CHARS:
+        return {
+            "status": "OMITTED",
+            "code": "MCP_ARTIFACT_TOO_LARGE",
+            "output_sha256": result.output_sha256,
+            "original_chars": result.original_chars,
+            "max_chars": MAX_MCP_TASK_ARTIFACT_CHARS,
+        }
+    if output_root is None or not task_id or not _SAFE_TASK_ID.fullmatch(task_id) or task_id in {".", ".."}:
+        return {
+            "status": "UNAVAILABLE",
+            "code": "MCP_ARTIFACT_CONTEXT_INVALID",
+            "output_sha256": result.output_sha256,
+            "original_chars": result.original_chars,
+        }
+    content_bytes = content.encode("utf-8")
+    if len(content_bytes) > MAX_MCP_TASK_ARTIFACT_CHARS:
+        return {
+            "status": "OMITTED",
+            "code": "MCP_ARTIFACT_TOO_LARGE",
+            "output_sha256": result.output_sha256,
+            "original_chars": result.original_chars,
+            "max_chars": MAX_MCP_TASK_ARTIFACT_CHARS,
+        }
+    digest = _sha256_bytes(content_bytes)
+    if digest != result.output_sha256:
+        return {
+            "status": "UNAVAILABLE",
+            "code": "MCP_ARTIFACT_HASH_MISMATCH",
+            "output_sha256": result.output_sha256,
+            "original_chars": result.original_chars,
+        }
+    try:
+        root = output_root.expanduser().resolve()
+        directory = (root / task_id).resolve()
+        destination = (directory / "mcp" / "outputs" / f"{digest}.json").resolve()
+        destination.relative_to(directory)
+        _atomic_write_bytes(destination, content_bytes)
+    except OSError:
+        return {
+            "status": "UNAVAILABLE",
+            "code": "MCP_ARTIFACT_WRITE_FAILED",
+            "output_sha256": result.output_sha256,
+            "original_chars": result.original_chars,
+        }
+    return {
+        "status": "READY",
+        "kind": "mcp_tool_output",
+        "relative_path": destination.relative_to(directory).as_posix(),
+        "sha256": digest,
+        "size_bytes": len(content_bytes),
+        "server_name": result.server_name,
+        "tool_name": result.tool_name,
+        "output_sha256": result.output_sha256,
+        "original_chars": result.original_chars,
+    }
+
+
+def _atomic_write_bytes(path: Path, content: bytes) -> None:
+    """用同目录临时文件替换，避免 Agent 被取消时留下半截 MCP 原文。"""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as temporary:
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_name, path)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except OSError:
+            pass
+        raise
 
 
 def _sha256_bytes(value: bytes) -> str:

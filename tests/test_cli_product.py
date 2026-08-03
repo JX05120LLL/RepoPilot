@@ -212,6 +212,8 @@ class CliProductTests(unittest.TestCase):
         self.assertIn("--task-mode full-local", command)
         self.assertIn(FULL_ACCESS_CONFIRMATION, command)
         self.assertNotIn(str(repository), json.dumps(payload, ensure_ascii=False))
+        self.assertEqual("NOT_DETECTED", payload["selected_project"]["java_maven"]["status"])
+        self.assertEqual({}, payload["selected_project"]["profiles"])
 
     def test_cli_prints_package_version_without_loading_runtime_configuration(self) -> None:
         output = StringIO()
@@ -1171,6 +1173,73 @@ class CliProductTests(unittest.TestCase):
             with patch("sys.stdout", output):
                 main(["task", "list", "--include-archived", "--state-db", str(state_path)])
             self.assertEqual(1, json.loads(output.getvalue())["count"])
+
+    def test_retention_commands_preview_then_archive_without_deletion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            state_path = root / "state.sqlite"
+            store = TaskStore(state_path)
+            try:
+                store.create(
+                    thread_id="thread-retention-cli",
+                    task_id="task-retention-cli",
+                    project_id=None,
+                    repository=root / "private-repository",
+                    output_root=root / "private-runs",
+                    task_mode="safe-isolated",
+                    permission_mode="safe",
+                    workspace_mode="worktree",
+                )
+                store.sync_graph_result(
+                    {
+                        "thread_id": "thread-retention-cli",
+                        "status": "REPORT",
+                        "pending_approval": False,
+                        "verdict": "UNVERIFIED",
+                        "state": {"tool_events": [{"type": "PLAN_GENERATED"}]},
+                    }
+                )
+                store._connection.execute(
+                    "UPDATE tasks SET updated_at = ? WHERE thread_id = ?",
+                    ("2026-01-01T00:00:00+00:00", "thread-retention-cli"),
+                )
+                store._connection.commit()
+            finally:
+                store.close()
+
+            output = StringIO()
+            with patch("sys.stdout", output):
+                preview_exit = main(
+                    [
+                        "task", "retention-preview", "--older-than-days", "0", "--state-db", str(state_path),
+                    ]
+                )
+            preview = json.loads(output.getvalue())
+            self.assertEqual(0, preview_exit)
+            self.assertEqual("TASK_RETENTION_PREVIEW_READY", preview["code"])
+            self.assertEqual(["thread-retention-cli"], [item["thread_id"] for item in preview["candidates"]])
+            self.assertFalse(preview["deletion_performed"])
+            self.assertNotIn("private-repository", output.getvalue())
+
+            output = StringIO()
+            with patch("sys.stdout", output):
+                archive_exit = main(
+                    [
+                        "task", "archive-eligible", "--older-than-days", "0", "--state-db", str(state_path),
+                    ]
+                )
+            archived = json.loads(output.getvalue())
+            self.assertEqual(0, archive_exit)
+            self.assertEqual("TASK_RETENTION_ARCHIVED", archived["code"])
+            self.assertEqual(1, archived["archived_count"])
+            self.assertFalse(archived["deletion_performed"])
+
+            reopened = TaskStore(state_path)
+            try:
+                self.assertIsNotNone(reopened.get("thread-retention-cli").archived_at)
+                self.assertIn("report", {artifact.kind for artifact in reopened.artifacts("thread-retention-cli")})
+            finally:
+                reopened.close()
 
     def test_task_review_requires_explicit_decision_after_reviewing_pending_approval(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

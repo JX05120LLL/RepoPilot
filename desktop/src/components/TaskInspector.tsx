@@ -2,6 +2,7 @@ import {
   CheckCircle,
   CopySimple,
   FileCode,
+  GitBranch,
   LinkSimple,
   Paperclip,
   Stack,
@@ -54,6 +55,23 @@ type InspectorTerminalCommand = {
   command: string;
 };
 
+type InspectorWorkspace = {
+  mode: "local" | "worktree";
+  lifecycle: "local" | "detached" | "branch";
+  branch?: string | null;
+  baseCommit?: string | null;
+  dirtyFileCount?: number;
+  branchCreationAvailable: boolean;
+  localHandoffAvailable: boolean;
+};
+
+type InspectorSkill = {
+  name: string;
+  scope: string;
+  allowedTools?: string[];
+  effectiveTools?: string[];
+};
+
 type TaskInspectorProps = {
   task: InspectorTask;
   sources: InspectorSource[];
@@ -61,13 +79,17 @@ type TaskInspectorProps = {
   evidence: InspectorEvidence[];
   artifacts: InspectorArtifact[];
   selectedSkillCount: number;
+  selectedSkills: InspectorSkill[];
   boundToolCount: number;
   totalTokens?: number;
   terminalCommands: InspectorTerminalCommand[];
+  workspace?: InspectorWorkspace | null;
   onClose: () => void;
   onOpenContext: () => void;
   onOpenArtifact: (kind?: string) => void;
   onCopyTerminalCommand: (command: string) => Promise<boolean>;
+  onCreateWorkspaceBranch: () => void;
+  onHandoffWorkspaceToLocal: () => void;
 };
 
 const statusLabels: Record<string, string> = {
@@ -92,7 +114,9 @@ const stageLabels: Record<string, string> = {
   PLAN_APPROVAL: "计划审批",
   EXECUTION_APPROVAL: "执行审批",
   PATCH: "应用补丁",
-  VERIFY: "Maven 验证",
+  VERIFY: "运行构建验证",
+  VERIFICATION_OBSERVATION: "核对验证结果",
+  VERIFICATION_TOOLS: "核对验证证据",
   REVIEW: "审阅结果",
   REPORT: "生成报告",
 };
@@ -125,13 +149,17 @@ export function TaskInspector({
   evidence,
   artifacts,
   selectedSkillCount,
+  selectedSkills,
   boundToolCount,
   totalTokens,
   terminalCommands,
+  workspace,
   onClose,
   onOpenContext,
   onOpenArtifact,
   onCopyTerminalCommand,
+  onCreateWorkspaceBranch,
+  onHandoffWorkspaceToLocal,
 }: TaskInspectorProps) {
   const [copiedCommandId, setCopiedCommandId] = useState<string | null>(null);
   const tone = statusTone(task.pendingApproval ? "WAITING_APPROVAL" : task.status, task.verdict);
@@ -201,6 +229,46 @@ export function TaskInspector({
           </div>
         </section>
 
+        {workspace && (
+          <section className="inspector-section inspector-workspace">
+            <header><span>工作区</span><GitBranch size={16} /></header>
+            <div className="inspector-workspace-card">
+              <strong>
+                {workspace.mode === "worktree"
+                  ? workspace.lifecycle === "detached"
+                    ? "隔离 Worktree"
+                    : "审阅分支"
+                  : "本机工作区"}
+              </strong>
+              {workspace.mode === "worktree" ? (
+                <>
+                  <p>
+                    {workspace.lifecycle === "detached"
+                      ? "当前修改仍与源仓库分离。"
+                      : `已创建分支 ${workspace.branch ?? ""}。`}
+                  </p>
+                  <dl>
+                    <div><dt>基线</dt><dd>{workspace.baseCommit?.slice(0, 12) ?? "未记录"}</dd></div>
+                    <div><dt>改动</dt><dd>{workspace.dirtyFileCount ?? 0} 个文件</dd></div>
+                  </dl>
+                  {workspace.branchCreationAvailable && (
+                    <button type="button" onClick={onCreateWorkspaceBranch}>
+                      <GitBranch size={14} />创建审阅分支
+                    </button>
+                  )}
+                  {workspace.localHandoffAvailable && (
+                    <button className="inspector-workspace-handoff" type="button" onClick={onHandoffWorkspaceToLocal}>
+                      交接到 Local
+                    </button>
+                  )}
+                </>
+              ) : (
+                <p>此任务直接绑定本机项目；不会创建隔离副本。</p>
+              )}
+            </div>
+          </section>
+        )}
+
         <section className="inspector-section">
           <header><span>上下文</span><b>{sources.length + attachments.length}</b></header>
           <div className="inspector-context-stats">
@@ -230,6 +298,28 @@ export function TaskInspector({
               {sources.length + attachments.length > 10 && (
                 <p className="inspector-more">另有 {sources.length + attachments.length - 10} 项</p>
               )}
+            </div>
+          )}
+          {selectedSkills.length > 0 && (
+            <div className="inspector-skill-list">
+              <p>Skill 工具范围已按任务权限冻结</p>
+              {selectedSkills.map((skill) => {
+                const requested = skill.allowedTools ?? [];
+                const effective = skill.effectiveTools ?? [];
+                return (
+                  <article key={`${skill.scope}-${skill.name}`}>
+                    <strong>{skill.name}</strong>
+                    <div>
+                      <span>请求</span>
+                      <code>{requested.length > 0 ? requested.join(", ") : "未声明"}</code>
+                    </div>
+                    <div>
+                      <span>可用</span>
+                      <code>{effective.length > 0 ? effective.join(", ") : "未获得额外工具授权"}</code>
+                    </div>
+                  </article>
+                );
+              })}
             </div>
           )}
           <button className="inspector-link" type="button" onClick={onOpenContext}>

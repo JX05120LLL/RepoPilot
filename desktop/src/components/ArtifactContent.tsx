@@ -121,6 +121,16 @@ function DiffSummary({ files }: { files: DiffFileSummary[] }) {
 
 /** 根据服务端产物类型提供确定性展示，不推断或改写任务结论。 */
 export function ArtifactContent({ kind, content }: { kind: string; content: string }) {
+  if (kind.startsWith("mcp_output_")) {
+    return (
+      <article className="artifact-content mcp-output-view">
+        <p className="mcp-output-warning">
+          此内容来自外部 MCP 工具，仅作为原始审计证据保存，不代表 RepoPilot 已验证的结论。
+        </p>
+        <pre className="artifact-raw-content">{content}</pre>
+      </article>
+    );
+  }
   if (kind === "git_diff") {
     const lines = parseUnifiedDiff(content);
     return (

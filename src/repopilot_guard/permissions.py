@@ -5,10 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+import re
 from typing import Any
 
 
 FULL_ACCESS_CONFIRMATION = "我已了解完全权限风险"
+_CAPABILITY_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$")
 
 
 class PermissionMode(str, Enum):
@@ -54,6 +56,8 @@ class PermissionSnapshot:
     workspace_mode: str
     granted_at: str
     approved_mcp_tools: tuple[str, ...] = ()
+    approved_mcp_sources: tuple[str, ...] = ()
+    approved_capabilities: tuple[str, ...] = ()
     task_operation: str = "change"
 
     def __post_init__(self) -> None:
@@ -66,6 +70,19 @@ class PermissionSnapshot:
             for capability_id in self.approved_mcp_tools
         ):
             raise ValueError("PERMISSION_SNAPSHOT_MCP_APPROVAL_INVALID")
+        if len(self.approved_mcp_sources) > 16 or any(
+            not isinstance(source_id, str)
+            or not re.fullmatch(r"(?:project|plugin:[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)", source_id)
+            for source_id in self.approved_mcp_sources
+        ):
+            raise ValueError("PERMISSION_SNAPSHOT_MCP_SOURCE_INVALID")
+        if self.approved_mcp_sources and not self.approved_mcp_tools:
+            raise ValueError("PERMISSION_SNAPSHOT_MCP_SOURCE_INVALID")
+        if len(self.approved_capabilities) > 64 or any(
+            not isinstance(capability_id, str) or not _CAPABILITY_ID_PATTERN.fullmatch(capability_id)
+            for capability_id in self.approved_capabilities
+        ):
+            raise ValueError("PERMISSION_SNAPSHOT_CAPABILITY_APPROVAL_INVALID")
         if self.task_operation not in {"change", "research"}:
             raise ValueError("PERMISSION_SNAPSHOT_OPERATION_INVALID")
         try:
@@ -81,6 +98,8 @@ class PermissionSnapshot:
         workspace_mode: str,
         approved_mcp_tools: tuple[str, ...] = (),
         task_operation: str = "change",
+        approved_capabilities: tuple[str, ...] = (),
+        approved_mcp_sources: tuple[str, ...] = (),
     ) -> "PermissionSnapshot":
         return cls(
             task_id=task_id,
@@ -89,6 +108,8 @@ class PermissionSnapshot:
             granted_at=datetime.now(timezone.utc).isoformat(),
             approved_mcp_tools=tuple(sorted(set(approved_mcp_tools))),
             task_operation=task_operation,
+            approved_capabilities=tuple(sorted(set(approved_capabilities))),
+            approved_mcp_sources=tuple(sorted(set(approved_mcp_sources))),
         )
 
     @classmethod
@@ -104,7 +125,9 @@ class PermissionSnapshot:
                 workspace_mode=str(payload["workspace_mode"]),
                 granted_at=str(payload["granted_at"]),
                 approved_mcp_tools=tuple(sorted(set(_mcp_tool_ids(payload.get("approved_mcp_tools", []))))),
+                approved_mcp_sources=tuple(sorted(set(_mcp_source_ids(payload.get("approved_mcp_sources", []))))),
                 task_operation=str(payload.get("task_operation", "change")),
+                approved_capabilities=tuple(sorted(set(_capability_ids(payload.get("approved_capabilities", []))))),
             )
         except (KeyError, TypeError, ValueError) as error:
             if isinstance(error, ValueError) and str(error).startswith("PERMISSION_SNAPSHOT_"):
@@ -119,6 +142,8 @@ class PermissionSnapshot:
             "workspace_mode": self.workspace_mode,
             "granted_at": self.granted_at,
             "approved_mcp_tools": list(self.approved_mcp_tools),
+            "approved_mcp_sources": list(self.approved_mcp_sources),
+            "approved_capabilities": list(self.approved_capabilities),
             "task_operation": self.task_operation,
             "audit_code": "USER_GRANTED_FULL_ACCESS" if self.grant.is_full_access else "SAFE_MODE",
         }
@@ -127,4 +152,16 @@ class PermissionSnapshot:
 def _mcp_tool_ids(value: object) -> tuple[str, ...]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ValueError("PERMISSION_SNAPSHOT_MCP_APPROVAL_INVALID")
+    return tuple(value)
+
+
+def _mcp_source_ids(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError("PERMISSION_SNAPSHOT_MCP_SOURCE_INVALID")
+    return tuple(value)
+
+
+def _capability_ids(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError("PERMISSION_SNAPSHOT_CAPABILITY_APPROVAL_INVALID")
     return tuple(value)

@@ -130,6 +130,8 @@ type Interrupt = {
   candidate_files?: unknown;
   recipe?: unknown;
   target_test_class?: unknown;
+  patch_preview?: unknown;
+  shell_previews?: unknown;
 };
 type TaskProgressStage = {
   id: string;
@@ -173,7 +175,18 @@ type Task = {
     task_description?: string;
     plan?: Record<string, unknown> | null;
     pending_approval_action?: string | null;
+    patch_preview?: Record<string, unknown> | null;
+    shell_previews?: unknown;
   };
+};
+type TaskWorkspace = {
+  mode: "local" | "worktree";
+  lifecycle: "local" | "detached" | "branch";
+  branch?: string | null;
+  base_commit?: string | null;
+  dirty_file_count?: number;
+  branch_creation_available: boolean;
+  local_handoff_available: boolean;
 };
 type Artifact = {
   kind: string;
@@ -204,6 +217,7 @@ type TimelineEvent = {
 type McpProbeResult = {
   status: string;
   code: string;
+  config_source?: string;
   connection?: {
     server?: {
       state?: string;
@@ -236,6 +250,7 @@ type CapabilityDirectoryItem = {
   source_label: string;
   risks: string[];
   enabled: boolean;
+  requires_approval?: boolean;
   details: Record<string, unknown>;
   safe_policy?: CapabilityPolicyDecision;
   full_policy?: CapabilityPolicyDecision;
@@ -270,6 +285,8 @@ type ContextSnapshot = {
     name: string;
     scope: string;
     content_sha256: string;
+    allowed_tools?: string[];
+    effective_tools?: string[];
   }>;
   bound_tool_ids: string[];
   capability_ids: string[];
@@ -305,13 +322,29 @@ type Plugin = {
   enabled: boolean;
   active: boolean;
   integrity_status: string;
+  compatibility_status: string;
+  signature_status: string;
+  signing_key_id?: string | null;
+  source_lock_status: string;
   manifest: {
     name: string;
     version: string;
     description: string;
     skills_root?: string | null;
     mcp_config?: string | null;
+    hooks?: Array<{
+      id: string;
+      event: "task_intake" | "plan_approval" | "execution_approval";
+      decision: "allow" | "ask" | "deny";
+      message: string;
+      context: Record<string, string>;
+    }>;
   };
+};
+type PluginTrustKey = {
+  key_id: string;
+  fingerprint: string;
+  created_at: string;
 };
 type DocumentIndexResult = {
   status: string;
@@ -356,6 +389,8 @@ type RuntimeConfiguration = {
     api_key_configured: boolean;
   };
   qdrant?: { url: string };
+  skills?: { user_roots: string[]; bundled_roots: string[] };
+  experimental?: { full_local_shell_enabled: boolean };
 };
 type ChatModelPreset = {
   id: string;
@@ -379,6 +414,12 @@ type ProjectModeReadiness = {
   dirty_entry_count?: number;
   allowed_operations?: Operation[];
 };
+type ProfileRuntimeReadiness = {
+  status: "READY" | "BLOCKED";
+  code: string;
+  command: string;
+  message: string;
+};
 type ProjectDiagnosis = {
   recommended_task_mode: Mode;
   recommended_task_operation?: Operation;
@@ -387,7 +428,16 @@ type ProjectDiagnosis = {
     full_local: ProjectModeReadiness;
   };
   git: { is_repository: boolean; baseline_commit: string | null; dirty_entry_count: number };
-  profiles: { java_maven: { status: string; code: string; warnings: string[] } };
+  profiles: Record<string, {
+    status: string;
+    code: string;
+    display_name: string;
+    detected_files: string[];
+    execution_supported: boolean;
+    message: string;
+    runtime?: ProfileRuntimeReadiness;
+    warnings?: string[];
+  }>;
 };
 type TaskOutcome = {
   tone: "neutral" | "success" | "warning" | "danger";
@@ -402,7 +452,13 @@ const artifactLabels: Record<string, string> = {
   git_diff: "真实 Diff",
   verification: "验证结果",
   telemetry: "运行遥测",
+  event_archive: "事件归档",
 };
+
+function artifactLabel(kind: string): string {
+  if (kind.startsWith("mcp_output_")) return "外部 MCP 原始输出";
+  return artifactLabels[kind] ?? kind;
+}
 const taskStateLabels: Record<string, string> = {
   WAITING_APPROVAL: "等待审批",
   RUNNING: "正在执行",
@@ -486,6 +542,7 @@ const eventLabels: Record<string, string> = {
   TASK_STATE: "任务状态已更新",
   PLAN_APPROVED: "修改计划已批准",
   EXECUTION_APPROVED: "执行操作已批准",
+  PATCH_SELECTION_APPROVED: "已冻结补丁文件选择",
 };
 
 const eventSummaryLabels: Record<string, string> = {
@@ -530,6 +587,9 @@ const keyEvidenceNodes = new Set([
   "PLAN_APPROVAL",
   "EXECUTION_APPROVAL",
   "PATCH",
+  "SHELL",
+  "EXECUTION_RESEARCH",
+  "EXECUTION_TOOLS",
   "VERIFY",
   "REVIEW",
   "REPORT",
@@ -539,7 +599,7 @@ function isKeyEvidenceEvent(event: TimelineEvent): boolean {
   if (keyEvidenceTypes.has(event.type)) return true;
   const node = event.payload.node;
   if (typeof node === "string" && keyEvidenceNodes.has(node)) return true;
-  return /APPROVAL|PATCH|VERIFY|VERIFICATION|FAILED|BLOCKED|CANCELLED/.test(
+  return /APPROVAL|PATCH|SHELL|EXECUTION_OBSERVATION|VERIFY|VERIFICATION|FAILED|BLOCKED|CANCELLED/.test(
     event.type,
   );
 }
@@ -571,6 +631,9 @@ const eventFactLabels: Record<string, string> = {
   code: "代码",
   duration_ms: "耗时",
   source_count: "来源",
+  selected_file_count: "已选文件数",
+  selection_sha256: "选择摘要",
+  selected_preview_sha256: "子补丁摘要",
   input_tokens: "输入 token",
   output_tokens: "输出 token",
   total_tokens: "总 token",
@@ -608,7 +671,7 @@ function resolveTaskOutcome(item: Task, running: boolean): TaskOutcome {
     return {
       tone: "success",
       title: "目标已完成",
-      detail: "已应用代码修改，并已通过声明的 Maven 验证。",
+      detail: "已应用代码修改，并已通过声明的构建验证。",
     };
   }
   if (result === "FAILED") {
@@ -722,13 +785,24 @@ export function App() {
   const [revisionComment, setRevisionComment] = useState("");
   const [approvalBusy, setApprovalBusy] = useState(false);
   const [executionApprovalConfirmation, setExecutionApprovalConfirmation] = useState(false);
+  const [selectedPatchPaths, setSelectedPatchPaths] = useState<string[]>([]);
+  const [taskWorkspace, setTaskWorkspace] = useState<TaskWorkspace | null>(null);
+  const [workspaceBranchDialogOpen, setWorkspaceBranchDialogOpen] = useState(false);
+  const [workspaceBranchName, setWorkspaceBranchName] = useState("");
+  const [workspaceBranchConfirmed, setWorkspaceBranchConfirmed] = useState(false);
+  const [workspaceBranchBusy, setWorkspaceBranchBusy] = useState(false);
+  const [workspaceHandoffDialogOpen, setWorkspaceHandoffDialogOpen] = useState(false);
+  const [workspaceHandoffConfirmed, setWorkspaceHandoffConfirmed] = useState(false);
+  const [workspaceHandoffBusy, setWorkspaceHandoffBusy] = useState(false);
   const [requestError, setRequestError] = useState("");
   const [mcpServer, setMcpServer] = useState("");
+  const [mcpConfigSource, setMcpConfigSource] = useState("project");
   const [mcpConfigPath, setMcpConfigPath] = useState(".repopilot/mcp.toml");
   const [mcpRiskApproved, setMcpRiskApproved] = useState(false);
   const [mcpBusy, setMcpBusy] = useState(false);
   const [mcpResult, setMcpResult] = useState<McpProbeResult | null>(null);
   const [approvedMcpTools, setApprovedMcpTools] = useState<string[]>([]);
+  const [approvedCapabilities, setApprovedCapabilities] = useState<string[]>([]);
   const [contextSnapshot, setContextSnapshot] =
     useState<ContextSnapshot | null>(null);
   const [taskAttachments, setTaskAttachments] = useState<TaskAttachment[]>([]);
@@ -736,6 +810,10 @@ export function App() {
   const [plugins, setPlugins] = useState<Plugin[]>([]);
   const [pluginSource, setPluginSource] = useState("");
   const [pluginBusy, setPluginBusy] = useState(false);
+  const [trustKeys, setTrustKeys] = useState<PluginTrustKey[]>([]);
+  const [trustKeyId, setTrustKeyId] = useState("");
+  const [trustKeyValue, setTrustKeyValue] = useState("");
+  const [trustKeyBusy, setTrustKeyBusy] = useState(false);
   const [capabilityDirectory, setCapabilityDirectory] =
     useState<CapabilityDirectory | null>(null);
   const [capabilityFilter, setCapabilityFilter] = useState<CapabilityFilter>("all");
@@ -763,6 +841,9 @@ export function App() {
   const [embeddingDimensions, setEmbeddingDimensions] = useState("");
   const [clearEmbeddingApiKey, setClearEmbeddingApiKey] = useState(false);
   const [qdrantUrl, setQdrantUrl] = useState("");
+  const [userSkillRoots, setUserSkillRoots] = useState("");
+  const [bundledSkillRoots, setBundledSkillRoots] = useState("");
+  const [fullLocalShellEnabled, setFullLocalShellEnabled] = useState(false);
   const [documentBusy, setDocumentBusy] = useState(false);
   const [documents, setDocuments] = useState<ManagedDocument[]>([]);
   const [attachedDocumentIds, setAttachedDocumentIds] = useState<string[]>([]);
@@ -849,6 +930,13 @@ export function App() {
     setPlugins(data.plugins ?? []);
   }
 
+  async function loadPluginTrustKeys() {
+    const response = await fetch(`${API}/plugin-trust-keys`);
+    if (!response.ok) throw new Error("无法读取可信发布者目录");
+    const data = (await response.json()) as { trust_keys?: PluginTrustKey[] };
+    setTrustKeys(data.trust_keys ?? []);
+  }
+
   async function loadRuntimeConfiguration() {
     const response = await fetch(`${API}/runtime/configuration`);
     if (response.status === 404 || response.status === 405) {
@@ -870,6 +958,13 @@ export function App() {
       );
     }
     if (payload.qdrant) setQdrantUrl(payload.qdrant.url);
+    if (payload.skills) {
+      setUserSkillRoots(payload.skills.user_roots.join("; "));
+      setBundledSkillRoots(payload.skills.bundled_roots.join("; "));
+    }
+    if (payload.experimental) {
+      setFullLocalShellEnabled(payload.experimental.full_local_shell_enabled);
+    }
   }
 
   async function loadDocuments(targetProjectId: string) {
@@ -1018,6 +1113,81 @@ export function App() {
     return copyText(command, "无法复制受控终端命令，请手动选择后复制。");
   }
 
+  async function loadTaskWorkspace(threadId: string): Promise<void> {
+    const response = await fetch(`${API}/tasks/${encodeURIComponent(threadId)}/workspace`);
+    if (!response.ok) {
+      setTaskWorkspace(null);
+      return;
+    }
+    setTaskWorkspace((await response.json()) as TaskWorkspace);
+  }
+
+  function openWorkspaceBranchDialog() {
+    setWorkspaceBranchName("");
+    setWorkspaceBranchConfirmed(false);
+    setWorkspaceBranchDialogOpen(true);
+  }
+
+  async function createWorkspaceBranch() {
+    if (!task || !workspaceBranchConfirmed || !workspaceBranchName.trim() || workspaceBranchBusy) return;
+    setWorkspaceBranchBusy(true);
+    setRequestError("");
+    try {
+      const response = await fetch(
+        `${API}/tasks/${encodeURIComponent(task.thread_id)}/workspace/branch`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ branch: workspaceBranchName.trim(), confirmed: true }),
+        },
+      );
+      const payload = await response.json() as { detail?: string };
+      if (!response.ok) {
+        throw new Error(payload.detail ?? "创建审阅分支失败");
+      }
+      await loadTaskWorkspace(task.thread_id);
+      setWorkspaceBranchDialogOpen(false);
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "创建审阅分支失败");
+    } finally {
+      setWorkspaceBranchBusy(false);
+    }
+  }
+
+  function openWorkspaceHandoffDialog() {
+    setWorkspaceHandoffConfirmed(false);
+    setWorkspaceHandoffDialogOpen(true);
+  }
+
+  async function handoffWorkspaceToLocal() {
+    if (!task || !workspaceHandoffConfirmed || workspaceHandoffBusy) return;
+    setWorkspaceHandoffBusy(true);
+    setRequestError("");
+    try {
+      const response = await fetch(
+        `${API}/tasks/${encodeURIComponent(task.thread_id)}/workspace/handoff`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            confirmed: true,
+            confirmation: "我已了解完全权限风险",
+          }),
+        },
+      );
+      const payload = await response.json() as { detail?: string };
+      if (!response.ok) {
+        throw new Error(payload.detail ?? "交接到 Local 失败");
+      }
+      await loadTaskWorkspace(task.thread_id);
+      setWorkspaceHandoffDialogOpen(false);
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "交接到 Local 失败");
+    } finally {
+      setWorkspaceHandoffBusy(false);
+    }
+  }
+
   async function copyConversationMessage(message: ConversationMessage): Promise<void> {
     const copied = await copyText(
       message.content,
@@ -1075,7 +1245,7 @@ export function App() {
         title: `任务产物 ${nextArtifacts.length}`,
         lines: nextArtifacts.length
           ? nextArtifacts.slice(0, 8).map((artifact) =>
-              `${artifactLabels[artifact.kind] ?? artifact.kind}  ${artifact.size_bytes.toLocaleString()} B  ${artifact.sha256.slice(0, 12)}`,
+              `${artifactLabel(artifact.kind)}  ${artifact.size_bytes.toLocaleString()} B  ${artifact.sha256.slice(0, 12)}`,
             )
           : ["当前任务尚未生成可读取产物。"],
       };
@@ -1101,6 +1271,7 @@ export function App() {
       loadTasks(false),
       loadConversations(false),
       loadPlugins(),
+      loadPluginTrustKeys(),
       loadRuntimeConfiguration(),
       checkApiHealth(),
     ])
@@ -1189,6 +1360,11 @@ export function App() {
   }, [projectDiagnosis, task?.thread_id, taskBlocksNewTurn]);
 
   useEffect(() => {
+    // 高风险能力授权不应从完全本机控制降级继承到安全隔离任务。
+    if (mode === "safe-isolated") setApprovedCapabilities([]);
+  }, [mode]);
+
+  useEffect(() => {
     if (!task) return;
     const source = new EventSource(`${API}/tasks/${task.thread_id}/events`);
     setEventStreamState("connecting");
@@ -1262,6 +1438,25 @@ export function App() {
     });
     return () => source.close();
   }, [task?.thread_id]);
+
+  useEffect(() => {
+    if (!task || !terminalTaskStatuses.has(task.status)) {
+      setTaskWorkspace(null);
+      return;
+    }
+    let active = true;
+    void fetch(`${API}/tasks/${encodeURIComponent(task.thread_id)}/workspace`)
+      .then(async (response) => response.ok ? await response.json() as TaskWorkspace : null)
+      .then((workspace) => {
+        if (active) setTaskWorkspace(workspace);
+      })
+      .catch(() => {
+        if (active) setTaskWorkspace(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [task?.thread_id, task?.status]);
 
   useEffect(() => {
     if (!conversationMessages.length && !task) return;
@@ -1711,13 +1906,65 @@ export function App() {
     }
   }
 
+  async function addPluginTrustKey() {
+    if (!trustKeyId.trim() || !trustKeyValue.trim()) return;
+    setTrustKeyBusy(true);
+    setRequestError("");
+    try {
+      const response = await fetch(`${API}/plugin-trust-keys`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          key_id: trustKeyId.trim(),
+          public_key_base64: trustKeyValue.trim(),
+        }),
+      });
+      const payload = (await response.json()) as { detail?: string | { message?: string } };
+      if (!response.ok) {
+        throw new Error(
+          typeof payload.detail === "string"
+            ? payload.detail
+            : (payload.detail?.message ?? "可信发布者登记失败"),
+        );
+      }
+      setTrustKeyId("");
+      setTrustKeyValue("");
+      await Promise.all([loadPluginTrustKeys(), loadPlugins(), loadCapabilityDirectory(projectId)]);
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "可信发布者登记失败");
+    } finally {
+      setTrustKeyBusy(false);
+    }
+  }
+
+  async function removePluginTrustKey(keyId: string) {
+    setTrustKeyBusy(true);
+    setRequestError("");
+    try {
+      const response = await fetch(`${API}/plugin-trust-keys/${encodeURIComponent(keyId)}`, { method: "DELETE" });
+      const payload = (await response.json()) as { detail?: string | { message?: string } };
+      if (!response.ok) {
+        throw new Error(
+          typeof payload.detail === "string"
+            ? payload.detail
+            : (payload.detail?.message ?? "撤销可信发布者失败"),
+        );
+      }
+      await Promise.all([loadPluginTrustKeys(), loadPlugins(), loadCapabilityDirectory(projectId)]);
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "撤销可信发布者失败");
+    } finally {
+      setTrustKeyBusy(false);
+    }
+  }
+
   async function saveRuntimeConfiguration() {
     if (!runtimeConfiguration?.writable) return;
     setRuntimeConfigurationBusy(true);
     setRuntimeConfigurationMessage("");
     setRequestError("");
     const dimensions = embeddingDimensions.trim();
-    const payload: Record<string, string | number> = {};
+    const payload: Record<string, string | number | boolean> = {};
     const addText = (name: string, value: string) => {
       if (value.trim()) payload[name] = value.trim();
     };
@@ -1726,6 +1973,9 @@ export function App() {
     addText("embedding_base_url", embeddingBaseUrl);
     addText("embedding_model", embeddingModel);
     addText("qdrant_url", qdrantUrl);
+    payload.user_skill_roots = userSkillRoots.trim();
+    payload.bundled_skill_roots = bundledSkillRoots.trim();
+    payload.full_local_shell_enabled = fullLocalShellEnabled;
     if (dimensions) payload.embedding_dimensions = Number(dimensions);
     if (chatApiKey) payload.chat_api_key = chatApiKey;
     else if (clearChatApiKey) payload.chat_api_key = "";
@@ -1798,12 +2048,12 @@ export function App() {
       const selected = await open({
         multiple: false,
         title: "选择研发文档",
-        filters: [{ name: "Markdown 或文本", extensions: ["md", "txt"] }],
+        filters: [{ name: "研发文档", extensions: ["md", "txt", "pdf", "docx"] }],
       });
       if (typeof selected === "string") await indexDocument(selected, true);
     } catch {
       setRequestError(
-        "系统文件选择器仅在已安装的 RepoPilot Desktop 中可用；浏览器调试时请手动输入 MD/TXT 路径。",
+        "系统文件选择器仅在已安装的 RepoPilot Desktop 中可用；浏览器调试时请手动输入 MD/TXT/PDF/DOCX 路径。",
       );
     }
   }
@@ -1976,6 +2226,12 @@ export function App() {
           operation,
           confirmation: confirmed ? "我已了解完全权限风险" : null,
           approved_mcp_tools: approvedMcpTools,
+          approved_mcp_sources:
+            approvedMcpTools.length > 0 && mcpResult?.config_source
+              ? [mcpResult.config_source]
+              : [],
+          approved_capabilities:
+            mode === "full-local" && confirmed ? approvedCapabilities : [],
           attached_document_ids: attachedDocumentIds,
         }),
       });
@@ -1989,6 +2245,8 @@ export function App() {
         );
       }
       setTask(payload as Task);
+      // 授权只绑定刚创建的任务；后续任务必须重新明确选择。
+      setApprovedCapabilities([]);
       setDescription("");
       setAttachedDocumentIds([]);
       summarizedTaskRef.current = null;
@@ -2138,6 +2396,7 @@ export function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           server: mcpServer.trim(),
+          config_source: mcpConfigSource,
           config_path: mcpConfigPath.trim(),
           task_mode: mode,
           confirmation:
@@ -2170,6 +2429,9 @@ export function App() {
         body: JSON.stringify({
           decision,
           comment: decision === "revise" ? revisionComment : null,
+          ...(decision === "approve" && executionApproval
+            ? { selected_patch_paths: selectedPatchPaths }
+            : {}),
         }),
       });
       const payload = await response.json();
@@ -2183,33 +2445,6 @@ export function App() {
       if (decision === "approve") setExecutionApprovalConfirmation(false);
       const nextTask = payload as Task;
       setTask(nextTask);
-
-      // 完全本机控制已由任务级确认语句冻结授权；此处仅自动继续图内的
-      // 第二个内部确认点，不会放宽 PolicyGuard、工具白名单或路径边界。
-      if (
-        decision === "approve" &&
-        nextTask.task_mode === "full-local" &&
-        nextTask.task_operation === "change" &&
-        nextTask.pending_approval
-      ) {
-        const continuation = await fetch(
-          `${API}/tasks/${nextTask.thread_id}/approval`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ decision: "approve", comment: null }),
-          },
-        );
-        const continuationPayload = await continuation.json();
-        if (!continuation.ok) {
-          throw new Error(
-            typeof continuationPayload.detail === "string"
-              ? continuationPayload.detail
-              : "无法继续执行已授权的任务",
-          );
-        }
-        setTask(continuationPayload as Task);
-      }
     } catch {
       setRequestError("审批请求未送达本机 API，请检查服务状态后重试。");
     } finally {
@@ -2325,6 +2560,7 @@ export function App() {
     setMode("safe-isolated");
     setOperation("change");
     setConfirmed(false);
+    setApprovedCapabilities([]);
     setRevisionComment("");
     setRequestError("");
     setActiveView("task");
@@ -2347,6 +2583,7 @@ export function App() {
     }
     setProjectId(nextProjectId);
     setApprovedMcpTools([]);
+    setApprovedCapabilities([]);
     setMcpResult(null);
     setConfirmed(false);
   }
@@ -2475,6 +2712,9 @@ export function App() {
 
   const interrupt = task?.interrupts?.[0];
   const currentProject = projects.find((item) => item.project_id === projectId);
+  const activePluginMcpSources = plugins
+    .filter((plugin) => plugin.active && plugin.manifest.mcp_config)
+    .sort((left, right) => left.manifest.name.localeCompare(right.manifest.name, "zh-CN"));
   const discoveredMcpCapabilities: CapabilityDirectoryItem[] = (
     mcpResult?.connection?.tools ?? []
   ).map((tool) => ({
@@ -2483,7 +2723,9 @@ export function App() {
     description: tool.description,
     kind: "mcp_tool",
     scope: "project",
-    source_label: "当前项目 MCP",
+    source_label: mcpResult?.config_source?.startsWith("plugin:")
+      ? `插件 MCP：${activePluginMcpSources.find((plugin) => `plugin:${plugin.plugin_id}` === mcpResult.config_source)?.manifest.name ?? "已冻结插件"}`
+      : "当前项目 MCP",
     risks: tool.risks,
     enabled: true,
     details: {},
@@ -2507,6 +2749,9 @@ export function App() {
     if (!item.enabled) return { label: "已禁用", tone: "blocked", detail: "能力目录已将该能力禁用。" };
     if (frozenToolIds.has(item.capability_id) || frozenCapabilityIds.has(item.capability_id)) {
       return { label: "已冻结", tone: "ready", detail: "已进入当前任务快照，不能由模型自行升级。" };
+    }
+    if (approvedCapabilities.includes(item.capability_id)) {
+      return { label: "待任务冻结", tone: "pending", detail: "将随本次任务快照提交，并由 PolicyGuard 再次裁决。" };
     }
     if (mode === "full-local" && !fullAccessConfirmed) {
       return { label: "待确认", tone: "pending", detail: "需先完成完全本机控制确认，才会按完全权限策略创建任务。" };
@@ -2557,6 +2802,14 @@ export function App() {
         ? "Git 基线待诊断"
         : "非 Git 项目"
       : "等待选择项目";
+  const detectedProfiles = Object.values(projectDiagnosis?.profiles ?? {});
+  const executableProfile = detectedProfiles.find(
+    (profile) => profile.execution_supported && profile.runtime?.status === "READY",
+  );
+  const blockedRuntimeProfile = detectedProfiles.find(
+    (profile) => profile.execution_supported && profile.runtime?.status === "BLOCKED",
+  );
+  const discoveredProfile = detectedProfiles.find((profile) => !profile.execution_supported);
   const projectReadinessItems = currentProject
     ? [
         {
@@ -2573,8 +2826,15 @@ export function App() {
         {
           label: "工程 Profile",
           value:
-            projectDiagnosis?.profiles.java_maven.status === "READY"
-              ? "Java / Maven"
+            executableProfile?.display_name ??
+            (discoveredProfile ? `${discoveredProfile.display_name}·已识别` : "等待预检"),
+        },
+        {
+          label: "验证运行时",
+          value: executableProfile
+            ? `${executableProfile.runtime?.command ?? executableProfile.display_name} 可用`
+            : blockedRuntimeProfile
+              ? `${blockedRuntimeProfile.runtime?.command ?? blockedRuntimeProfile.display_name} 待安装`
               : "等待预检",
         },
       ]
@@ -2694,7 +2954,21 @@ export function App() {
     readString(interrupt?.target_test_class) ??
     readString(approvalPlan?.target_test_class);
   const approvalSteps = readStringList(approvalPlan?.steps);
+  const approvalPatchPreview = asRecord(interrupt?.patch_preview) ?? asRecord(task?.state?.patch_preview);
+  const approvalPatchDiff = readString(approvalPatchPreview?.diff);
+  const approvalPatchHash = readString(approvalPatchPreview?.sha256);
+  const approvalPatchPaths = readStringList(approvalPatchPreview?.paths);
+  const approvalShellPreviews = Array.isArray(interrupt?.shell_previews ?? task?.state?.shell_previews)
+    ? (interrupt?.shell_previews ?? task?.state?.shell_previews) as unknown[]
+    : [];
   const executionApproval = interrupt?.type === "EXECUTION_APPROVAL_REQUIRED";
+  const riskApproval = interrupt?.type === "SHELL_RISK_APPROVAL_REQUIRED";
+  const protectedExecutionApproval = executionApproval || riskApproval;
+  const patchSelectionKey = `${task?.thread_id ?? ""}:${approvalPatchHash ?? ""}:${approvalPatchPaths.join("|")}`;
+
+  useEffect(() => {
+    setSelectedPatchPaths(executionApproval ? approvalPatchPaths : []);
+  }, [patchSelectionKey, executionApproval]);
   const canStart =
     !taskBlocksNewTurn &&
     Boolean(projectId && description.trim()) &&
@@ -3362,7 +3636,7 @@ export function App() {
                         )}
                         <div className="goal-result-facts" aria-label="任务结果摘要">
                           {hasGitDiff && <span><CheckCircle size={14} weight="fill" />已生成真实代码修改</span>}
-                          {hasVerification && <span><CheckCircle size={14} weight="fill" />已记录 Maven 验证</span>}
+                          {hasVerification && <span><CheckCircle size={14} weight="fill" />已记录构建验证</span>}
                           {hasPlan && !hasGitDiff && <span><FileCode size={14} />已生成处理方案</span>}
                           {!hasGitDiff && !hasVerification && !hasPlan && taskIsRunning && <span><CircleNotch className="spin" size={14} />正在分析代码上下文</span>}
                           {!hasGitDiff && !hasVerification && !hasPlan && !taskIsRunning && <span><WarningCircle size={14} weight="fill" />尚未生成可验证的修改</span>}
@@ -3454,15 +3728,19 @@ export function App() {
                         <strong>
                           {researchPlanApproval
                             ? "分析已完成，可以生成结论"
+                            : riskApproval
+                            ? "高风险命令需要单独确认"
                             : interrupt?.type === "EXECUTION_APPROVAL_REQUIRED"
                             ? "准备开始修复与验证"
                             : "已定位修复方向"}
                         </strong>
                         <p>
                           {researchPlanApproval
-                            ? "这是只读计划任务，继续后会整理结论，不会修改代码或运行 Maven。"
+                            ? "这是只读计划任务，继续后会整理结论，不会修改代码或运行构建验证。"
+                            : riskApproval
+                              ? "命令包含网络或包管理风险。此步只授权已预览命令，之后仍需单独审阅补丁与构建执行。"
                             : executionApproval
-                              ? "继续后将只在受控范围内写入代码并运行固定 Maven 验证。"
+                              ? "继续后将只在受控范围内写入代码并运行固定构建验证。"
                               : "RepoPilot 已完成问题定位；你无需审阅计划，继续后会进入下一步处理。"}
                         </p>
                       </div>
@@ -3472,7 +3750,7 @@ export function App() {
                       <div className="approval-scope" aria-label="本次审批范围">
                         <div className="approval-scope-facts">
                           <span><b>{executionApproval ? "写入范围" : "处理范围"}</b>{executionApproval ? "仅允许受控补丁写入候选文件" : "本次不会直接写入代码"}</span>
-                          <span><b>Maven Recipe</b><code>{approvalRecipe}</code></span>
+                          <span><b>Build Recipe</b><code>{approvalRecipe}</code></span>
                           {approvalTargetTest && <span><b>目标测试</b><code>{approvalTargetTest}</code></span>}
                         </div>
                         {approvalCandidateFiles.length > 0 && (
@@ -3484,6 +3762,66 @@ export function App() {
                             {approvalCandidateFiles.length > 5 && <small>另有 {approvalCandidateFiles.length - 5} 个候选文件</small>}
                           </div>
                         )}
+                        {executionApproval && approvalPatchPaths.length > 0 && (
+                          <div className="approval-file-selection">
+                            <div>
+                              <span>选择要写入的文件</span>
+                              <small>仅所选文件会写入工作区；至少保留一个文件，验证仍使用同一 Build Recipe。</small>
+                            </div>
+                            <ul>
+                              {approvalPatchPaths.map((path) => {
+                                const checked = selectedPatchPaths.includes(path);
+                                return (
+                                  <li key={path}>
+                                    <label>
+                                      <input
+                                        type="checkbox"
+                                        checked={checked}
+                                        disabled={checked && selectedPatchPaths.length === 1}
+                                        onChange={() => {
+                                          setSelectedPatchPaths((current) => (
+                                            current.includes(path)
+                                              ? current.filter((item) => item !== path)
+                                              : [...current, path]
+                                          ));
+                                        }}
+                                      />
+                                      <code>{path}</code>
+                                    </label>
+                                  </li>
+                                );
+                              })}
+                            </ul>
+                          </div>
+                        )}
+                        {executionApproval && approvalPatchDiff && (
+                          <details className="approval-patch-preview">
+                            <summary>查看补丁预览</summary>
+                            {approvalPatchHash && <code className="approval-patch-hash">{approvalPatchHash}</code>}
+                            <pre>{approvalPatchDiff}</pre>
+                          </details>
+                        )}
+                        {protectedExecutionApproval && approvalShellPreviews.length > 0 && (
+                          <details className="approval-patch-preview">
+                            <summary>查看命令预览</summary>
+                            <p className="muted-copy">以下命令尚未运行；继续后仅会执行哈希未变化的已预览命令。</p>
+                            <ol className="approval-plan-steps">
+                              {approvalShellPreviews.map((raw, index) => {
+                                const preview = asRecord(raw);
+                                const argv = readStringList(preview?.argv);
+                                const digest = readString(preview?.approval_sha256);
+                                const timeout = preview?.timeout_seconds;
+                                return (
+                                  <li key={digest ?? index}>
+                                    <code>{argv.join(" ") || "受控命令"}</code>
+                                    {typeof timeout === "number" && <small> 超时 {timeout}s</small>}
+                                    {digest && <code className="approval-patch-hash">{digest}</code>}
+                                  </li>
+                                );
+                              })}
+                            </ol>
+                          </details>
+                        )}
                         {!executionApproval && approvalSteps.length > 0 && (
                           <ol className="approval-plan-steps">{approvalSteps.map((step, index) => <li key={index}>{step}</li>)}</ol>
                         )}
@@ -3494,7 +3832,7 @@ export function App() {
                         className="primary-button"
                         type="button"
                         onClick={() => {
-                          if (executionApproval) {
+                          if (protectedExecutionApproval) {
                             setExecutionApprovalConfirmation(true);
                             return;
                           }
@@ -3503,7 +3841,7 @@ export function App() {
                         disabled={approvalBusy}
                       >
                         <CheckCircle size={16} weight="bold" />
-                        {approvalBusy ? "正在继续" : researchPlanApproval ? "生成结论" : executionApproval ? "允许执行并验证" : activeTaskMode === "full-local" ? "继续实现目标" : "继续修复"}
+                        {approvalBusy ? "正在继续" : researchPlanApproval ? "生成结论" : riskApproval ? "审阅高风险命令" : executionApproval ? "允许执行并验证" : activeTaskMode === "full-local" ? "继续实现目标" : "继续修复"}
                       </button>
                       <button className="danger-button" type="button" onClick={() => void approve("reject")} disabled={approvalBusy}>
                         <XCircle size={16} />停止任务
@@ -3512,7 +3850,7 @@ export function App() {
                     </section>
                   </article>
                 )}
-                {executionApprovalConfirmation && task?.pending_approval && executionApproval && (
+                {executionApprovalConfirmation && task?.pending_approval && protectedExecutionApproval && (
                   <div className="approval-confirmation-backdrop" role="presentation">
                     <section
                       className="approval-confirmation"
@@ -3524,19 +3862,29 @@ export function App() {
                       <header>
                         <WarningCircle size={21} weight="fill" aria-hidden="true" />
                         <div>
-                          <span>执行审批</span>
-                          <h2 id="execution-approval-title">确认允许受控执行</h2>
+                          <span>{riskApproval ? "高风险审批" : "执行审批"}</span>
+                          <h2 id="execution-approval-title">{riskApproval ? "确认允许已预览的高风险命令" : "确认允许受控执行"}</h2>
                         </div>
                       </header>
                       <p id="execution-approval-description">
-                        RepoPilot 将只在当前任务工作区内应用结构化补丁，并按下方固定 Maven Recipe 验证。不会创建提交、推送代码或执行任意 Shell。
+                        {riskApproval
+                          ? "你即将授权已预览的完全本机高风险命令，其中可能包含 Shell 解释器、项目外路径、网络、Git 提交或推送。任何参数或风险哈希变化都会阻断命令；补丁和构建验证仍需后续单独审批。"
+                          : "RepoPilot 将按已预览范围应用结构化补丁，并按下方 Build Recipe 验证。完全本机 Shell、提交和推送仍必须先经过单独的命令风险审批。"}
                       </p>
-                      <dl>
-                        <div><dt>可写入范围</dt><dd>{approvalCandidateFiles.length ? `${approvalCandidateFiles.length} 个候选文件` : "计划中的候选文件"}</dd></div>
-                        <div><dt>Maven Recipe</dt><dd><code>{approvalRecipe}</code></dd></div>
-                        {approvalTargetTest && <div><dt>目标测试</dt><dd><code>{approvalTargetTest}</code></dd></div>}
-                      </dl>
-                      <p className="approval-confirmation-note">拒绝会停止本次任务并保留已生成的计划与证据，不会写入代码。</p>
+                      {riskApproval ? (
+                        <p className="approval-confirmation-note">
+                          本次仅见下方命令预览中标记为风险的命令。拒绝会停止任务，不会执行命令、写入代码或运行构建验证。
+                        </p>
+                      ) : (
+                        <>
+                          <dl>
+                            <div><dt>可写入范围</dt><dd>{approvalPatchPaths.length ? `${selectedPatchPaths.length} / ${approvalPatchPaths.length} 个预览文件` : approvalCandidateFiles.length ? `${approvalCandidateFiles.length} 个候选文件` : "计划中的候选文件"}</dd></div>
+                            <div><dt>Build Recipe</dt><dd><code>{approvalRecipe}</code></dd></div>
+                            {approvalTargetTest && <div><dt>目标测试</dt><dd><code>{approvalTargetTest}</code></dd></div>}
+                          </dl>
+                          <p className="approval-confirmation-note">拒绝会停止本次任务并保留已生成的计划与证据，不会写入代码。</p>
+                        </>
+                      )}
                       <footer>
                         <button className="secondary-button" type="button" onClick={() => setExecutionApprovalConfirmation(false)} disabled={approvalBusy}>
                           返回审阅
@@ -3678,7 +4026,7 @@ export function App() {
                             onClick={() => selectOperation("change")}
                             aria-label="修改代码模式"
                             aria-pressed={composerMode === "change"}
-                            title="围绕一个代码目标完成计划、受控修改和 Maven 验证"
+                            title="围绕一个代码目标完成计划、受控修改和构建验证"
                           >
                             <Target size={15} />
                             <span>修改代码</span>
@@ -3690,7 +4038,7 @@ export function App() {
                             onClick={() => selectOperation("research")}
                             aria-label="分析代码模式"
                             aria-pressed={composerMode === "research"}
-                            title="只研究代码并输出证据化计划，不写入文件、不运行 Maven"
+                            title="只研究代码并输出证据化计划，不写入文件、不运行构建验证"
                           >
                             <ListMagnifyingGlass size={15} />
                             <span>分析代码</span>
@@ -3768,13 +4116,28 @@ export function App() {
                   evidence={inspectorEvidence}
                   artifacts={artifacts.map((artifact) => ({
                     kind: artifact.kind,
-                    label: artifactLabels[artifact.kind] ?? artifact.kind,
+                    label: artifactLabel(artifact.kind),
                     sizeBytes: artifact.size_bytes,
                   }))}
                   selectedSkillCount={contextSnapshot?.selected_skills.length ?? 0}
+                  selectedSkills={(contextSnapshot?.selected_skills ?? []).map((skill) => ({
+                    name: skill.name,
+                    scope: skill.scope,
+                    allowedTools: skill.allowed_tools,
+                    effectiveTools: skill.effective_tools,
+                  }))}
                   boundToolCount={contextSnapshot?.bound_tool_ids.length ?? 0}
                   totalTokens={telemetry?.model.total_tokens}
                   terminalCommands={terminalCommands}
+                  workspace={taskWorkspace ? {
+                    mode: taskWorkspace.mode,
+                    lifecycle: taskWorkspace.lifecycle,
+                    branch: taskWorkspace.branch,
+                    baseCommit: taskWorkspace.base_commit,
+                    dirtyFileCount: taskWorkspace.dirty_file_count,
+                    branchCreationAvailable: taskWorkspace.branch_creation_available,
+                    localHandoffAvailable: taskWorkspace.local_handoff_available,
+                  } : null}
                   onClose={() => setShowTaskInspector(false)}
                   onOpenContext={() => setActiveView("context")}
                   onOpenArtifact={(kind) => {
@@ -3785,8 +4148,110 @@ export function App() {
                     setActiveView("review");
                   }}
                   onCopyTerminalCommand={copyTerminalCommand}
+                  onCreateWorkspaceBranch={openWorkspaceBranchDialog}
+                  onHandoffWorkspaceToLocal={openWorkspaceHandoffDialog}
                 />
               </>
+            )}
+            {workspaceBranchDialogOpen && taskWorkspace?.mode === "worktree" && (
+              <div className="approval-confirmation-backdrop" role="presentation">
+                <section
+                  className="approval-confirmation workspace-branch-confirmation"
+                  role="dialog"
+                  aria-modal="true"
+                  aria-labelledby="workspace-branch-title"
+                >
+                  <header>
+                    <GitBranch size={21} weight="fill" aria-hidden="true" />
+                    <div>
+                      <span>Worktree 操作</span>
+                      <h2 id="workspace-branch-title">创建审阅分支</h2>
+                    </div>
+                  </header>
+                  <p>分支会在当前任务的隔离 Worktree 内创建，不会修改源仓库内容、创建提交或推送远程。</p>
+                  <label className="workspace-branch-field">
+                    <span>分支名称</span>
+                    <input
+                      value={workspaceBranchName}
+                      onChange={(event) => setWorkspaceBranchName(event.target.value)}
+                      placeholder="例如 repopilot/fix-order-validation"
+                      autoFocus
+                    />
+                  </label>
+                  <label className="workspace-branch-check">
+                    <input
+                      type="checkbox"
+                      checked={workspaceBranchConfirmed}
+                      onChange={(event) => setWorkspaceBranchConfirmed(event.target.checked)}
+                    />
+                    <span>我确认仅创建审阅分支，并保留该隔离工作区。</span>
+                  </label>
+                  <footer>
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      onClick={() => setWorkspaceBranchDialogOpen(false)}
+                      disabled={workspaceBranchBusy}
+                    >
+                      取消
+                    </button>
+                    <button
+                      className="primary-button"
+                      type="button"
+                      onClick={() => void createWorkspaceBranch()}
+                      disabled={workspaceBranchBusy || !workspaceBranchConfirmed || !workspaceBranchName.trim()}
+                    >
+                      <GitBranch size={16} weight="bold" />{workspaceBranchBusy ? "正在创建" : "确认创建"}
+                    </button>
+                  </footer>
+                </section>
+              </div>
+            )}
+            {workspaceHandoffDialogOpen && taskWorkspace?.mode === "worktree" && (
+              <div className="approval-confirmation-backdrop" role="presentation">
+                <section
+                  className="approval-confirmation workspace-handoff-confirmation"
+                  role="dialog"
+                  aria-modal="true"
+                  aria-labelledby="workspace-handoff-title"
+                >
+                  <header>
+                    <WarningCircle size={21} weight="fill" aria-hidden="true" />
+                    <div>
+                      <span>完全本机控制</span>
+                      <h2 id="workspace-handoff-title">将隔离修改交接到 Local</h2>
+                    </div>
+                  </header>
+                  <p>此操作会将当前 Worktree 的真实 Git Diff 应用到原项目目录。不会创建提交或推送，Worktree 仍会保留。</p>
+                  <p className="approval-confirmation-note">RepoPilot 会先复核原项目仍处于任务基线且没有未提交改动；任一变化都会阻断，不会覆盖你的文件。</p>
+                  <label className="workspace-branch-check workspace-handoff-check">
+                    <input
+                      type="checkbox"
+                      checked={workspaceHandoffConfirmed}
+                      onChange={(event) => setWorkspaceHandoffConfirmed(event.target.checked)}
+                    />
+                    <span>我已了解完全权限风险，并确认将这次隔离修改写入 Local 项目。</span>
+                  </label>
+                  <footer>
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      onClick={() => setWorkspaceHandoffDialogOpen(false)}
+                      disabled={workspaceHandoffBusy}
+                    >
+                      保持隔离
+                    </button>
+                    <button
+                      className="danger-button"
+                      type="button"
+                      onClick={() => void handoffWorkspaceToLocal()}
+                      disabled={workspaceHandoffBusy || !workspaceHandoffConfirmed}
+                    >
+                      {workspaceHandoffBusy ? "正在交接" : "确认写入 Local"}
+                    </button>
+                  </footer>
+                </section>
+              </div>
             )}
             {task && showTaskTerminal && (
               <TaskTerminalDock
@@ -3858,6 +4323,14 @@ export function App() {
                   <div className="capability-list">
                     {capabilityItems.map((item) => {
                       const state = capabilityState(item);
+                      const canApproveForTask = Boolean(
+                        !task &&
+                        item.enabled &&
+                        !item.discovered_mcp &&
+                        item.requires_approval &&
+                        mode === "full-local" &&
+                        confirmed,
+                      );
                       const allowedTools = Array.isArray(item.details.allowed_tools)
                         ? item.details.allowed_tools.filter((value): value is string => typeof value === "string")
                         : [];
@@ -3874,7 +4347,23 @@ export function App() {
                               {allowedTools.length > 0 && <code>允许：{allowedTools.join(", ")}</code>}
                             </div>
                           </div>
-                          <span className={`capability-state ${state.tone}`} title={state.detail}>{state.label}</span>
+                          <div className="capability-actions">
+                            {canApproveForTask && (
+                              <label className="capability-approval">
+                                <input
+                                  type="checkbox"
+                                  checked={approvedCapabilities.includes(item.capability_id)}
+                                  onChange={(event) => setApprovedCapabilities((current) =>
+                                    event.target.checked
+                                      ? [...new Set([...current, item.capability_id])]
+                                      : current.filter((capabilityId) => capabilityId !== item.capability_id),
+                                  )}
+                                />
+                                本任务授权
+                              </label>
+                            )}
+                            <span className={`capability-state ${state.tone}`} title={state.detail}>{state.label}</span>
+                          </div>
                         </article>
                       );
                     })}
@@ -3937,6 +4426,18 @@ export function App() {
                       <button className="secondary-button" type="button" onClick={() => void checkApiHealth()} disabled={runtimeHealthChecking}>
                         <ArrowClockwise size={15} />{runtimeHealthChecking ? "检查中" : "刷新状态"}
                       </button>
+                    </div>
+                    <div className="runtime-shell-setting">
+                      <label className="checkbox-row">
+                        <input
+                          type="checkbox"
+                          checked={fullLocalShellEnabled}
+                          onChange={(event) => setFullLocalShellEnabled(event.target.checked)}
+                          disabled={!runtimeConfiguration.writable || runtimeConfigurationBusy}
+                        />
+                        启用完全本机 Shell 与 Git 交付
+                      </label>
+                      <p>保存并重启后，完全本机任务可申请 Shell、Git commit/push 等能力；每条高风险命令仍需展示完整预览并单独确认。</p>
                     </div>
                     <div className="runtime-config-groups">
                       <section className="runtime-config-group">
@@ -4020,6 +4521,24 @@ export function App() {
                           <label className="runtime-config-wide">Qdrant URL<input value={qdrantUrl} onChange={(event) => setQdrantUrl(event.target.value)} placeholder="http://127.0.0.1:6333" disabled={!runtimeConfiguration.writable} /></label>
                         </div>
                       </section>
+                      <section className="runtime-config-group">
+                        <header>
+                          <b>Skill 目录</b>
+                          <span>启动时发现本机可复用 Skill；每项能力仍会经过任务权限、工具白名单和 PolicyGuard 裁决。</span>
+                          <em className="configuration-state complete">可选</em>
+                        </header>
+                        <div className="runtime-config-grid">
+                          <label className="runtime-config-wide">
+                            用户 Skill 根目录
+                            <input value={userSkillRoots} onChange={(event) => setUserSkillRoots(event.target.value)} placeholder="C:\\Users\\你\\.repopilot\\skills; D:\\team-skills" disabled={!runtimeConfiguration.writable} />
+                          </label>
+                          <label className="runtime-config-wide">
+                            内置或团队 Skill 根目录
+                            <input value={bundledSkillRoots} onChange={(event) => setBundledSkillRoots(event.target.value)} placeholder="D:\\RepoPilot\\skills" disabled={!runtimeConfiguration.writable} />
+                          </label>
+                        </div>
+                        <p className="runtime-config-help">使用分号分隔多个目录。这里只保存根目录，本页不会读取或展示 Skill 正文；保存并重启后生效。</p>
+                      </section>
                     </div>
                     <div className="runtime-configuration-actions">
                       <label className="checkbox-row"><input type="checkbox" checked={clearChatApiKey} onChange={(event) => setClearChatApiKey(event.target.checked)} disabled={!runtimeConfiguration.writable} />清除 Chat API Key</label>
@@ -4060,7 +4579,19 @@ export function App() {
               </div>
               <div className="settings-content">
                 <div className="mcp-form-grid">
-                  <label>配置路径<input value={mcpConfigPath} onChange={(event) => setMcpConfigPath(event.target.value)} /></label>
+                  <label>配置来源
+                    <select value={mcpConfigSource} onChange={(event) => {
+                      setMcpConfigSource(event.target.value);
+                      setMcpResult(null);
+                      setApprovedMcpTools([]);
+                    }}>
+                      <option value="project">当前项目配置</option>
+                      {activePluginMcpSources.map((plugin) => (
+                        <option key={plugin.plugin_id} value={`plugin:${plugin.plugin_id}`}>插件：{plugin.manifest.name}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>配置路径<input value={mcpConfigPath} onChange={(event) => setMcpConfigPath(event.target.value)} disabled={mcpConfigSource !== "project"} /></label>
                   <label>Server<input value={mcpServer} onChange={(event) => setMcpServer(event.target.value)} placeholder="engineering-docs" /></label>
                 </div>
                 <label className="checkbox-row">
@@ -4104,10 +4635,41 @@ export function App() {
                 <div className="plugin-list-clean">
                   {plugins.length === 0 ? <p>尚未安装插件</p> : plugins.map((plugin) => (
                     <label key={plugin.plugin_id}>
-                      <span><b>{plugin.manifest.name}</b><small>{plugin.manifest.description}</small></span>
-                      <input type="checkbox" checked={plugin.enabled} disabled={pluginBusy} onChange={(event) => void setPluginEnabled(plugin, event.target.checked)} />
+                      <span>
+                        <b>{plugin.manifest.name}</b>
+                        <small>{plugin.manifest.description}</small>
+                        <small>{plugin.compatibility_status === "COMPATIBLE" ? "兼容当前版本" : "与当前 RepoPilot 不兼容"}</small>
+                        <small>{plugin.signature_status === "VERIFIED" ? `发布者已验证：${plugin.signing_key_id ?? "已登记密钥"}` : `签名状态：${plugin.signature_status}`}</small>
+                        <small>{plugin.source_lock_status === "LOCKED" ? "Git 来源已锁定" : plugin.source_lock_status === "LOCAL_EXPLICIT" ? "本地显式来源（未锁定远程 Git）" : "Git 来源锁未验证"}</small>
+                        {plugin.manifest.hooks?.length ? <small>{plugin.manifest.hooks.length} 个声明式 Hook</small> : null}
+                      </span>
+                      <input
+                        type="checkbox"
+                        checked={plugin.enabled}
+                        disabled={pluginBusy || plugin.compatibility_status !== "COMPATIBLE" || plugin.integrity_status !== "VERIFIED" || plugin.signature_status !== "VERIFIED"}
+                        onChange={(event) => void setPluginEnabled(plugin, event.target.checked)}
+                      />
                     </label>
                   ))}
+                </div>
+                <div className="trust-key-panel">
+                  <div className="trust-key-heading">
+                    <b>可信发布者</b>
+                    <small>只保存公钥指纹；撤销后相关插件会立即失效。</small>
+                  </div>
+                  <div className="trust-key-form">
+                    <input value={trustKeyId} onChange={(event) => setTrustKeyId(event.target.value)} placeholder="发布者 ID，例如 team.spring" autoComplete="off" />
+                    <input value={trustKeyValue} onChange={(event) => setTrustKeyValue(event.target.value)} placeholder="Ed25519 公钥 Base64" autoComplete="off" />
+                    <button className="secondary-button" type="button" onClick={() => void addPluginTrustKey()} disabled={!trustKeyId.trim() || !trustKeyValue.trim() || trustKeyBusy}>登记</button>
+                  </div>
+                  <div className="trust-key-list">
+                    {trustKeys.length === 0 ? <p>尚未登记可信发布者。未受信任的已签名插件不会启用。</p> : trustKeys.map((key) => (
+                      <div key={key.key_id}>
+                        <span><b>{key.key_id}</b><small>指纹：{key.fingerprint.slice(0, 16)}…</small></span>
+                        <button className="text-button danger" type="button" onClick={() => void removePluginTrustKey(key.key_id)} disabled={trustKeyBusy}>撤销</button>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               </div>
             </section>
@@ -4127,6 +4689,27 @@ export function App() {
                           <span key={source.path + index}>{source.path}{source.line_start ? ":" + source.line_start : ""}</span>
                         ))}
                       </div>
+                      {contextSnapshot.selected_skills.length > 0 && (
+                        <div className="snapshot-skill-list">
+                          <span>Skill 工具权限快照</span>
+                          <p>请求工具与本任务实际可用工具的交集，不能通过 Skill 新增权限。</p>
+                          {contextSnapshot.selected_skills.map((skill) => (
+                            <article key={`${skill.scope}-${skill.name}`}>
+                              <b>{skill.name}</b>
+                              <dl>
+                                <div>
+                                  <dt>请求</dt>
+                                  <dd>{skill.allowed_tools?.length ? skill.allowed_tools.join(", ") : "未声明"}</dd>
+                                </div>
+                                <div>
+                                  <dt>可用</dt>
+                                  <dd>{skill.effective_tools?.length ? skill.effective_tools.join(", ") : "未获得额外工具授权"}</dd>
+                                </div>
+                              </dl>
+                            </article>
+                          ))}
+                        </div>
+                      )}
                     </>
                   )}
                   {taskAttachments.length > 0 && (
@@ -4172,14 +4755,14 @@ export function App() {
                   }}
                 >
                   <FileCode size={16} />
-                  <span>{artifactLabels[artifact.kind] ?? artifact.kind}<small>{artifact.size_bytes} B</small></span>
+                  <span>{artifactLabel(artifact.kind)}<small>{artifact.size_bytes} B</small></span>
                 </button>
               ))}
             </aside>
             <article className="artifact-reader">
               <header>
                 <div>
-                  <h2>{selectedArtifact ? artifactLabels[selectedArtifact] ?? selectedArtifact : "选择任务产物"}</h2>
+                  <h2>{selectedArtifact ? artifactLabel(selectedArtifact) : "选择任务产物"}</h2>
                   <p>{task ? compactTaskLabel(task) + " · " + taskStateLabel(task.status, task.verdict, task.pending_approval) : "尚未选择任务"}</p>
                 </div>
                 <div className="review-header-actions">

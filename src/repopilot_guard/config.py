@@ -33,6 +33,9 @@ _RUNTIME_CONFIG_KEYS = (
     "REPOPILOT_EMBEDDING_MODEL",
     "REPOPILOT_EMBEDDING_DIMENSIONS",
     "REPOPILOT_QDRANT_URL",
+    "REPOPILOT_USER_SKILL_ROOTS",
+    "REPOPILOT_BUNDLED_SKILL_ROOTS",
+    "REPOPILOT_FULL_LOCAL_SHELL_ENABLED",
 )
 _RUNTIME_CONFIG_LINE = re.compile(r"^(?P<prefix>\s*)(?P<key>REPOPILOT_[A-Z0-9_]+)\s*=.*$")
 
@@ -69,6 +72,12 @@ class RuntimeConfigurationManager:
                     "api_key_configured": self._secret_configured(settings.embedding_api_key),
                 },
                 "qdrant": {"url": settings.qdrant_url},
+                # Skill 目录是仅在本机设置页展示的路径配置，不会出现在任务证据或能力目录接口中。
+                "skills": {
+                    "user_roots": [str(path) for path in settings.user_skill_roots],
+                    "bundled_roots": [str(path) for path in settings.bundled_skill_roots],
+                },
+                "experimental": {"full_local_shell_enabled": settings.full_local_shell_enabled},
             }
             if not writable:
                 snapshot["code"] = "CONFIGURATION_WRITE_NOT_MANAGED"
@@ -156,10 +165,20 @@ class RuntimeConfigurationManager:
                     raise RuntimeConfigurationError("INVALID_EMBEDDING_DIMENSIONS")
                 validated[key] = str(value)
                 continue
+            if key == "REPOPILOT_FULL_LOCAL_SHELL_ENABLED":
+                if not isinstance(value, bool):
+                    raise RuntimeConfigurationError("INVALID_SHELL_FEATURE_FLAG")
+                validated[key] = "true" if value else "false"
+                continue
             if not isinstance(value, str) or len(value) > 1_024 or any(character in value for character in ("\r", "\n", "\x00")):
                 raise RuntimeConfigurationError("INVALID_CONFIGURATION_VALUE")
-            # URL 与模型名不能提交空白值；API Key 允许空字符串用于显式清除。
-            if key not in {"REPOPILOT_CHAT_API_KEY", "REPOPILOT_EMBEDDING_API_KEY"} and not value.strip():
+            # API Key 与 Skill 根目录允许空字符串，用于在桌面端显式清除已有设置。
+            if key not in {
+                "REPOPILOT_CHAT_API_KEY",
+                "REPOPILOT_EMBEDDING_API_KEY",
+                "REPOPILOT_USER_SKILL_ROOTS",
+                "REPOPILOT_BUNDLED_SKILL_ROOTS",
+            } and not value.strip():
                 raise RuntimeConfigurationError("INVALID_CONFIGURATION_VALUE")
             validated[key] = value.strip() if key not in {"REPOPILOT_CHAT_API_KEY", "REPOPILOT_EMBEDDING_API_KEY"} else value
         return validated
@@ -222,6 +241,12 @@ class AppSettings(BaseSettings):
 
     qdrant_url: str = Field(default="http://127.0.0.1:6333", validation_alias="REPOPILOT_QDRANT_URL")
     state_db_path: Path = Field(default=Path(".repopilot/state.sqlite"), validation_alias="REPOPILOT_STATE_DB_PATH")
+    user_skill_roots_value: str | None = Field(default=None, validation_alias="REPOPILOT_USER_SKILL_ROOTS")
+    bundled_skill_roots_value: str | None = Field(default=None, validation_alias="REPOPILOT_BUNDLED_SKILL_ROOTS")
+    full_local_shell_enabled: bool = Field(
+        default=False,
+        validation_alias="REPOPILOT_FULL_LOCAL_SHELL_ENABLED",
+    )
 
     @field_validator("embedding_dimensions", mode="before")
     @classmethod
@@ -238,6 +263,18 @@ class AppSettings(BaseSettings):
             max_estimated_cost=self.task_max_estimated_cost,
             currency=self.chat_price_currency if self.task_max_estimated_cost is not None else None,
         )
+
+    @property
+    def user_skill_roots(self) -> tuple[Path, ...]:
+        """用户级 Skill 目录只在本机发现，缺失目录由 SkillRegistry 留痕而非静默忽略。"""
+
+        return _parse_skill_roots(self.user_skill_roots_value)
+
+    @property
+    def bundled_skill_roots(self) -> tuple[Path, ...]:
+        """内置/团队打包的只读 Skill 目录；不将目录路径投影到桌面 API。"""
+
+        return _parse_skill_roots(self.bundled_skill_roots_value)
 
     def chat_check(self) -> ComponentCheck:
         missing = self._missing(
@@ -326,6 +363,25 @@ class LocalStateSettings(BaseSettings):
     def __init__(self, **values: object) -> None:
         values.setdefault("_env_file", _configured_env_file())
         super().__init__(**values)
+
+
+def _parse_skill_roots(value: str | None) -> tuple[Path, ...]:
+    """兼容 Windows 分号和多行配置，保持配置顺序并去重。"""
+
+    if not value or not value.strip():
+        return ()
+    roots: list[Path] = []
+    seen: set[Path] = set()
+    for item in re.split(r"[;\r\n]+", value):
+        candidate = item.strip()
+        if not candidate:
+            continue
+        root = Path(candidate).expanduser()
+        if root in seen:
+            continue
+        seen.add(root)
+        roots.append(root)
+    return tuple(roots)
 
 
 def sanitized_settings_error() -> ComponentCheck:

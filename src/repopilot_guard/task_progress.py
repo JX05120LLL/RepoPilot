@@ -31,9 +31,16 @@ _STATUS_TO_STAGE = {
     "RESEARCH_TOOLS": "research",
     "PLAN": "research",
     "PLAN_APPROVAL": "plan_approval",
+    "PATCH_DRAFT": "execution_approval",
     "EXECUTION_APPROVAL": "execution_approval",
     "PATCH": "patch",
+    # Shell 仅是已批准补丁后的可选执行子步骤，沿用写入阶段以保持进度栏稳定。
+    "SHELL": "patch",
+    "EXECUTION_RESEARCH": "verify",
+    "EXECUTION_TOOLS": "verify",
     "VERIFY": "verify",
+    "VERIFICATION_OBSERVATION": "verify",
+    "VERIFICATION_TOOLS": "verify",
     "REVIEW": "report",
     "REPORT": "report",
 }
@@ -50,7 +57,12 @@ _NODE_TO_STAGE = {
     "PLAN_APPROVAL": "plan_approval",
     "EXECUTION_APPROVAL": "execution_approval",
     "PATCH": "patch",
+    "SHELL": "patch",
+    "EXECUTION_RESEARCH": "verify",
+    "EXECUTION_TOOLS": "verify",
     "VERIFY": "verify",
+    "VERIFICATION_OBSERVATION": "verify",
+    "VERIFICATION_TOOLS": "verify",
     "REVIEW": "report",
     "REPORT": "report",
 }
@@ -131,7 +143,7 @@ def _current_stage(
     stage_ids: list[str],
 ) -> str:
     if pending_approval:
-        if approval_action == "EXECUTION_REVIEW":
+        if approval_action in {"EXECUTION_REVIEW", "SHELL_RISK_REVIEW"}:
             return "execution_approval"
         return "plan_approval"
     if status == "BLOCKED":
@@ -190,6 +202,6 @@ def _summary(stage_id: str, terminal_kind: str | None) -> str:
         "plan_approval": "计划已生成，等待你的审批。",
         "execution_approval": "执行范围已确定，等待你的二次审批。",
         "patch": "正在生成并原子应用结构化补丁。",
-        "verify": "正在按白名单 Maven Recipe 验证修改。",
+        "verify": "正在按白名单 Build Recipe 验证修改。",
         "report": "正在汇总 Diff、验证结果和审计证据。",
     }[stage_id]

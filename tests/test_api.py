@@ -15,9 +15,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
+from tests.plugin_signing import sign_plugin, trust_test_publisher
 
-from repopilot_guard.api import create_app
-from repopilot_guard.api import _desktop_allowed_origins
+from repopilot_guard.api import _desktop_allowed_origins, _safe_task_interrupts, _safe_task_state, create_app
 from repopilot_guard.config import ComponentCheck, RuntimeConfigurationManager
 from repopilot_guard.context import ManagedDocumentStore
 from repopilot_guard.mcp import McpServerConfig, McpToolDescriptor
@@ -29,9 +29,11 @@ from repopilot_guard.mcp_runtime import (
     McpToolDiscovery,
 )
 from repopilot_guard.plugins import PluginRegistry
-from repopilot_guard.permissions import FULL_ACCESS_CONFIRMATION
+from repopilot_guard.models import TaskRequest
+from repopilot_guard.permissions import FULL_ACCESS_CONFIRMATION, PermissionGrant, PermissionMode
 from repopilot_guard.project_registry import ProjectRegistry
 from repopilot_guard.task_store import TaskStore
+from repopilot_guard.workspace import WorkspaceManager
 
 
 def _initialize_git_repository(repository: Path) -> None:
@@ -92,6 +94,7 @@ class FakeRunner:
         *,
         decision: str | None = None,
         comment: str | None = None,
+        selected_patch_paths: list[str] | None = None,
     ) -> object:
         self.result.pending_approval = False
         self.result.status = "REPORT"
@@ -238,6 +241,300 @@ class FakeApiMcpConnector:
 
 
 class ApiTests(unittest.TestCase):
+    def test_retention_endpoints_preview_before_explicit_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            output_root = root / "runs"
+            store = TaskStore(root / "state.sqlite")
+            registry = ProjectRegistry(root / "state.sqlite")
+            try:
+                store.create(
+                    thread_id="thread-retention-api",
+                    task_id="task-retention-api",
+                    project_id=None,
+                    repository=root / "repository",
+                    output_root=output_root,
+                    task_mode="safe-isolated",
+                    permission_mode="safe",
+                    workspace_mode="worktree",
+                )
+                store.sync_graph_result(
+                    {
+                        "thread_id": "thread-retention-api",
+                        "status": "REPORT",
+                        "pending_approval": False,
+                        "verdict": "UNVERIFIED",
+                        "state": {"tool_events": [{"type": "PLAN_GENERATED"}]},
+                    }
+                )
+                store._connection.execute(
+                    "UPDATE tasks SET updated_at = ? WHERE thread_id = ?",
+                    ("2026-01-01T00:00:00+00:00", "thread-retention-api"),
+                )
+                store._connection.commit()
+                with TestClient(create_app(FakeRunner(delay=0), registry, output_root, task_store=store)) as client:
+                    preview = client.get("/api/tasks/retention-preview?older_than_days=0")
+                    listed = client.get("/api/tasks")
+                    unconfirmed = client.post("/api/tasks/archive-eligible", json={"confirmed": False})
+                    archived = client.post("/api/tasks/archive-eligible", json={"older_than_days": 0, "confirmed": True})
+                    archived_at = store.get("thread-retention-api").archived_at
+                    artifact_kinds = {item.kind for item in store.artifacts("thread-retention-api")}
+
+                self.assertEqual(200, preview.status_code)
+                self.assertEqual(["thread-retention-api"], [item["thread_id"] for item in preview.json()["candidates"]])
+                self.assertFalse(preview.json()["deletion_performed"])
+                self.assertEqual(200, listed.status_code)
+                self.assertNotIn("repository", listed.json()["tasks"][0])
+                self.assertNotIn("output_root", listed.json()["tasks"][0])
+                self.assertNotIn(str(root), listed.text)
+                self.assertEqual(409, unconfirmed.status_code)
+                self.assertEqual("TASK_RETENTION_CONFIRMATION_REQUIRED", unconfirmed.json()["detail"])
+                self.assertEqual(200, archived.status_code)
+                self.assertEqual(1, archived.json()["archived_count"])
+                self.assertFalse(archived.json()["deletion_performed"])
+                self.assertIsNotNone(archived_at)
+                self.assertIn("report", artifact_kinds)
+            finally:
+                registry.close()
+
+    def test_worktree_handoff_requires_full_confirmation_and_applies_only_to_clean_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repository = root / "repository"
+            repository.mkdir()
+            _initialize_git_repository(repository)
+            output_root = root / "runs"
+            request = TaskRequest(repository, "将已验证修复交接回 Local", output_root, task_id="task-1")
+            prepared = WorkspaceManager().prepare(request, PermissionGrant(PermissionMode.SAFE))
+            self.assertEqual("READY", prepared.status)
+            assert prepared.workspace_path is not None
+            (prepared.workspace_path / "README.md").write_text("# fixed\n", encoding="utf-8")
+            store = TaskStore(root / "state.sqlite")
+            runner = FakeRunner(delay=0)
+            runner.ran = True
+            runner.result.status = "REPORT"
+            runner.result.pending_approval = False
+            runner.result.state.update(
+                {
+                    "workspace_path": str(prepared.workspace_path),
+                    "repository": str(repository),
+                    "base_commit": prepared.base_commit,
+                }
+            )
+            registry = ProjectRegistry(root / "state.sqlite")
+            try:
+                store.create(
+                    thread_id="thread-1",
+                    task_id="task-1",
+                    project_id=None,
+                    repository=repository,
+                    output_root=output_root,
+                    task_mode="safe-isolated",
+                    permission_mode="safe",
+                    workspace_mode="worktree",
+                )
+                store.sync_graph_result(runner.result.to_dict())
+                with TestClient(create_app(runner, registry, output_root, task_store=store)) as client:
+                    status_before = client.get("/api/tasks/thread-1/workspace")
+                    missing_confirmation = client.post("/api/tasks/thread-1/workspace/handoff", json={})
+                    source_before_handoff = (repository / "README.md").read_text(encoding="utf-8")
+                    invalid_confirmation = client.post(
+                        "/api/tasks/thread-1/workspace/handoff",
+                        json={"confirmed": True, "confirmation": "我确认"},
+                    )
+                    handed_off = client.post(
+                        "/api/tasks/thread-1/workspace/handoff",
+                        json={"confirmed": True, "confirmation": FULL_ACCESS_CONFIRMATION},
+                    )
+                    status_after = client.get("/api/tasks/thread-1/workspace")
+                    repeated = client.post(
+                        "/api/tasks/thread-1/workspace/handoff",
+                        json={"confirmed": True, "confirmation": FULL_ACCESS_CONFIRMATION},
+                    )
+                    events = [item.to_public_dict() for item in store.recent_events("thread-1", limit=8)]
+                    source_after_handoff = (repository / "README.md").read_text(encoding="utf-8")
+                    worktree_survived = prepared.workspace_path.is_dir()
+            finally:
+                registry.close()
+
+        self.assertTrue(status_before.json()["local_handoff_available"])
+        self.assertEqual("# fixture\n", source_before_handoff)
+        self.assertEqual(409, missing_confirmation.status_code)
+        self.assertEqual("LOCAL_HANDOFF_CONFIRMATION_REQUIRED", missing_confirmation.json()["detail"])
+        self.assertEqual(409, invalid_confirmation.status_code)
+        self.assertEqual("LOCAL_HANDOFF_FULL_CONFIRMATION_REQUIRED", invalid_confirmation.json()["detail"])
+        self.assertEqual(200, handed_off.status_code)
+        self.assertEqual("LOCAL_HANDOFF_APPLIED", handed_off.json()["code"])
+        self.assertEqual("# fixed\n", source_after_handoff)
+        self.assertTrue(worktree_survived)
+        self.assertNotIn(str(repository), handed_off.text)
+        self.assertFalse(status_after.json()["local_handoff_available"])
+        self.assertEqual(409, repeated.status_code)
+        self.assertEqual("LOCAL_HANDOFF_ALREADY_APPLIED", repeated.json()["detail"])
+        event = next(item for item in events if item["type"] == "WORKSPACE_LOCAL_HANDOFF_APPLIED")
+        self.assertEqual("USER_GRANTED_FULL_ACCESS", event["payload"]["audit_code"])
+        self.assertNotIn(str(repository), json.dumps(event, ensure_ascii=False))
+
+    def test_worktree_handoff_blocks_local_baseline_drift_without_overwriting_user_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repository = root / "repository"
+            repository.mkdir()
+            _initialize_git_repository(repository)
+            output_root = root / "runs"
+            request = TaskRequest(repository, "不要覆盖 Local 改动", output_root, task_id="task-1")
+            prepared = WorkspaceManager().prepare(request, PermissionGrant(PermissionMode.SAFE))
+            self.assertEqual("READY", prepared.status)
+            assert prepared.workspace_path is not None
+            (prepared.workspace_path / "README.md").write_text("# agent fix\n", encoding="utf-8")
+            (repository / "README.md").write_text("# user edit\n", encoding="utf-8")
+            store = TaskStore(root / "state.sqlite")
+            runner = FakeRunner(delay=0)
+            runner.ran = True
+            runner.result.status = "REPORT"
+            runner.result.pending_approval = False
+            runner.result.state.update(
+                {
+                    "workspace_path": str(prepared.workspace_path),
+                    "repository": str(repository),
+                    "base_commit": prepared.base_commit,
+                }
+            )
+            registry = ProjectRegistry(root / "state.sqlite")
+            try:
+                store.create(
+                    thread_id="thread-1",
+                    task_id="task-1",
+                    project_id=None,
+                    repository=repository,
+                    output_root=output_root,
+                    task_mode="safe-isolated",
+                    permission_mode="safe",
+                    workspace_mode="worktree",
+                )
+                store.sync_graph_result(runner.result.to_dict())
+                with TestClient(create_app(runner, registry, output_root, task_store=store)) as client:
+                    blocked = client.post(
+                        "/api/tasks/thread-1/workspace/handoff",
+                        json={"confirmed": True, "confirmation": FULL_ACCESS_CONFIRMATION},
+                    )
+                    source_after_block = (repository / "README.md").read_text(encoding="utf-8")
+            finally:
+                registry.close()
+
+        self.assertEqual(409, blocked.status_code)
+        self.assertEqual("LOCAL_BASELINE_CHANGED", blocked.json()["detail"])
+        self.assertEqual("# user edit\n", source_after_block)
+
+    def test_worktree_status_and_explicit_branch_creation_do_not_expose_local_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repository = root / "repository"
+            repository.mkdir()
+            _initialize_git_repository(repository)
+            output_root = root / "runs"
+            request = TaskRequest(repository, "将隔离修改转成分支", output_root, task_id="task-1")
+            prepared = WorkspaceManager().prepare(request, PermissionGrant(PermissionMode.SAFE))
+            self.assertEqual("READY", prepared.status)
+            self.assertIsNotNone(prepared.workspace_path)
+            store = TaskStore(root / "state.sqlite")
+            runner = FakeRunner(delay=0)
+            runner.ran = True
+            runner.result.status = "REPORT"
+            runner.result.pending_approval = False
+            runner.result.state.update({"workspace_path": str(prepared.workspace_path)})
+            registry = ProjectRegistry(root / "state.sqlite")
+            try:
+                store.create(
+                    thread_id="thread-1",
+                    task_id="task-1",
+                    project_id=None,
+                    repository=repository,
+                    output_root=output_root,
+                    task_mode="safe-isolated",
+                    permission_mode="safe",
+                    workspace_mode="worktree",
+                )
+                store.sync_graph_result(runner.result.to_dict())
+                with TestClient(create_app(runner, registry, output_root, task_store=store)) as client:
+                    status = client.get("/api/tasks/thread-1/workspace")
+                    unconfirmed = client.post("/api/tasks/thread-1/workspace/branch", json={"branch": "repopilot/fix-order"})
+                    created = client.post(
+                        "/api/tasks/thread-1/workspace/branch",
+                        json={"branch": "repopilot/fix-order", "confirmed": True},
+                    )
+                    repeated = client.post(
+                        "/api/tasks/thread-1/workspace/branch",
+                        json={"branch": "repopilot/second", "confirmed": True},
+                    )
+                    events = [item.to_public_dict() for item in store.recent_events("thread-1", limit=8)]
+            finally:
+                registry.close()
+
+        self.assertEqual(200, status.status_code)
+        self.assertEqual("detached", status.json()["lifecycle"])
+        self.assertNotIn(str(prepared.workspace_path), status.text)
+        self.assertEqual(409, unconfirmed.status_code)
+        self.assertEqual("WORKSPACE_BRANCH_CONFIRMATION_REQUIRED", unconfirmed.json()["detail"])
+        self.assertEqual(200, created.status_code)
+        self.assertEqual("repopilot/fix-order", created.json()["branch"])
+        self.assertEqual(409, repeated.status_code)
+        event = next(item for item in events if item["type"] == "WORKSPACE_BRANCH_CREATED")
+        self.assertEqual("repopilot/fix-order", event["payload"]["branch"])
+
+    def test_approval_projection_keeps_patch_preview_but_drops_checkpoint_internals(self) -> None:
+        raw_preview = {
+            "status": "READY",
+            "code": "PATCH_PREVIEW_READY",
+            "paths": ["src/main/java/OrderService.java"],
+            "diff": "- old\n+ new\n",
+            "sha256": "a" * 64,
+            "workspace_path": "D:/private/worktree",
+        }
+        interrupts = _safe_task_interrupts(
+            [
+                {
+                    "type": "EXECUTION_APPROVAL_REQUIRED",
+                    "message": "请审阅补丁。",
+                    "candidate_files": ["src/main/java/OrderService.java"],
+                    "recipe": "test",
+                    "patch_preview": raw_preview,
+                    "permission_confirmation": "我已了解完全权限风险",
+                }
+            ]
+        )
+        state = _safe_task_state({"patch_preview": raw_preview, "repository": "D:/private/repository"})
+
+        self.assertEqual("PATCH_PREVIEW_READY", interrupts[0]["patch_preview"]["code"])
+        self.assertEqual("- old\n+ new\n", interrupts[0]["patch_preview"]["diff"])
+        self.assertNotIn("workspace_path", str(interrupts))
+        self.assertNotIn("permission_confirmation", str(interrupts))
+        self.assertNotIn("repository", state)
+        self.assertEqual("a" * 64, state["patch_preview"]["sha256"])
+
+    def test_execution_approval_projects_shell_preview_without_checkpoint_path_or_secret(self) -> None:
+        preview = {
+            "status": "READY",
+            "argv": ["python", "-c", "print('token=visible-secret')"],
+            "argv_sha256": "a" * 64,
+            "approval_sha256": "b" * 64,
+            "working_directory": "D:/private/worktree",
+            "timeout_seconds": 30,
+            "risk_categories": ["process", "write"],
+            "internal": "must-not-leak",
+        }
+
+        interrupts = _safe_task_interrupts(
+            [{"type": "EXECUTION_APPROVAL_REQUIRED", "shell_previews": [preview]}]
+        )
+        state = _safe_task_state({"shell_previews": [preview]})
+
+        self.assertIn("token=[REDACTED]", interrupts[0]["shell_previews"][0]["argv"][2])
+        self.assertNotIn("visible-secret", str(interrupts))
+        self.assertNotIn("working_directory", str(interrupts))
+        self.assertNotIn("internal", str(state))
+        self.assertEqual("b" * 64, state["shell_previews"][0]["approval_sha256"])
+
     def test_plain_chat_persists_messages_without_creating_a_task(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -638,6 +935,9 @@ class ApiTests(unittest.TestCase):
                                 "embedding_api_key": "embedding-secret-must-not-return",
                                 "embedding_model": "embed-test",
                                 "embedding_dimensions": 1536,
+                                "user_skill_roots": "C:\\skills; D:\\team-skills",
+                                "bundled_skill_roots": "D:\\RepoPilot\\skills",
+                                "full_local_shell_enabled": True,
                             },
                         )
 
@@ -645,6 +945,9 @@ class ApiTests(unittest.TestCase):
                         self.assertEqual("CONFIGURATION_SAVED", saved.json()["code"])
                         self.assertTrue(saved.json()["restart_required"])
                         self.assertTrue(saved.json()["chat"]["api_key_configured"])
+                        self.assertTrue(saved.json()["experimental"]["full_local_shell_enabled"])
+                        self.assertEqual(["C:\\skills", "D:\\team-skills"], saved.json()["skills"]["user_roots"])
+                        self.assertEqual(["D:\\RepoPilot\\skills"], saved.json()["skills"]["bundled_roots"])
                         self.assertNotIn(api_key, json.dumps(saved.json(), ensure_ascii=False))
                         self.assertNotIn("embedding-secret-must-not-return", json.dumps(saved.json(), ensure_ascii=False))
                         listed = client.get("/api/runtime/configuration")
@@ -654,6 +957,8 @@ class ApiTests(unittest.TestCase):
                     persisted = config_file.read_text(encoding="utf-8")
                     self.assertIn('REPOPILOT_CHAT_API_KEY="desktop-secret-must-not-return"', persisted)
                     self.assertIn('REPOPILOT_EMBEDDING_DIMENSIONS="1536"', persisted)
+                    self.assertIn('REPOPILOT_USER_SKILL_ROOTS="C:\\\\skills; D:\\\\team-skills"', persisted)
+                    self.assertIn('REPOPILOT_FULL_LOCAL_SHELL_ENABLED="true"', persisted)
                     self.assertNotIn("\nREPOPILOT_UNTRUSTED=", persisted)
             finally:
                 registry.close()
@@ -695,7 +1000,7 @@ class ApiTests(unittest.TestCase):
                     ) as client:
                         injected = client.post(
                             "/api/runtime/configuration",
-                            json={"chat_model": "safe\nREPOPILOT_UNTRUSTED=1"},
+                            json={"user_skill_roots": "C:\\skills\nREPOPILOT_UNTRUSTED=1"},
                         )
                     self.assertEqual(400, injected.status_code)
                     self.assertEqual("INVALID_CONFIGURATION_VALUE", injected.json()["detail"]["code"])
@@ -906,23 +1211,54 @@ class ApiTests(unittest.TestCase):
             )
             skill_file = skill_root / "SKILL.md"
             skill_file.write_text("---\nname: java-review\ndescription: review\n---\nRead code first.\n", encoding="utf-8")
+            sign_plugin(plugin_root)
             registry = ProjectRegistry(root / "state.sqlite")
             plugin_registry = PluginRegistry(root / "state.sqlite")
+            trust_test_publisher(plugin_registry)
             try:
-                with TestClient(create_app(FakeRunner(), registry, root / "runs", plugin_registry=plugin_registry)) as client:
+                with TestClient(
+                    create_app(
+                        FakeRunner(),
+                        registry,
+                        root / "runs",
+                        plugin_registry=plugin_registry,
+                        shell_runtime_enabled=True,
+                    )
+                ) as client:
                     installed = client.post("/api/plugins", json={"source": str(plugin_root)})
                     self.assertEqual(200, installed.status_code)
                     self.assertTrue(installed.json()["plugin"]["active"])
+                    original_hash = installed.json()["plugin"]["package_sha256"]
 
                     listed = client.get("/api/plugins")
                     self.assertEqual("spring-maintenance", listed.json()["plugins"][0]["plugin_id"])
                     self.assertEqual("VERIFIED", listed.json()["plugins"][0]["integrity_status"])
+                    self.assertEqual("LOCAL_EXPLICIT", listed.json()["plugins"][0]["source_lock_status"])
 
                     disabled = client.post("/api/plugins/spring-maintenance/enabled", json={"enabled": False})
                     self.assertEqual(200, disabled.status_code)
                     self.assertFalse(disabled.json()["plugin"]["enabled"])
 
                     skill_file.write_text(skill_file.read_text(encoding="utf-8") + "Modified after review.\n", encoding="utf-8")
+                    # 原目录改变不影响当前受控快照；用户必须显式重新安装才会产生新版本。
+                    still_verified = client.get("/api/plugins")
+                    self.assertEqual("VERIFIED", still_verified.json()["plugins"][0]["integrity_status"])
+                    sign_plugin(plugin_root)
+                    reinstalled = client.post("/api/plugins", json={"source": str(plugin_root)})
+                    self.assertEqual(200, reinstalled.status_code)
+                    self.assertNotEqual(original_hash, reinstalled.json()["plugin"]["package_sha256"])
+                    versions = client.get("/api/plugins/spring-maintenance/versions")
+                    self.assertEqual(200, versions.status_code)
+                    self.assertEqual(2, len(versions.json()["versions"]))
+                    rolled_back = client.post(
+                        "/api/plugins/spring-maintenance/rollback",
+                        json={"package_sha256": original_hash},
+                    )
+                    self.assertEqual(200, rolled_back.status_code)
+                    self.assertEqual(original_hash, rolled_back.json()["plugin"]["package_sha256"])
+
+                    snapshot_skill = plugin_registry.get("spring-maintenance").root_path / "skills" / "java-review" / "SKILL.md"
+                    snapshot_skill.write_text(snapshot_skill.read_text(encoding="utf-8") + "Tampered snapshot.\n", encoding="utf-8")
                     blocked = client.post("/api/plugins/spring-maintenance/enabled", json={"enabled": True})
                     self.assertEqual(409, blocked.status_code)
                     self.assertEqual("PLUGIN_INTEGRITY_CHECK_FAILED", blocked.json()["detail"]["code"])
@@ -930,6 +1266,39 @@ class ApiTests(unittest.TestCase):
                     audit = client.get("/api/plugins/audit?plugin_id=spring-maintenance")
                     self.assertEqual(200, audit.status_code)
                     self.assertEqual("PLUGIN_ENABLE_BLOCKED", audit.json()["events"][0]["action"])
+            finally:
+                plugin_registry.close()
+                registry.close()
+
+    def test_plugin_trust_key_api_manages_public_keys_with_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            registry = ProjectRegistry(root / "state.sqlite")
+            plugin_registry = PluginRegistry(root / "state.sqlite")
+            try:
+                with TestClient(
+                    create_app(FakeRunner(), registry, root / "runs", plugin_registry=plugin_registry)
+                ) as client:
+                    created = client.post(
+                        "/api/plugin-trust-keys",
+                        json={"key_id": "test-publisher", "public_key_base64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="},
+                    )
+                    self.assertEqual(200, created.status_code)
+                    self.assertEqual("test-publisher", created.json()["trust_key"]["key_id"])
+                    self.assertNotIn("private", json.dumps(created.json()).lower())
+                    self.assertNotIn("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", json.dumps(created.json()))
+
+                    listed = client.get("/api/plugin-trust-keys")
+                    self.assertEqual(200, listed.status_code)
+                    self.assertEqual(["test-publisher"], [item["key_id"] for item in listed.json()["trust_keys"]])
+
+                    removed = client.delete("/api/plugin-trust-keys/test-publisher")
+                    self.assertEqual(200, removed.status_code)
+                    self.assertEqual("PLUGIN_TRUST_KEY_REMOVED", removed.json()["code"])
+
+                    audit = client.get("/api/plugin-trust-keys/audit")
+                    self.assertEqual(200, audit.status_code)
+                    self.assertEqual("PLUGIN_TRUST_KEY_REMOVED", audit.json()["events"][0]["action"])
             finally:
                 plugin_registry.close()
                 registry.close()
@@ -942,6 +1311,13 @@ class ApiTests(unittest.TestCase):
             skill_root.mkdir(parents=True)
             (skill_root / "SKILL.md").write_text(
                 "---\nname: java-review\ndescription: Java review guidance\nallowed-tools: [read_file]\n---\nNever expose this body.\n",
+                encoding="utf-8",
+            )
+            user_skill_root = root / "user-skills"
+            user_skill = user_skill_root / "java-team" / "SKILL.md"
+            user_skill.parent.mkdir(parents=True)
+            user_skill.write_text(
+                "---\nname: java-team\ndescription: Shared Java guidance\nallowed-tools: [read_file]\n---\nNever expose this shared body.\n",
                 encoding="utf-8",
             )
             plugin_root = root / "spring-maintenance"
@@ -962,7 +1338,16 @@ class ApiTests(unittest.TestCase):
             plugin_registry = PluginRegistry(root / "state.sqlite")
             project = registry.add(repository, "能力目录项目")
             try:
-                with TestClient(create_app(FakeRunner(), registry, root / "runs", plugin_registry=plugin_registry)) as client:
+                with TestClient(
+                    create_app(
+                        FakeRunner(),
+                        registry,
+                        root / "runs",
+                        plugin_registry=plugin_registry,
+                        shell_runtime_enabled=True,
+                        user_skill_roots=(user_skill_root,),
+                    )
+                ) as client:
                     self.assertEqual(200, client.post("/api/plugins", json={"source": str(plugin_root)}).status_code)
                     response = client.get(f"/api/projects/{project.project_id}/capability-directory")
 
@@ -970,16 +1355,22 @@ class ApiTests(unittest.TestCase):
                 payload = response.json()
                 builtin = next(item for item in payload["capabilities"] if item["capability_id"] == "read_file")
                 skill = next(item for item in payload["capabilities"] if item["capability_id"] == "skill__java-review")
+                user_skill = next(item for item in payload["capabilities"] if item["capability_id"] == "skill__java-team")
+                shell = next(item for item in payload["capabilities"] if item["capability_id"] == "shell")
                 self.assertEqual("RepoPilot 内置", builtin["source_label"])
                 self.assertTrue(builtin["safe_policy"]["allowed"])
                 self.assertEqual("当前项目", skill["source_label"])
+                self.assertEqual("本机用户", user_skill["source_label"])
                 self.assertEqual(["read_file"], skill["details"]["allowed_tools"])
                 self.assertEqual("USER_GRANTED_FULL_ACCESS", skill["full_policy"]["code"])
+                self.assertTrue(shell["requires_approval"])
+                self.assertTrue(shell["full_policy"]["requires_approval"])
                 self.assertEqual("Spring Maintenance", payload["plugins"][0]["name"])
                 serialized = json.dumps(payload, ensure_ascii=False)
                 self.assertNotIn(str(repository), serialized)
                 self.assertNotIn(str(plugin_root), serialized)
                 self.assertNotIn("Never expose this body", serialized)
+                self.assertNotIn("Never expose this shared body", serialized)
             finally:
                 plugin_registry.close()
                 registry.close()
@@ -1140,6 +1531,77 @@ class ApiTests(unittest.TestCase):
             finally:
                 registry.close()
 
+    def test_project_mcp_probe_accepts_only_active_verified_plugin_snapshot_source(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repository = root / "repo"
+            repository.mkdir()
+            plugin_root = root / "docs-plugin"
+            plugin_root.mkdir()
+            (plugin_root / "repopilot-plugin.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "id": "docs-plugin",
+                        "name": "研发文档插件",
+                        "version": "1.0.0",
+                        "description": "提供只读研发文档工具。",
+                        "mcp_config": "mcp.toml",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (plugin_root / "mcp.toml").write_text(
+                "[[servers]]\n"
+                'name="docs"\n'
+                'transport="streamable_http"\n'
+                'url="https://mcp.example.com/v1"\n'
+                'access="read_only"\n'
+                'allowed_tools=["search"]\n',
+                encoding="utf-8",
+            )
+            sign_plugin(plugin_root)
+            registry = ProjectRegistry(root / "state.sqlite")
+            plugin_registry = PluginRegistry(root / "state.sqlite")
+            trust_test_publisher(plugin_registry)
+            project = registry.add(repository, "插件 MCP 项目")
+            connector = FakeApiMcpConnector()
+            runtime_factory = lambda configuration, workspace: McpRuntime(
+                configuration,
+                connector=connector,
+                workspace_root=workspace,
+            )
+            try:
+                plugin_registry.install(plugin_root)
+                with TestClient(
+                    create_app(
+                        FakeRunner(),
+                        registry,
+                        root / "runs",
+                        mcp_runtime_factory=runtime_factory,
+                        plugin_registry=plugin_registry,
+                    )
+                ) as client:
+                    probe = client.post(
+                        f"/api/projects/{project.project_id}/mcp/probe",
+                        json={"server": "docs", "config_source": "plugin:docs-plugin", "approve_risk": True},
+                    )
+                    self.assertEqual(200, probe.status_code)
+                    self.assertEqual("plugin:docs-plugin", probe.json()["config_source"])
+                    self.assertNotIn(str(plugin_root), json.dumps(probe.json(), ensure_ascii=False))
+
+                    plugin_registry.disable("docs-plugin")
+                    blocked = client.post(
+                        f"/api/projects/{project.project_id}/mcp/probe",
+                        json={"server": "docs", "config_source": "plugin:docs-plugin", "approve_risk": True},
+                    )
+                    self.assertEqual(409, blocked.status_code)
+                    self.assertEqual("MCP_PLUGIN_SOURCE_UNAVAILABLE", blocked.json()["detail"]["code"])
+            finally:
+                plugin_registry.close()
+                registry.close()
+
     def test_local_api_creates_safe_task_and_streams_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -1211,6 +1673,66 @@ class ApiTests(unittest.TestCase):
                     self.assertEqual(["read_file"], context.json()["context_snapshot"]["bound_tool_ids"])
                     self.assertEqual(200, telemetry.status_code)
                     self.assertEqual(0, telemetry.json()["model"]["total_tokens"])
+            finally:
+                registry.close()
+
+    def test_task_capability_requires_feature_flag_and_full_local_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repository = root / "repo"
+            repository.mkdir()
+            _initialize_git_repository(repository)
+            registry = ProjectRegistry(root / "state.sqlite")
+            project = registry.add(repository, "Shell 授权项目")
+            try:
+                runner = FakeRunner(delay=0)
+                with TestClient(
+                    create_app(runner, registry, root / "runs", shell_runtime_enabled=True)
+                ) as client:
+                    safe = client.post(
+                        "/api/tasks",
+                        json={
+                            "project_id": project.project_id,
+                            "description": "仅分析 Git 状态",
+                            "task_mode": "safe-isolated",
+                            "operation": "research",
+                            "approved_capabilities": ["shell"],
+                        },
+                    )
+                    self.assertEqual(409, safe.status_code)
+                    self.assertEqual("SHELL_REQUIRES_FULL_LOCAL", safe.json()["detail"]["code"])
+
+                    accepted = client.post(
+                        "/api/tasks",
+                        json={
+                            "project_id": project.project_id,
+                            "description": "仅分析 Git 状态",
+                            "task_mode": "full-local",
+                            "operation": "research",
+                            "confirmation": FULL_ACCESS_CONFIRMATION,
+                            "thread_id": "thread-shell",
+                            "approved_capabilities": ["shell"],
+                        },
+                    )
+                    self.assertEqual(200, accepted.status_code)
+                    time.sleep(0.05)
+                    self.assertEqual(("shell",), runner.requests[0].approved_capabilities)
+
+                disabled_runner = FakeRunner(delay=0)
+                with TestClient(create_app(disabled_runner, registry, root / "runs")) as client:
+                    disabled = client.post(
+                        "/api/tasks",
+                        json={
+                            "project_id": project.project_id,
+                            "description": "仅分析 Git 状态",
+                            "task_mode": "full-local",
+                            "operation": "research",
+                            "confirmation": FULL_ACCESS_CONFIRMATION,
+                            "approved_capabilities": ["shell"],
+                        },
+                    )
+                    self.assertEqual(409, disabled.status_code)
+                    self.assertEqual("CAPABILITY_NOT_AVAILABLE", disabled.json()["detail"]["code"])
             finally:
                 registry.close()
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import xml.etree.ElementTree as element_tree
 from dataclasses import dataclass
 from pathlib import Path
@@ -113,6 +114,56 @@ class RepositoryTools:
             {"query": query, "matches": matches, "truncated": False},
         )
 
+    def find_symbol(
+        self,
+        symbol: str,
+        path: Path = Path("."),
+        max_results: int = 50,
+        max_depth: int = 6,
+    ) -> ToolResult:
+        """按 Java 声明名定位类型或方法，不接受用户提供的正则表达式。"""
+
+        if not re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]{0,127}", symbol):
+            return self._blocked("INVALID_SYMBOL", "符号必须是单个 Java 标识符。", {"symbol": symbol[:128]})
+        if max_results < 1 or max_results > 50 or max_depth < 0:
+            return self._blocked("INVALID_LIMIT", "符号检索深度和结果数量必须在受控范围内。", {})
+        target = self._resolve(path)
+        decision = self.guard.check_path(ToolName.FIND_SYMBOL, target)
+        if not decision.allowed:
+            return self._blocked(decision.audit_code, decision.reason, {"path": str(target)})
+        if not target.is_dir():
+            return self._blocked("NOT_A_DIRECTORY", "符号检索目标必须是目录。", {"path": str(target)})
+
+        escaped = re.escape(symbol)
+        type_pattern = re.compile(rf"\b(?:class|interface|enum|record)\s+{escaped}\b")
+        method_pattern = re.compile(rf"\b{escaped}\s*\(")
+        matches: list[dict[str, object]] = []
+        for candidate in self._iter_files(target, ToolName.FIND_SYMBOL, max_depth=max_depth, max_candidates=1000):
+            if candidate.suffix.lower() != ".java":
+                continue
+            try:
+                if candidate.stat().st_size > 256 * 1024:
+                    continue
+                content = candidate.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            for line_number, line in enumerate(content.splitlines(), start=1):
+                kind = "type" if type_pattern.search(line) else "method" if method_pattern.search(line) else None
+                if kind is None:
+                    continue
+                matches.append({"path": self._display_path(candidate), "line": line_number, "kind": kind, "content": line[:300]})
+                if len(matches) >= max_results:
+                    return self._ready(
+                        "SYMBOL_SEARCH_COMPLETED",
+                        "符号结果已达到上限并截断。",
+                        {"symbol": symbol, "matches": matches, "truncated": True},
+                    )
+        return self._ready(
+            "SYMBOL_SEARCH_COMPLETED",
+            "Java 声明符号检索完成。",
+            {"symbol": symbol, "matches": matches, "truncated": False},
+        )
+
     def read_file(self, path: Path, max_bytes: int = 256 * 1024) -> ToolResult:
         if max_bytes < 1:
             return self._blocked("INVALID_LIMIT", "文件大小上限必须为正数。", {})
@@ -168,10 +219,15 @@ class RepositoryTools:
                 }
             except element_tree.ParseError:
                 pom_summary = {"parse_error": "pom.xml 不是可解析的 XML。"}
+        descriptors = [
+            name
+            for name in ("pom.xml", "build.gradle", "build.gradle.kts", "pyproject.toml", "pytest.ini", "tox.ini", "setup.cfg")
+            if (self.workspace_root / name).is_file()
+        ]
         return self._ready(
             "BUILD_INSPECTED",
-            "Maven 构建信息检查完成，未执行 Maven。",
-            {"preflight": preflight.to_dict(), "pom": pom_summary},
+            "构建信息检查完成，未执行构建命令。",
+            {"preflight": preflight.to_dict(), "pom": pom_summary, "build_descriptors": descriptors},
         )
 
     @staticmethod

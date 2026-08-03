@@ -424,6 +424,54 @@ class ContextTests(unittest.TestCase):
             self.assertEqual(0, len(missing.contexts))
             store.close()
 
+    def test_java_chunks_expose_deterministic_declared_symbols_in_payload(self) -> None:
+        chunks = split_context(
+            "public class OrderLookupService {\n  public String findOrder(String id) { return id; }\n}\n",
+            project_id="project-a",
+            repo_commit="commit-a",
+            source_type="code",
+            path="src/OrderLookupService.java",
+            document_id="code",
+            markdown=False,
+        )
+
+        self.assertEqual(("OrderLookupService", "findOrder"), chunks[0].symbols)
+        self.assertEqual(["OrderLookupService", "findOrder"], chunks[0].payload()["symbols"])
+
+    def test_sqlite_bm25_recalls_exact_symbol_missing_from_vector_candidates_and_keeps_commit_isolation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            store = ContextChunkStore(Path(temporary_directory) / "state.sqlite")
+            if not store.lexical_available:
+                self.skipTest("当前 Python 的 SQLite 未编译 FTS5，验证向量检索降级路径。")
+            chunks = split_context(
+                "package demo;\nclass TenantOrderPolicy { boolean allow() { return true; } }\n",
+                project_id="project-a",
+                repo_commit="commit-a",
+                source_type="code",
+                path="src/TenantOrderPolicy.java",
+                document_id="code",
+                markdown=False,
+            )
+            indexed = ContextIndexer(FakeQdrant(), FakeEmbeddings(), store).index(chunks)
+            self.assertEqual("CONTEXT_INDEXED", indexed.code)
+            # 模拟语义向量没有召回该类：BM25 仍可从同一项目和提交的受控索引中找到它。
+            result = ContextRetriever(RankedFakeQdrant([]), FakeEmbeddings(), store).search(
+                "TenantOrderPolicy",
+                project_id="project-a",
+                repo_commit="commit-a",
+            )
+            isolated = ContextRetriever(RankedFakeQdrant([]), FakeEmbeddings(), store).search(
+                "TenantOrderPolicy",
+                project_id="project-a",
+                repo_commit="commit-b",
+            )
+            self.assertEqual("hybrid_vector_bm25_lexical_symbol_path", result.strategy)
+            self.assertEqual("src/TenantOrderPolicy.java", result.contexts[0].path)
+            self.assertIsNone(result.contexts[0].vector_score)
+            self.assertEqual(1.0, result.contexts[0].bm25_score)
+            self.assertEqual((), isolated.contexts)
+            store.close()
+
     def test_hybrid_retrieval_promotes_exact_path_and_keyword_match_over_vector_rank(self) -> None:
         payload = lambda path, content: {
             "content": content,
@@ -448,12 +496,31 @@ class ContextTests(unittest.TestCase):
             limit=2,
         )
 
-        self.assertEqual("hybrid_vector_lexical_path", result.strategy)
+        self.assertEqual("hybrid_vector_lexical_symbol_path", result.strategy)
         self.assertEqual(3, result.candidate_count)
         self.assertEqual(8, client.last_limit)
         self.assertEqual("src/main/java/TenantOrderService.java", result.contexts[0].path)
         self.assertGreater(result.contexts[0].lexical_score, result.contexts[1].lexical_score)
         self.assertEqual(0.72, result.contexts[0].vector_score)
+
+    def test_hybrid_retrieval_promotes_explicit_java_symbol_over_higher_vector_rank(self) -> None:
+        legacy = RetrievedContext("legacy implementation", 0.99, "src/Legacy.java", 1, 1, "code", "legacy", vector_score=0.99)
+        target = RetrievedContext(
+            "implementation",
+            0.72,
+            "src/Service.java",
+            1,
+            1,
+            "code",
+            "target",
+            vector_score=0.72,
+            symbols=("TenantOrderService",),
+        )
+
+        result = _hybrid_rerank("TenantOrderService", [(legacy, 0), (target, 1)], 2)
+
+        self.assertEqual("src/Service.java", result[0].path)
+        self.assertEqual(1.0, result[0].symbol_score)
 
     def test_hybrid_retrieval_has_stable_path_tiebreaker(self) -> None:
         context = lambda path: RetrievedContext("class Service {}", 0.9, path, 1, 1, "code", path, vector_score=0.9)
@@ -489,6 +556,77 @@ class ContextTests(unittest.TestCase):
                 permission=PermissionGrant.safe(),
             )
         self.assertNotIn(".env", {chunk.path for chunk in chunks})
+
+    def test_loader_indexes_detected_profile_sources_but_not_generic_json_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repository = create_repository(root)
+            (repository / "build.gradle.kts").write_text("plugins { java }\n", encoding="utf-8")
+            (repository / "src" / "main" / "python").mkdir(parents=True)
+            (repository / "src" / "main" / "python" / "orders.py").write_text("def find_order():\n    return 1\n", encoding="utf-8")
+            (repository / "package.json").write_text('{"name":"orders"}\n', encoding="utf-8")
+            (repository / "src" / "main" / "web.ts").write_text("export const order = 1;\n", encoding="utf-8")
+            (repository / "service-account.json").write_text('{"private_key":"secret"}\n', encoding="utf-8")
+
+            chunks, _ = ContextLoader().load_project(
+                repository,
+                project_id="project-a",
+                repo_commit="commit-a",
+                permission=PermissionGrant.safe(),
+            )
+
+        source_types = {chunk.path: chunk.source_type for chunk in chunks}
+        self.assertEqual("build_config", source_types["build.gradle.kts"])
+        self.assertEqual("code", source_types["src/main/python/orders.py"])
+        self.assertEqual("build_config", source_types["package.json"])
+        self.assertEqual("code", source_types["src/main/web.ts"])
+        self.assertNotIn("service-account.json", source_types)
+
+    def test_loader_indexes_governed_json_and_yaml_config_after_redacting_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repository = create_repository(root)
+            (repository / "application.yaml").write_text(
+                """service:
+  endpoint: https://api.example.test
+database:
+  password: local-password
+oauth:
+  client-secret: |
+    multiline-secret
+    must-not-leak
+""",
+                encoding="utf-8",
+            )
+            (repository / "config.json").write_text(
+                '{\n  "apiKey": "sk-local-secret",\n  "credentials": {"opaque": "nested-secret"},\n  "url": "https://user:password@example.test/orders"\n}\n',
+                encoding="utf-8",
+            )
+            (repository / "service-account.json").write_text('{"private_key":"must-stay-out"}\n', encoding="utf-8")
+
+            chunks, _ = ContextLoader().load_project(
+                repository,
+                project_id="project-a",
+                repo_commit="commit-a",
+                permission=PermissionGrant.safe(),
+            )
+
+        contents = "\n".join(chunk.content for chunk in chunks)
+        source_types = {chunk.path: chunk.source_type for chunk in chunks}
+        self.assertEqual("configuration", source_types["application.yaml"])
+        self.assertEqual("configuration", source_types["config.json"])
+        self.assertNotIn("service-account.json", source_types)
+        self.assertIn("https://api.example.test", contents)
+        self.assertIn("[REDACTED]", contents)
+        self.assertNotIn("local-password", contents)
+        self.assertNotIn("multiline-secret", contents)
+        self.assertNotIn("must-not-leak", contents)
+        self.assertNotIn("sk-local-secret", contents)
+        self.assertNotIn("nested-secret", contents)
+        self.assertNotIn("user:password", contents)
+        self.assertIn('"apiKey": "[REDACTED]"', contents)
+        config_content = next(chunk.content for chunk in chunks if chunk.path == "config.json")
+        self.assertEqual("[REDACTED]", json.loads(config_content)["credentials"])
 
     def test_managed_document_import_hides_source_path_and_detects_tampering(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

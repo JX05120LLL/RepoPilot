@@ -66,6 +66,7 @@ class FakeSession:
         self.initialize_delay = initialize_delay
         self.calls: list[tuple[str, dict[str, object]]] = []
         self.pings = 0
+        self.call_started = asyncio.Event()
 
     async def initialize(self) -> McpSessionInfo:
         if self.initialize_delay:
@@ -91,6 +92,7 @@ class FakeSession:
 
     async def call_tool(self, name: str, arguments: dict[str, object]) -> McpRawToolResult:
         self.calls.append((name, arguments))
+        self.call_started.set()
         if self.call_delay:
             await asyncio.sleep(self.call_delay)
         return self.result
@@ -242,6 +244,65 @@ class McpRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("MCP_TOOL_TIMEOUT", called.code)
         self.assertNotEqual(McpConnectionState.READY, runtime.status("docs")[0].state)
         await runtime.close()
+
+    async def test_bounded_actor_queue_blocks_overflow_without_dropping_healthy_connection(self) -> None:
+        session = FakeSession(call_delay=0.08)
+        connector = FakeConnector(session)
+        runtime = McpRuntime(
+            McpConfiguration(1, (_remote_config(),)),
+            connector=connector,
+            max_pending_commands=1,
+        )
+        await runtime.connect("docs", PermissionGrant.safe(), approved=True)
+
+        first = asyncio.create_task(
+            runtime.call_tool("mcp__docs__search", {"query": "first"}, PermissionGrant.safe(), approved=True)
+        )
+        await asyncio.wait_for(session.call_started.wait(), timeout=1)
+        second = asyncio.create_task(
+            runtime.call_tool("mcp__docs__search", {"query": "second"}, PermissionGrant.safe(), approved=True)
+        )
+        await asyncio.sleep(0)
+        overflow = await runtime.call_tool(
+            "mcp__docs__search", {"query": "overflow"}, PermissionGrant.safe(), approved=True
+        )
+        first_result, second_result = await asyncio.gather(first, second)
+
+        self.assertEqual("MCP_SERVER_BUSY", overflow.code)
+        self.assertEqual("BLOCKED", overflow.status)
+        self.assertEqual("READY", first_result.status)
+        self.assertEqual("READY", second_result.status)
+        self.assertEqual(McpConnectionState.READY, runtime.status("docs")[0].state)
+        self.assertEqual(0, runtime.status("docs")[0].failure_count)
+        self.assertEqual(["first", "second"], [item[1]["query"] for item in session.calls])
+        self.assertIn("MCP_SERVER_BUSY", [event.code for event in runtime.events])
+        await runtime.close()
+        self.assertEqual(1, connector.closes)
+
+    async def test_close_waits_for_accepted_commands_when_actor_queue_is_full(self) -> None:
+        session = FakeSession(call_delay=0.05)
+        connector = FakeConnector(session)
+        runtime = McpRuntime(
+            McpConfiguration(1, (_remote_config(),)),
+            connector=connector,
+            max_pending_commands=1,
+        )
+        await runtime.connect("docs", PermissionGrant.safe(), approved=True)
+
+        first = asyncio.create_task(
+            runtime.call_tool("mcp__docs__search", {"query": "first"}, PermissionGrant.safe(), approved=True)
+        )
+        await asyncio.wait_for(session.call_started.wait(), timeout=1)
+        second = asyncio.create_task(
+            runtime.call_tool("mcp__docs__search", {"query": "second"}, PermissionGrant.safe(), approved=True)
+        )
+        await asyncio.sleep(0)
+        await asyncio.wait_for(runtime.close(), timeout=1)
+
+        self.assertEqual("READY", (await first).status)
+        self.assertEqual("READY", (await second).status)
+        self.assertEqual(McpConnectionState.CLOSED, runtime.status("docs")[0].state)
+        self.assertEqual(1, connector.closes)
 
     async def test_repeated_connection_failure_opens_circuit(self) -> None:
         connector = FakeConnector(failures=10)

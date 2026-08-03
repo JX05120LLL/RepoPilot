@@ -65,7 +65,10 @@ class GitClient:
         self.run(repository, "worktree", "add", "--detach", str(destination), commit)
 
     def apply_binary_patch(self, repository: Path, patch: bytes) -> None:
-        self.run(repository, "apply", "--binary", "--whitespace=nowarn", "-", input_text=patch.decode("utf-8"))
+        # 先由 Git 完整校验，避免多文件交接在写入中途才发现冲突。
+        decoded_patch = patch.decode("utf-8")
+        self.run(repository, "apply", "--check", "--binary", "--whitespace=nowarn", "-", input_text=decoded_patch)
+        self.run(repository, "apply", "--binary", "--whitespace=nowarn", "-", input_text=decoded_patch)
 
     def create_branch(self, repository: Path, branch_name: str) -> None:
         self.run(repository, "check-ref-format", "--branch", branch_name)
@@ -328,14 +331,16 @@ class WorkspaceManager:
             return {"status": "BLOCKED", "code": "WORKTREE_DIFF_EMPTY", "message": "worktree 没有可交接的修改。"}
         try:
             self._git.apply_binary_patch(local, patch)
-        except GitCommandError as error:
-            return {"status": "BLOCKED", "code": "LOCAL_HANDOFF_CONFLICT", "message": str(error)}
+        except GitCommandError:
+            return {"status": "BLOCKED", "code": "LOCAL_HANDOFF_CONFLICT", "message": "Local 工作区无法应用隔离补丁。"}
         return {
             "status": "READY",
             "code": "LOCAL_HANDOFF_APPLIED",
             "message": "已显式应用 worktree diff 到 Local；worktree 已保留。",
             "worktree_path": str(worktree),
             "local_repository": str(local),
+            "diff_sha256": hashlib.sha256(patch).hexdigest(),
+            "changed_file_count": sum(1 for line in patch.splitlines() if line.startswith(b"diff --git ")),
         }
 
     def snapshot(self, repository: Path) -> RepositorySnapshot:

@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import subprocess
 import tempfile
+import time
 import unittest
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+from tests.plugin_signing import sign_plugin, trust_test_publisher
 
 from repopilot_guard.config import ComponentCheck
 from repopilot_guard.context import IndexResult, RetrievalResult, RetrievedContext
@@ -26,6 +29,7 @@ from repopilot_guard.mcp_agent import TaskMcpBindingService
 from repopilot_guard.mcp_runtime import McpRawToolResult, McpRuntime, McpSessionInfo, McpSessionProtocol, McpToolDiscovery
 from repopilot_guard.models import TaskRequest
 from repopilot_guard.permissions import PermissionGrant
+from repopilot_guard.plugins import PluginRegistry
 
 
 class ReadyChecker(GraphPreflightChecker):
@@ -101,6 +105,8 @@ class FakeSession:
 class FakeConnector:
     def __init__(self) -> None:
         self.sessions: list[FakeSession] = []
+        self.opens = 0
+        self.closes = 0
 
     @asynccontextmanager
     async def open(
@@ -109,24 +115,29 @@ class FakeConnector:
         _environment: Mapping[str, str],
         _workspace_root: Path | None,
     ) -> AsyncIterator[McpSessionProtocol]:
+        self.opens += 1
         session = FakeSession()
         self.sessions.append(session)
-        yield session
+        try:
+            yield session
+        finally:
+            self.closes += 1
 
 
-def create_repository(root: Path) -> Path:
+def create_repository(root: Path, *, with_mcp: bool = True) -> Path:
     repository = root / "repository"
     source = repository / "src" / "main" / "java" / "com" / "example"
     source.mkdir(parents=True)
     (source / "OrderService.java").write_text("package com.example; class OrderService {}\n", encoding="utf-8")
     (repository / "pom.xml").write_text("<project><artifactId>demo</artifactId></project>\n", encoding="utf-8")
-    config = repository / ".repopilot"
-    config.mkdir()
-    (config / "mcp.toml").write_text(
-        "[[servers]]\nname=\"docs\"\ntransport=\"streamable_http\"\n"
-        "url=\"https://mcp.example.com/v1\"\naccess=\"read_only\"\nallowed_tools=[\"search\"]\n",
-        encoding="utf-8",
-    )
+    if with_mcp:
+        config = repository / ".repopilot"
+        config.mkdir()
+        (config / "mcp.toml").write_text(
+            "[[servers]]\nname=\"docs\"\ntransport=\"streamable_http\"\n"
+            "url=\"https://mcp.example.com/v1\"\naccess=\"read_only\"\nallowed_tools=[\"search\"]\n",
+            encoding="utf-8",
+        )
     for args in (("init", "-b", "main"), ("config", "user.name", "RepoPilot Test"), ("config", "user.email", "test@example.invalid")):
         subprocess.run(("git", "-C", str(repository), *args), check=True, capture_output=True)
     subprocess.run(("git", "-C", str(repository), "add", "."), check=True, capture_output=True)
@@ -134,7 +145,73 @@ def create_repository(root: Path) -> Path:
     return repository
 
 
+def create_plugin(root: Path) -> Path:
+    plugin = root / "docs-plugin"
+    plugin.mkdir()
+    (plugin / "repopilot-plugin.json").write_text(
+        "{\n"
+        '  "schema_version": 1,\n'
+        '  "id": "docs-plugin",\n'
+        '  "name": "研发文档插件",\n'
+        '  "version": "1.0.0",\n'
+        '  "description": "提供只读研发文档工具。",\n'
+        '  "mcp_config": "mcp.toml"\n'
+        "}\n",
+        encoding="utf-8",
+    )
+    (plugin / "mcp.toml").write_text(
+        "[[servers]]\nname=\"docs\"\ntransport=\"streamable_http\"\n"
+        "url=\"https://mcp.example.com/v1\"\naccess=\"read_only\"\nallowed_tools=[\"search\"]\n",
+        encoding="utf-8",
+    )
+    sign_plugin(plugin)
+    return plugin
+
+
 class McpGraphBindingTests(unittest.TestCase):
+    def test_plugin_mcp_is_frozen_into_safe_graph_task_and_released_at_terminal_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            connector = FakeConnector()
+            plugin_registry = PluginRegistry(root / "plugin-state.sqlite")
+            trust_test_publisher(plugin_registry)
+            plugin_registry.install(create_plugin(root))
+            service = TaskMcpBindingService(
+                lambda configuration, workspace_root: McpRuntime(configuration, connector=connector, workspace_root=workspace_root),
+                plugin_registry=plugin_registry,
+            )
+            store = SqliteCheckpointStore(root / "state.sqlite")
+            graph = CodingGraphFactory(
+                ReadyChecker(),
+                context_service=ContextService(),
+                research_model=McpCallingModel(),
+                mcp_binding_service=service,
+            ).create(store.checkpointer)
+            runner = GraphRunner(graph)
+            try:
+                result = runner.run(
+                    TaskRequest(
+                        create_repository(root, with_mcp=False),
+                        "查询插件提供的订单权限文档后生成修复计划",
+                        root / "runs",
+                        approved_mcp_tools=("mcp__docs__search",),
+                        approved_mcp_sources=("plugin:docs-plugin",),
+                    ),
+                    "plugin-mcp-graph-thread",
+                    PermissionGrant.safe(),
+                )
+                completed = runner.resume("plugin-mcp-graph-thread", approved=False)
+            finally:
+                store.close()
+                plugin_registry.close()
+
+        binding = result.state["mcp_bindings"][0]
+        self.assertEqual("plugin:docs-plugin", binding["config_source_id"])
+        self.assertEqual("WAITING_APPROVAL", result.status)
+        self.assertEqual("BLOCKED", completed.verdict)
+        self.assertEqual(1, connector.opens)
+        self.assertEqual(1, connector.closes)
+
     def test_explicit_safe_mcp_tool_is_frozen_bound_and_audited_by_graph(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -162,6 +239,7 @@ class McpGraphBindingTests(unittest.TestCase):
                     "mcp-graph-thread",
                     PermissionGrant.safe(),
                 )
+                completed = runner.resume("mcp-graph-thread", approved=False)
             finally:
                 store.close()
 
@@ -174,6 +252,51 @@ class McpGraphBindingTests(unittest.TestCase):
         tool_event = next(event for event in result.state["tool_events"] if event.get("name") == "mcp__docs__search")
         self.assertEqual("MCP_TOOL_COMPLETED", tool_event["code"])
         self.assertEqual(("search", {"query": "订单权限"}), connector.sessions[-1].calls[0])
+        self.assertEqual(1, len(connector.sessions))
+        self.assertEqual("BLOCKED", completed.verdict)
+        self.assertEqual(1, connector.closes)
+        self.assertIn(
+            "MCP_TASK_RUNTIME_RELEASED",
+            {str(event.get("type")) for event in completed.state["tool_events"]},
+        )
+
+    def test_cancelling_waiting_task_releases_its_mcp_session_in_background(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            connector = FakeConnector()
+            service = TaskMcpBindingService(
+                lambda configuration, workspace_root: McpRuntime(configuration, connector=connector, workspace_root=workspace_root)
+            )
+            store = SqliteCheckpointStore(root / "state.sqlite")
+            graph = CodingGraphFactory(
+                ReadyChecker(),
+                context_service=ContextService(),
+                research_model=McpCallingModel(),
+                mcp_binding_service=service,
+            ).create(store.checkpointer)
+            runner = GraphRunner(graph)
+            try:
+                waiting = runner.run(
+                    TaskRequest(
+                        create_repository(root),
+                        "查询订单权限文档后生成修复计划",
+                        root / "runs",
+                        approved_mcp_tools=("mcp__docs__search",),
+                    ),
+                    "mcp-cancel-thread",
+                    PermissionGrant.safe(),
+                )
+                runner.request_cancellation("mcp-cancel-thread", "用户取消等待中的任务")
+                for _ in range(20):
+                    if connector.closes == 1:
+                        break
+                    time.sleep(0.05)
+            finally:
+                store.close()
+
+        self.assertTrue(waiting.pending_approval)
+        self.assertEqual(1, connector.opens)
+        self.assertEqual(1, connector.closes)
 
 
 if __name__ == "__main__":

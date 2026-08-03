@@ -1,4 +1,4 @@
-"""可重放的 Java/Maven 评测 fixture 准备与基线校验。"""
+"""可重放 Coding Agent 评测的 fixture 准备与 Build 基线校验。"""
 
 from __future__ import annotations
 
@@ -7,18 +7,29 @@ import json
 import platform
 import re
 import subprocess
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
+from typing import Callable
 from uuid import uuid4
 
 from repopilot_guard import __version__
 from repopilot_guard.models import TaskOperation, TaskRequest, VerificationContract, WorkspaceMode, WorkspaceSelection
 from repopilot_guard.permissions import PermissionGrant
-from repopilot_guard.policy import MavenRecipeName
+from repopilot_guard.policy import GradleRecipeName, MavenRecipeName, NodeRecipeName, PytestRecipeName
 from repopilot_guard.processes import hidden_process_kwargs
-from repopilot_guard.recipes import MavenExecutionResult, MavenRecipeRunner
+from repopilot_guard.recipes import (
+    GradleExecutionResult,
+    GradleRecipeRunner,
+    MavenExecutionResult,
+    MavenRecipeRunner,
+    NodeExecutionResult,
+    NodeRecipeRunner,
+    PytestExecutionResult,
+    PytestRecipeRunner,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +42,7 @@ class EvaluationTask:
     expected_status: str
     baseline_status: str | None = None
     target_test_class: str | None = None
+    profile: str = "java_maven"
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +100,7 @@ class EvaluationReportMetadata:
 class FixtureResult:
     task_id: str
     category: str
+    profile: str
     repository: Path
     baseline_commit: str
     expected_paths_present: bool
@@ -98,6 +111,7 @@ class FixtureResult:
         return {
             "task_id": self.task_id,
             "category": self.category,
+            "profile": self.profile,
             "repository": str(self.repository),
             "baseline_commit": self.baseline_commit,
             "expected_paths_present": self.expected_paths_present,
@@ -110,7 +124,7 @@ class FixtureResult:
 
 @dataclass(frozen=True, slots=True)
 class BaselineValidationResult:
-    """不调用模型，仅验证 fixture 在修复前是否符合声明的 Maven 基线。"""
+    """不调用模型，仅验证 fixture 在修复前是否符合声明的 Build 基线。"""
 
     task_id: str
     recipe: str
@@ -125,10 +139,14 @@ class BaselineValidationResult:
     exit_code: int | None
     duration_ms: int
     surefire_reports: tuple[str, ...]
+    build_system: str
+    report_kind: str
+    verification_reports: tuple[str, ...]
     stdout_log: Path
     stderr_log: Path
 
     def to_dict(self) -> dict[str, object]:
+        log_prefix = "maven" if self.build_system == "maven" else "build"
         return {
             "task_id": self.task_id,
             "recipe": self.recipe,
@@ -143,8 +161,11 @@ class BaselineValidationResult:
             "exit_code": self.exit_code,
             "duration_ms": self.duration_ms,
             "surefire_reports": list(self.surefire_reports),
-            "stdout_log": f"{self.task_id}/maven-stdout.txt",
-            "stderr_log": f"{self.task_id}/maven-stderr.txt",
+            "build_system": self.build_system,
+            "report_kind": self.report_kind,
+            "verification_reports": list(self.verification_reports),
+            "stdout_log": f"{self.task_id}/{log_prefix}-stdout.txt",
+            "stderr_log": f"{self.task_id}/{log_prefix}-stderr.txt",
         }
 
 
@@ -169,6 +190,9 @@ class EvaluationRunResult:
     verification_exit_code: int | None
     verification_duration_ms: int | None
     verification_surefire_reports: tuple[str, ...]
+    verification_build_system: str | None
+    verification_report_kind: str | None
+    verification_reports: tuple[str, ...]
     verification_contract_valid: bool
     error_summary: str | None
 
@@ -193,8 +217,77 @@ class EvaluationRunResult:
             "verification_exit_code": self.verification_exit_code,
             "verification_duration_ms": self.verification_duration_ms,
             "verification_surefire_reports": list(self.verification_surefire_reports),
+            "verification_build_system": self.verification_build_system,
+            "verification_report_kind": self.verification_report_kind,
+            "verification_reports": list(self.verification_reports),
             "verification_contract_valid": self.verification_contract_valid,
             "error_summary": self.error_summary,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationMatrixRun:
+    """一次完整评测运行的脱敏汇总，不替代该轮原始任务报告。"""
+
+    run_index: int
+    report_directory: str
+    task_count: int
+    matched_expectations: int
+    status_counts: tuple[tuple[str, int], ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "run_index": self.run_index,
+            "report_directory": self.report_directory,
+            "task_count": self.task_count,
+            "matched_expectations": self.matched_expectations,
+            "status_counts": dict(self.status_counts),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationMatrixTask:
+    """同一任务跨多轮运行的稳定性统计。"""
+
+    task_id: str
+    expected_status: str
+    attempts: int
+    matched_expectations: int
+    actual_status_counts: tuple[tuple[str, int], ...]
+
+    @property
+    def match_rate(self) -> float:
+        return self.matched_expectations / self.attempts if self.attempts else 0.0
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "task_id": self.task_id,
+            "expected_status": self.expected_status,
+            "attempts": self.attempts,
+            "matched_expectations": self.matched_expectations,
+            "match_rate": self.match_rate,
+            "actual_status_counts": dict(self.actual_status_counts),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationMatrixResult:
+    """多轮评测总览；每轮原始证据保留在 run-XXX 子目录。"""
+
+    repetitions: int
+    runs: tuple[EvaluationMatrixRun, ...]
+    tasks: tuple[EvaluationMatrixTask, ...]
+
+    @property
+    def all_matched(self) -> bool:
+        return all(task.matched_expectations == task.attempts for task in self.tasks)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "repetitions": self.repetitions,
+            "all_matched": self.all_matched,
+            "runs": [item.to_dict() for item in self.runs],
+            "tasks": [item.to_dict() for item in self.tasks],
         }
 
 
@@ -219,6 +312,7 @@ class EvaluationCatalog:
             expected_status = item.get("expected_status")
             baseline_status = item.get("baseline_status")
             target_test_class = item.get("target_test_class")
+            profile = item.get("profile", "java_maven")
             paths = item.get("expected_paths")
             if not all(isinstance(value, str) and value for value in (task_id, category, description, recipe, expected_status)):
                 raise ValueError("EVALUATION_CATALOG_INVALID")
@@ -228,7 +322,15 @@ class EvaluationCatalog:
                 raise ValueError("EVALUATION_CATALOG_INVALID")
             if target_test_class is not None and (not isinstance(target_test_class, str) or not target_test_class):
                 raise ValueError("EVALUATION_CATALOG_INVALID")
-            if recipe == MavenRecipeName.TARGETED_TEST.value and not target_test_class:
+            if profile not in {"java_maven", "java_gradle", "python_pytest", "node_npm", "node_pnpm"}:
+                raise ValueError("EVALUATION_CATALOG_INVALID")
+            try:
+                parsed_recipe = _registered_recipe(recipe)
+            except ValueError as error:
+                raise ValueError("EVALUATION_CATALOG_INVALID") from error
+            if parsed_recipe in {MavenRecipeName.TARGETED_TEST, GradleRecipeName.TARGETED_TEST, PytestRecipeName.TARGETED_TEST} and not target_test_class:
+                raise ValueError("EVALUATION_CATALOG_INVALID")
+            if parsed_recipe not in {MavenRecipeName.TARGETED_TEST, GradleRecipeName.TARGETED_TEST, PytestRecipeName.TARGETED_TEST} and target_test_class is not None:
                 raise ValueError("EVALUATION_CATALOG_INVALID")
             tasks.append(
                 EvaluationTask(
@@ -240,9 +342,10 @@ class EvaluationCatalog:
                     expected_status,
                     baseline_status,
                     target_test_class,
+                    profile,
                 )
             )
-        if len(tasks) != 15 or len({task.task_id for task in tasks}) != len(tasks):
+        if not tasks or len({task.task_id for task in tasks}) != len(tasks):
             raise ValueError("EVALUATION_CATALOG_INVALID")
         return tuple(tasks)
 
@@ -266,7 +369,7 @@ class FixtureBuilder:
         if task_root.exists():
             raise ValueError(f"FIXTURE_ALREADY_EXISTS:{task.task_id}")
         repository.mkdir(parents=True)
-        self._write_base_project(repository)
+        self._write_base_project(repository, task.profile)
         self._write_scenario(repository, task)
         self._git(repository, "init", "-b", "main")
         self._git(repository, "config", "user.name", "RepoPilot Evaluation")
@@ -283,15 +386,27 @@ class FixtureBuilder:
         return FixtureResult(
             task.task_id,
             task.category,
+            task.profile,
             repository,
             commit,
             present,
-            _scenario_name(task.category),
+            _scenario_name(task.category, task.profile),
             task.baseline_status,
         )
 
     @staticmethod
-    def _write_base_project(repository: Path) -> None:
+    def _write_base_project(repository: Path, profile: str = "java_maven") -> None:
+        if profile == "java_gradle":
+            FixtureBuilder._write_gradle_base_project(repository)
+            return
+        if profile == "python_pytest":
+            FixtureBuilder._write_pytest_base_project(repository)
+            return
+        if profile in {"node_npm", "node_pnpm"}:
+            FixtureBuilder._write_node_base_project(repository, profile)
+            return
+        if profile != "java_maven":
+            raise ValueError("EVALUATION_PROFILE_NOT_SUPPORTED")
         files = {
             "pom.xml": """<project xmlns=\"http://maven.apache.org/POM/4.0.0\">
   <modelVersion>4.0.0</modelVersion>
@@ -345,8 +460,122 @@ class FixtureBuilder:
             path.write_text(content, encoding="utf-8")
 
     @staticmethod
+    def _write_gradle_base_project(repository: Path) -> None:
+        files = {
+            "settings.gradle.kts": "rootProject.name = \"repopilot-gradle-evaluation\"\n",
+            "build.gradle.kts": """plugins { java }
+
+repositories { mavenCentral() }
+
+dependencies {
+    testImplementation(\"org.junit.jupiter:junit-jupiter:5.11.4\")
+    // Gradle 9 不再为 JUnit Platform 隐式补齐 launcher；显式声明才能让评测
+    // 失败来自真实断言，而不是测试执行器启动失败。
+    testRuntimeOnly(\"org.junit.platform:junit-platform-launcher\")
+}
+
+tasks.test { useJUnitPlatform() }
+""",
+            "README.md": "# Gradle Evaluation Demo\n",
+            "src/main/java/com/repopilot/gradle/OrderService.java": "package com.repopilot.gradle;\npublic class OrderService { public String find(String id) { return id; } }\n",
+            "src/test/java/com/repopilot/gradle/OrderServiceTest.java": "package com.repopilot.gradle;\nimport static org.junit.jupiter.api.Assertions.assertEquals;\nimport org.junit.jupiter.api.Test;\nclass OrderServiceTest { @Test void findsOrder() { assertEquals(\"o-1\", new OrderService().find(\"o-1\")); } }\n",
+        }
+        for relative, content in files.items():
+            path = repository / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+
+    @staticmethod
+    def _write_pytest_base_project(repository: Path) -> None:
+        files = {
+            "pyproject.toml": "[tool.pytest.ini_options]\ntestpaths = [\"tests\"]\n",
+            "README.md": "# pytest Evaluation Demo\n",
+            "orders/__init__.py": "",
+            "orders/service.py": "def find_order(order_id: str) -> str:\n    return order_id\n",
+            "tests/test_service.py": "from orders.service import find_order\n\ndef test_finds_order() -> None:\n    assert find_order(\"o-1\") == \"o-1\"\n",
+        }
+        for relative, content in files.items():
+            path = repository / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+
+    @staticmethod
+    def _write_node_base_project(repository: Path, profile: str) -> None:
+        files = {
+            "package.json": json.dumps(
+                {
+                    "name": "repopilot-node-evaluation",
+                    "private": True,
+                    "type": "module",
+                    # 使用 Node 内置测试发现，确保独立失败 fixture 也会进入 npm/pnpm 的固定 Recipe。
+                    "scripts": {"test": "node --test"},
+                },
+                ensure_ascii=False,
+                indent=2,
+            ) + "\n",
+            "README.md": "# Node Evaluation Demo\n",
+            "src/orders.js": "export function findOrder(orderId) { return orderId; }\n",
+            "test/orders.test.js": "import assert from 'node:assert/strict';\nimport { findOrder } from '../src/orders.js';\nassert.equal(findOrder('o-1'), 'o-1');\n",
+        }
+        if profile == "node_pnpm":
+            files["pnpm-lock.yaml"] = "lockfileVersion: '9.0'\n"
+        else:
+            files["package-lock.json"] = json.dumps({"name": "repopilot-node-evaluation", "lockfileVersion": 3}, indent=2) + "\n"
+        for relative, content in files.items():
+            path = repository / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+
+    @staticmethod
     def _write_scenario(repository: Path, task: EvaluationTask) -> None:
-        if task.category in {"controller", "resume"}:
+        if task.profile == "java_gradle" and task.category in {"gradle_validation", "gradle_resume"}:
+            test = repository / "src/test/java/com/repopilot/gradle/OrderServiceTest.java"
+            test.write_text(
+                """package com.repopilot.gradle;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import org.junit.jupiter.api.Test;
+class OrderServiceTest { @Test void rejectsBlankOrderId() { assertThrows(IllegalArgumentException.class, () -> new OrderService().find(\"  \")); } }
+""",
+                encoding="utf-8",
+            )
+        elif task.profile == "java_gradle" and task.category == "gradle_failure":
+            test = repository / "src/test/java/com/repopilot/gradle/UnrelatedFailureTest.java"
+            test.write_text(
+                """package com.repopilot.gradle;
+import static org.junit.jupiter.api.Assertions.fail;
+import org.junit.jupiter.api.Test;
+class UnrelatedFailureTest { @Test void preservesFailure() { fail(\"independent Gradle failure\"); } }
+""",
+                encoding="utf-8",
+            )
+        elif task.profile == "python_pytest" and task.category in {"pytest_validation", "pytest_resume"}:
+            test = repository / "tests/test_service.py"
+            test.write_text(
+                """import pytest
+from orders.service import find_order
+
+def test_rejects_blank_order_id() -> None:
+    with pytest.raises(ValueError):
+        find_order(\"  \")
+""",
+                encoding="utf-8",
+            )
+        elif task.profile == "python_pytest" and task.category == "pytest_failure":
+            test = repository / "tests/test_failure.py"
+            test.write_text("def test_preserves_failure() -> None:\n    assert False, 'independent pytest failure'\n", encoding="utf-8")
+        elif task.profile in {"node_npm", "node_pnpm"} and task.category in {"node_validation", "node_resume"}:
+            test = repository / "test/orders.test.js"
+            test.write_text(
+                """import assert from 'node:assert/strict';
+import { findOrder } from '../src/orders.js';
+assert.throws(() => findOrder('  '), Error);
+""",
+                encoding="utf-8",
+            )
+        elif task.profile in {"node_npm", "node_pnpm"} and task.category == "node_failure":
+            test = repository / "test/failure.test.js"
+            test.write_text("import assert from 'node:assert/strict';\nassert.equal(1, 2, 'independent Node failure');\n", encoding="utf-8")
+        elif task.category in {"controller", "resume"}:
             test = repository / "src/test/java/com/repopilot/demo/OrderControllerTest.java"
             test.write_text(
                 """package com.repopilot.demo;
@@ -530,17 +759,27 @@ class UnrelatedFailureTest {
         payload = {"schema_version": 2, "fixture_count": len(results), "results": [item.to_dict() for item in results]}
         (root / "fixtures.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         with (root / "fixtures.csv").open("w", newline="", encoding="utf-8") as stream:
-            writer = csv.DictWriter(stream, fieldnames=["task_id", "category", "repository", "baseline_commit", "expected_paths_present", "scenario", "baseline_status", "fixture_status", "agent_status"])
+            writer = csv.DictWriter(stream, fieldnames=["task_id", "category", "profile", "repository", "baseline_commit", "expected_paths_present", "scenario", "baseline_status", "fixture_status", "agent_status"])
             writer.writeheader()
             writer.writerows(item.to_dict() for item in results)
 
 
 class BaselineValidator:
-    """在独立 Git clone 中运行固定 Maven Recipe，避免污染 fixture 基线。"""
+    """在独立 Git clone 中运行固定 Build Recipe，避免污染 fixture 基线。"""
 
-    def __init__(self, catalog: EvaluationCatalog, maven_runner: MavenRecipeRunner | None = None) -> None:
+    def __init__(
+        self,
+        catalog: EvaluationCatalog,
+        maven_runner: MavenRecipeRunner | None = None,
+        gradle_runner: GradleRecipeRunner | None = None,
+        pytest_runner: PytestRecipeRunner | None = None,
+        node_runner: NodeRecipeRunner | None = None,
+    ) -> None:
         self.catalog = catalog
         self.maven_runner = maven_runner or MavenRecipeRunner()
+        self.gradle_runner = gradle_runner or GradleRecipeRunner()
+        self.pytest_runner = pytest_runner or PytestRecipeRunner()
+        self.node_runner = node_runner or NodeRecipeRunner()
 
     def validate(
         self,
@@ -583,14 +822,10 @@ class BaselineValidator:
         task_output.mkdir(parents=True)
         self._git_clone(repository, workspace)
         FixtureBuilder._git(workspace, "checkout", "--detach", baseline_commit)
-        execution = self.maven_runner.run(
-            workspace,
-            MavenRecipeName(task.recipe),
-            PermissionGrant.safe(),
-            task.target_test_class,
-        )
-        stdout_log = task_output / "maven-stdout.txt"
-        stderr_log = task_output / "maven-stderr.txt"
+        build_system, execution = self._run_recipe(workspace, task)
+        log_prefix = "maven" if build_system == "maven" else "build"
+        stdout_log = task_output / f"{log_prefix}-stdout.txt"
+        stderr_log = task_output / f"{log_prefix}-stderr.txt"
         stdout_log.write_text(execution.stdout_summary, encoding="utf-8")
         stderr_log.write_text(execution.stderr_summary, encoding="utf-8")
         source_unchanged = (
@@ -613,10 +848,29 @@ class BaselineValidator:
             code=execution.code,
             exit_code=execution.exit_code,
             duration_ms=execution.duration_ms,
-            surefire_reports=execution.surefire_reports,
+            surefire_reports=execution.surefire_reports if build_system == "maven" else (),
+            build_system=build_system,
+            report_kind=_build_report_kind(build_system),
+            verification_reports=_execution_reports(execution),
             stdout_log=stdout_log,
             stderr_log=stderr_log,
         )
+
+    def _run_recipe(
+        self,
+        workspace: Path,
+        task: EvaluationTask,
+    ) -> tuple[str, MavenExecutionResult | GradleExecutionResult | PytestExecutionResult | NodeExecutionResult]:
+        """评测只能分派已注册 Recipe，不能从任务 JSON 拼接任意命令。"""
+
+        recipe = _registered_recipe(task.recipe)
+        if isinstance(recipe, MavenRecipeName):
+            return "maven", self.maven_runner.run(workspace, recipe, PermissionGrant.safe(), task.target_test_class)
+        if isinstance(recipe, GradleRecipeName):
+            return "gradle", self.gradle_runner.run(workspace, recipe, PermissionGrant.safe(), task.target_test_class)
+        if isinstance(recipe, PytestRecipeName):
+            return "pytest", self.pytest_runner.run(workspace, recipe, PermissionGrant.safe(), task.target_test_class)
+        return "node", self.node_runner.run(workspace, recipe, PermissionGrant.safe(), task.target_test_class)
 
     @staticmethod
     def _git_clone(repository: Path, workspace: Path) -> None:
@@ -664,7 +918,7 @@ class BaselineValidator:
             f"- 验证任务：{len(results)}",
             f"- 符合预期：{matched}",
             "",
-            "| 任务 | Recipe | 预期基线 | 实际 | 匹配 | 源 fixture 未变 | 退出码 |",
+            "| 任务 | Build Recipe | 预期基线 | 实际 | 匹配 | 源 fixture 未变 | 退出码 |",
             "|---|---|---|---|---|---|---|",
         ]
         lines.extend(
@@ -690,8 +944,8 @@ def _matches(path: str, pattern: str) -> bool:
     return re.fullmatch(expression, path) is not None
 
 
-def _scenario_name(category: str) -> str:
-    return {
+def _scenario_name(category: str, profile: str = "java_maven") -> str:
+    named_scenarios = {
         "dirty_repo": "包含未提交改动的源仓库",
         "secret": "包含未跟踪敏感文件",
         "path_escape": "项目外路径攻击断言",
@@ -700,7 +954,56 @@ def _scenario_name(category: str) -> str:
         "maven_failure": "验证失败预期",
         "resume": "checkpoint 恢复预期",
         "patch_conflict": "补丁旧文本冲突",
-    }.get(category, "Java/Maven 代码维护")
+    }
+    if category in named_scenarios:
+        return named_scenarios[category]
+    return {
+        "java_maven": "Java/Maven 代码维护",
+        "java_gradle": "Java/Gradle 代码维护",
+        "python_pytest": "Python/pytest 代码维护",
+        "node_npm": "Node.js/npm 代码维护",
+        "node_pnpm": "Node.js/pnpm 代码维护",
+    }.get(profile, "通用代码维护")
+
+
+def _registered_recipe(value: str) -> MavenRecipeName | GradleRecipeName | PytestRecipeName | NodeRecipeName:
+    """将评测目录中的 Recipe 名称限制在与 Agent 相同的受控枚举集合。"""
+
+    for recipe_type in (MavenRecipeName, GradleRecipeName, PytestRecipeName, NodeRecipeName):
+        try:
+            return recipe_type(value)
+        except ValueError:
+            continue
+    raise ValueError("EVALUATION_RECIPE_NOT_REGISTERED")
+
+
+def _execution_reports(execution: MavenExecutionResult | GradleExecutionResult | PytestExecutionResult | NodeExecutionResult) -> tuple[str, ...]:
+    if isinstance(execution, MavenExecutionResult):
+        return execution.surefire_reports
+    return execution.test_reports
+
+
+def _build_report_kind(build_system: str) -> str:
+    return {
+        "maven": "maven_surefire",
+        "gradle": "gradle_test_results",
+        "pytest": "pytest_output",
+        "node": "node_test_output",
+    }[build_system]
+
+
+def _recipe_build_system(value: str) -> str | None:
+    try:
+        recipe = _registered_recipe(value)
+    except ValueError:
+        return None
+    if isinstance(recipe, MavenRecipeName):
+        return "maven"
+    if isinstance(recipe, GradleRecipeName):
+        return "gradle"
+    if isinstance(recipe, PytestRecipeName):
+        return "pytest"
+    return "node"
 
 
 class EvaluationRunner:
@@ -777,6 +1080,14 @@ class EvaluationRunner:
         verification_duration_ms = verification.get("duration_ms") if isinstance(verification, dict) else None
         raw_surefire_reports = verification.get("surefire_reports", []) if isinstance(verification, dict) else []
         verification_surefire_reports = tuple(str(item) for item in raw_surefire_reports if isinstance(item, str))
+        verification_build_system = verification.get("build_system") if isinstance(verification, dict) else None
+        if not isinstance(verification_build_system, str) and isinstance(verification_recipe, str):
+            verification_build_system = _recipe_build_system(verification_recipe)
+        verification_report_kind = verification.get("report_kind") if isinstance(verification, dict) else None
+        if not isinstance(verification_report_kind, str) and isinstance(verification_build_system, str):
+            verification_report_kind = _build_report_kind(verification_build_system)
+        raw_build_reports = verification.get("build_reports", raw_surefire_reports) if isinstance(verification, dict) else []
+        verification_reports = tuple(str(item) for item in raw_build_reports if isinstance(item, str))
         verification_contract_valid = _verification_contract_matches(task, verification)
         patch_result = state.get("patch_result") if isinstance(state, dict) else None
         raw_changed_paths = patch_result.get("paths", []) if isinstance(patch_result, dict) else []
@@ -804,6 +1115,9 @@ class EvaluationRunner:
             verification_exit_code=verification_exit_code if isinstance(verification_exit_code, int) else None,
             verification_duration_ms=verification_duration_ms if isinstance(verification_duration_ms, int) else None,
             verification_surefire_reports=verification_surefire_reports,
+            verification_build_system=verification_build_system if isinstance(verification_build_system, str) else None,
+            verification_report_kind=verification_report_kind if isinstance(verification_report_kind, str) else None,
+            verification_reports=verification_reports,
             verification_contract_valid=verification_contract_valid,
             error_summary=str(state.get("error_summary")) if isinstance(state, dict) and state.get("error_summary") else None,
         )
@@ -836,11 +1150,114 @@ class EvaluationRunner:
             f"- 执行任务：{len(results)}",
             f"- 期望匹配：{passed}",
             "",
-            "| 任务 | 期望 | 实际 | 匹配 | Diff | 范围 | Maven Recipe | 契约 | 退出码 | 源仓库未变 |",
+            "| 任务 | 期望 | 实际 | 匹配 | Diff | 范围 | Build Recipe | 契约 | 退出码 | 源仓库未变 |",
             "|---|---|---|---|---|---|---|---|---|---|",
         ]
         lines.extend(f"| {item.task_id} | {item.expected_status} | {item.actual_status} | {'是' if item.matched_expectation else '否'} | {'是' if item.git_diff_present else '否'} | {'合规' if item.scope_valid else '越界'} | {item.verification_recipe or '-'} / {item.verification_status or '-'} | {'合规' if item.verification_contract_valid else '不合规'} | {item.verification_exit_code if item.verification_exit_code is not None else '-'} | {'是' if item.source_unchanged else '否'} |" for item in results)
         (root / "evaluation-report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+class EvaluationMatrixRunner:
+    """顺序重复真实评测，并把每轮原始证据与稳定性统计分开保存。"""
+
+    def __init__(
+        self,
+        catalog: EvaluationCatalog,
+        graph_runner_factory: Callable[[], object],
+        provider_summary: EvaluationProviderSummary | None = None,
+    ) -> None:
+        self.catalog = catalog
+        self._graph_runner_factory = graph_runner_factory
+        self.provider_summary = provider_summary or EvaluationProviderSummary()
+
+    def run(
+        self,
+        fixtures_root: Path,
+        result_root: Path,
+        *,
+        repetitions: int,
+        task_ids: set[str] | None = None,
+        approval: str = "manual",
+    ) -> EvaluationMatrixResult:
+        if repetitions < 2 or repetitions > 30:
+            raise ValueError("EVALUATION_MATRIX_REPETITIONS_INVALID")
+        root = result_root.expanduser().resolve()
+        if root.exists() and any(root.iterdir()):
+            raise ValueError("EVALUATION_OUTPUT_NOT_EMPTY")
+        root.mkdir(parents=True, exist_ok=True)
+
+        all_results: dict[str, list[EvaluationRunResult]] = defaultdict(list)
+        runs: list[EvaluationMatrixRun] = []
+        for run_index in range(1, repetitions + 1):
+            directory = root / f"run-{run_index:03d}"
+            results = EvaluationRunner(
+                self.catalog,
+                self._graph_runner_factory(),
+                self.provider_summary,
+            ).run(
+                fixtures_root,
+                directory,
+                task_ids=task_ids,
+                approval=approval,
+            )
+            for result in results:
+                all_results[result.task_id].append(result)
+            status_counts = Counter(result.actual_status for result in results)
+            runs.append(
+                EvaluationMatrixRun(
+                    run_index,
+                    directory.name,
+                    len(results),
+                    sum(result.matched_expectation for result in results),
+                    tuple(sorted(status_counts.items())),
+                )
+            )
+
+        tasks = tuple(
+            EvaluationMatrixTask(
+                task_id,
+                results[0].expected_status,
+                len(results),
+                sum(result.matched_expectation for result in results),
+                tuple(sorted(Counter(result.actual_status for result in results).items())),
+            )
+            for task_id, results in sorted(all_results.items())
+        )
+        matrix = EvaluationMatrixResult(repetitions, tuple(runs), tasks)
+        self._write_matrix_report(root, matrix)
+        return matrix
+
+    @staticmethod
+    def _write_matrix_report(root: Path, matrix: EvaluationMatrixResult) -> None:
+        payload = {"schema_version": 1, **matrix.to_dict()}
+        (root / "evaluation-matrix.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        with (root / "evaluation-matrix.csv").open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(
+                stream,
+                fieldnames=["task_id", "expected_status", "attempts", "matched_expectations", "match_rate", "actual_status_counts"],
+            )
+            writer.writeheader()
+            for task in matrix.tasks:
+                row = task.to_dict()
+                row["actual_status_counts"] = json.dumps(row["actual_status_counts"], ensure_ascii=False, sort_keys=True)
+                writer.writerow(row)
+        lines = [
+            "# RepoPilot 多轮评测矩阵",
+            "",
+            f"- 重复次数：{matrix.repetitions}",
+            f"- 所有期望匹配：{'是' if matrix.all_matched else '否'}",
+            "",
+            "| 任务 | 期望 | 尝试 | 匹配 | 匹配率 | 实际终态分布 |",
+            "|---|---|---|---|---|---|",
+        ]
+        lines.extend(
+            f"| {task.task_id} | {task.expected_status} | {task.attempts} | {task.matched_expectations} | {task.match_rate:.0%} | {dict(task.actual_status_counts)} |"
+            for task in matrix.tasks
+        )
+        (root / "evaluation-matrix.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _build_report_metadata(
@@ -949,10 +1366,17 @@ def _verification_contract_matches(task: EvaluationTask, verification: object) -
     argv = verification.get("argv")
     if not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
         return False
-    targeted_arguments = [item for item in argv if item.startswith("-Dtest=")]
-    if task.recipe == MavenRecipeName.TARGETED_TEST.value:
-        return targeted_arguments == [f"-Dtest={task.target_test_class}"]
-    return not targeted_arguments
+    try:
+        recipe = _registered_recipe(task.recipe)
+    except ValueError:
+        return False
+    if recipe is MavenRecipeName.TARGETED_TEST:
+        return [item for item in argv if item.startswith("-Dtest=")] == [f"-Dtest={task.target_test_class}"]
+    if recipe is GradleRecipeName.TARGETED_TEST:
+        return tuple(argv[-3:]) == ("test", "--tests", str(task.target_test_class))
+    if recipe is PytestRecipeName.TARGETED_TEST:
+        return tuple(argv[-1:]) == (str(task.target_test_class),)
+    return not any(item.startswith("-Dtest=") or item == "--tests" for item in argv)
 
 
 def _evaluation_prompt(task: EvaluationTask) -> str:

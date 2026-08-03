@@ -13,6 +13,7 @@ from repopilot_guard.permissions import PermissionGrant
 class ToolName(str, Enum):
     LIST_FILES = "list_files"
     SEARCH_CODE = "search_code"
+    FIND_SYMBOL = "find_symbol"
     READ_FILE = "read_file"
     INSPECT_BUILD = "inspect_build"
     APPLY_PATCH = "apply_patch"
@@ -25,6 +26,28 @@ class MavenRecipeName(str, Enum):
     COMPILE = "compile"
     TEST = "test"
     TARGETED_TEST = "targeted_test"
+
+
+class GradleRecipeName(str, Enum):
+    """Gradle Profile 的受控验证配方，名称与 Maven 分开以冻结真实构建工具。"""
+
+    COMPILE = "gradle_compile"
+    TEST = "gradle_test"
+    TARGETED_TEST = "gradle_targeted_test"
+
+
+class PytestRecipeName(str, Enum):
+    """Python Profile 的固定 pytest 配方，不接受任意 flag 或额外命令。"""
+
+    TEST = "pytest_test"
+    TARGETED_TEST = "pytest_targeted_test"
+
+
+class NodeRecipeName(str, Enum):
+    """Node Profile 的固定测试入口，包管理器由冻结 Recipe 决定。"""
+
+    NPM_TEST = "npm_test"
+    PNPM_TEST = "pnpm_test"
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +74,7 @@ class PolicyGuard:
     _protected_directories = frozenset({".git", ".aws", ".ssh", ".gnupg"})
     _protected_suffixes = frozenset({".pem", ".key", ".p12", ".pfx", ".jks"})
     _test_class_pattern = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*$")
+    _pytest_selector_pattern = re.compile(r"^(?!-)(?!.*(?:^|[\\/])\.\.(?:[\\/]|$))[A-Za-z0-9_./:-]+$")
 
     def __init__(self, workspace_root: Path, permission: PermissionGrant | None = None) -> None:
         self.workspace_root = workspace_root.expanduser().resolve()
@@ -84,21 +108,26 @@ class PolicyGuard:
             return PolicyDecision(False, "Tool is not allowlisted.", "TOOL_NOT_ALLOWLISTED")
         return PolicyDecision(True, "Path is within the workspace and passes protection rules.")
 
-    def check_recipe(self, recipe: MavenRecipeName, test_class: str | None = None) -> PolicyDecision:
+    def check_recipe(self, recipe: MavenRecipeName | GradleRecipeName | PytestRecipeName | NodeRecipeName, test_class: str | None = None) -> PolicyDecision:
         if self.permission.is_full_access:
             return PolicyDecision(
                 True,
                 "完全权限模式已由用户确认；允许该 Recipe 并记录风险审计。",
                 "USER_GRANTED_FULL_ACCESS",
             )
-        if recipe is MavenRecipeName.TARGETED_TEST:
+        if recipe in {MavenRecipeName.TARGETED_TEST, GradleRecipeName.TARGETED_TEST}:
             if not test_class:
                 return PolicyDecision(False, "targeted_test requires a test class.", "MISSING_TEST_CLASS")
             if not self._test_class_pattern.fullmatch(test_class):
                 return PolicyDecision(False, "Test class contains unsupported characters.", "INVALID_TEST_CLASS")
+        elif recipe is PytestRecipeName.TARGETED_TEST:
+            if not test_class:
+                return PolicyDecision(False, "pytest_targeted_test requires a test selector.", "MISSING_TEST_SELECTOR")
+            if not self._pytest_selector_pattern.fullmatch(test_class):
+                return PolicyDecision(False, "Pytest selector contains unsupported characters.", "INVALID_TEST_SELECTOR")
         elif test_class is not None:
-            return PolicyDecision(False, "Only targeted_test accepts a test class.", "INVALID_RECIPE_ARGUMENT")
-        return PolicyDecision(True, "Maven Recipe is allowlisted.")
+            return PolicyDecision(False, "Only a targeted Recipe accepts a test selector.", "INVALID_RECIPE_ARGUMENT")
+        return PolicyDecision(True, "Build Recipe is allowlisted.")
 
 
 class TaskIntentGuard:

@@ -40,7 +40,19 @@ REPOPILOT_EMBEDDING_DIMENSIONS=
 
 # 本地基础设施
 REPOPILOT_QDRANT_URL=http://127.0.0.1:6333
+
+# 可选：多个 Skill 根目录使用分号分隔。只读取声明文件，不执行目录中的脚本。
+REPOPILOT_USER_SKILL_ROOTS=
+REPOPILOT_BUNDLED_SKILL_ROOTS=
+
+# 实验性能力，默认关闭；启用后仍需要任务级完全权限确认与单独审批。
+REPOPILOT_FULL_LOCAL_SHELL_ENABLED=false
 "#;
+const DESKTOP_CONFIG_MIGRATION_FIELDS: &[(&str, &str)] = &[
+    ("REPOPILOT_USER_SKILL_ROOTS", ""),
+    ("REPOPILOT_BUNDLED_SKILL_ROOTS", ""),
+    ("REPOPILOT_FULL_LOCAL_SHELL_ENABLED", "false"),
+];
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -197,6 +209,7 @@ fn backend_command(resource_dir: Option<&Path>, runtime_dir: Option<&Path>) -> C
 fn ensure_desktop_config(runtime_dir: &Path) -> PathBuf {
     let config_file = runtime_dir.join("settings.env");
     if config_file.exists() {
+        migrate_desktop_config(&config_file);
         return config_file;
     }
     match fs::OpenOptions::new()
@@ -215,6 +228,56 @@ fn ensure_desktop_config(runtime_dir: &Path) -> PathBuf {
         }
     }
     config_file
+}
+
+fn migrate_desktop_config(config_file: &Path) {
+    // 旧版配置只追加新字段，绝不读取、回显或覆盖用户已有的模型地址和 API Key。
+    let existing = match fs::read_to_string(config_file) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("无法读取 RepoPilot 桌面配置以执行迁移: {error}");
+            return;
+        }
+    };
+    let missing = DESKTOP_CONFIG_MIGRATION_FIELDS
+        .iter()
+        .filter(|(key, _)| !desktop_config_contains_key(&existing, key))
+        .copied()
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return;
+    }
+    let mut block = String::new();
+    if !existing.ends_with('\n') {
+        block.push('\n');
+    }
+    block.push_str("\n# RepoPilot Desktop 配置迁移：新增字段保留默认值，可在设置页修改。\n");
+    for (key, value) in missing {
+        block.push_str(key);
+        block.push('=');
+        block.push_str(value);
+        block.push('\n');
+    }
+    match fs::OpenOptions::new().append(true).open(config_file) {
+        Ok(mut file) => {
+            if let Err(error) = file.write_all(block.as_bytes()) {
+                eprintln!("无法追加 RepoPilot 桌面配置迁移字段: {error}");
+            }
+        }
+        Err(error) => eprintln!("无法打开 RepoPilot 桌面配置以执行迁移: {error}"),
+    }
+}
+
+fn desktop_config_contains_key(content: &str, key: &str) -> bool {
+    content.lines().any(|line| {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            return false;
+        }
+        trimmed
+            .split_once('=')
+            .is_some_and(|(candidate, _)| candidate.trim_end() == key)
+    })
 }
 
 fn bundled_backend_path(resource_dir: Option<&Path>) -> Option<PathBuf> {
@@ -290,6 +353,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{ensure_desktop_config, is_repopilot_health_response};
 
@@ -315,14 +379,52 @@ mod tests {
         let config_file = ensure_desktop_config(&directory);
         let initial = fs::read_to_string(&config_file).expect("读取配置模板");
         assert!(initial.contains("REPOPILOT_CHAT_API_KEY="));
+        assert!(initial.contains("REPOPILOT_USER_SKILL_ROOTS="));
+        assert!(initial.contains("REPOPILOT_FULL_LOCAL_SHELL_ENABLED=false"));
 
         fs::write(&config_file, "REPOPILOT_CHAT_API_KEY=user-value\n").expect("写入用户配置");
         let repeated = ensure_desktop_config(&directory);
         assert_eq!(config_file, repeated);
+        let migrated = fs::read_to_string(&config_file).expect("读取用户配置");
+        assert!(migrated.contains("REPOPILOT_CHAT_API_KEY=user-value"));
+        assert!(migrated.contains("REPOPILOT_USER_SKILL_ROOTS="));
         assert_eq!(
-            "REPOPILOT_CHAT_API_KEY=user-value\n",
-            fs::read_to_string(&config_file).expect("读取用户配置")
+            1,
+            migrated
+                .matches("REPOPILOT_FULL_LOCAL_SHELL_ENABLED=")
+                .count()
         );
+        fs::remove_dir_all(directory).expect("清理测试目录");
+    }
+
+    #[test]
+    fn desktop_config_migration_appends_only_missing_fields_without_overwriting_user_values() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("读取系统时间")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "repopilot-config-migration-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).expect("创建测试目录");
+        let config_file = directory.join("settings.env");
+        fs::write(
+            &config_file,
+            "REPOPILOT_CHAT_API_KEY=user-value\nREPOPILOT_USER_SKILL_ROOTS=D:\\\\skills\n",
+        )
+        .expect("写入旧版配置");
+
+        ensure_desktop_config(&directory);
+        let migrated = fs::read_to_string(&config_file).expect("读取迁移后的配置");
+        assert!(migrated.contains("REPOPILOT_CHAT_API_KEY=user-value"));
+        assert_eq!(1, migrated.matches("REPOPILOT_USER_SKILL_ROOTS=").count());
+        assert!(migrated.contains("REPOPILOT_BUNDLED_SKILL_ROOTS="));
+        assert!(migrated.contains("REPOPILOT_FULL_LOCAL_SHELL_ENABLED=false"));
+
+        ensure_desktop_config(&directory);
+        let repeated = fs::read_to_string(&config_file).expect("读取重复迁移后的配置");
+        assert_eq!(migrated, repeated);
         fs::remove_dir_all(directory).expect("清理测试目录");
     }
 }

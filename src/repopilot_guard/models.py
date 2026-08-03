@@ -6,12 +6,15 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
+import re
 from tempfile import gettempdir
 from typing import Any
 from uuid import uuid4
 
 
 MAX_ATTACHED_DOCUMENTS = 4
+_CAPABILITY_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$")
+_MCP_SOURCE_ID_PATTERN = re.compile(r"^(?:project|plugin:[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?)$")
 
 
 def default_output_root() -> Path:
@@ -91,11 +94,11 @@ class VerificationContract:
     target_test_class: str | None = None
 
     def __post_init__(self) -> None:
-        if self.recipe not in {"compile", "test", "targeted_test"}:
+        if self.recipe not in {"compile", "test", "targeted_test", "gradle_compile", "gradle_test", "gradle_targeted_test", "pytest_test", "pytest_targeted_test", "npm_test", "pnpm_test"}:
             raise ValueError("verification recipe is not allowed.")
-        if self.recipe == "targeted_test" and not self.target_test_class:
+        if self.recipe in {"targeted_test", "gradle_targeted_test", "pytest_targeted_test"} and not self.target_test_class:
             raise ValueError("targeted_test requires target_test_class.")
-        if self.recipe != "targeted_test" and self.target_test_class is not None:
+        if self.recipe not in {"targeted_test", "gradle_targeted_test", "pytest_targeted_test"} and self.target_test_class is not None:
             raise ValueError("compile/test must not define target_test_class.")
 
     def to_dict(self) -> dict[str, str | None]:
@@ -182,6 +185,8 @@ class TaskRequest:
     workspace_selection: WorkspaceSelection = field(default_factory=WorkspaceSelection)
     verification_contract: VerificationContract | None = None
     approved_mcp_tools: tuple[str, ...] = ()
+    approved_mcp_sources: tuple[str, ...] = ()
+    approved_capabilities: tuple[str, ...] = ()
     attached_document_ids: tuple[str, ...] = ()
     budget: TaskBudget = field(default_factory=TaskBudget)
     operation: TaskOperation = TaskOperation.CHANGE
@@ -208,6 +213,18 @@ class TaskRequest:
             for capability_id in self.approved_mcp_tools
         ):
             raise ValueError("approved_mcp_tools must contain MCP capability IDs.")
+        if len(self.approved_mcp_sources) > 16 or any(
+            not isinstance(source_id, str) or not _MCP_SOURCE_ID_PATTERN.fullmatch(source_id)
+            for source_id in self.approved_mcp_sources
+        ):
+            raise ValueError("approved_mcp_sources must contain project or plugin MCP source IDs.")
+        if self.approved_mcp_sources and not self.approved_mcp_tools:
+            raise ValueError("approved_mcp_sources requires approved_mcp_tools.")
+        if len(self.approved_capabilities) > 64 or any(
+            not isinstance(capability_id, str) or not _CAPABILITY_ID_PATTERN.fullmatch(capability_id)
+            for capability_id in self.approved_capabilities
+        ):
+            raise ValueError("approved_capabilities must contain capability IDs.")
         if len(self.attached_document_ids) > MAX_ATTACHED_DOCUMENTS:
             raise ValueError("attached_document_ids supports at most 4 documents.")
         if any(
@@ -233,6 +250,7 @@ class TaskRequest:
         object.__setattr__(self, "output_root", output_root)
         # 任务快照使用确定性顺序，避免同一授权集合产生不同恢复状态。
         object.__setattr__(self, "approved_mcp_tools", tuple(sorted(set(self.approved_mcp_tools))))
+        object.__setattr__(self, "approved_capabilities", tuple(sorted(set(self.approved_capabilities))))
         object.__setattr__(self, "attached_document_ids", tuple(self.attached_document_ids))
 
 
@@ -243,6 +261,10 @@ class PreflightResult:
     has_pom_xml: bool
     java_source_root: Path | None
     maven_wrapper: Path | None
+    has_gradle_build: bool = False
+    gradle_wrapper: Path | None = None
+    has_pytest_project: bool = False
+    has_node_project: bool = False
     errors: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
 
@@ -257,6 +279,10 @@ class PreflightResult:
             "has_pom_xml": self.has_pom_xml,
             "java_source_root": str(self.java_source_root) if self.java_source_root else None,
             "maven_wrapper": str(self.maven_wrapper) if self.maven_wrapper else None,
+            "has_gradle_build": self.has_gradle_build,
+            "gradle_wrapper": str(self.gradle_wrapper) if self.gradle_wrapper else None,
+            "has_pytest_project": self.has_pytest_project,
+            "has_node_project": self.has_node_project,
             "errors": list(self.errors),
             "warnings": list(self.warnings),
         }

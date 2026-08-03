@@ -27,6 +27,7 @@ from repopilot_guard.document_indexing import index_uploaded_document
 from repopilot_guard.evaluation import (
     BaselineValidator,
     EvaluationCatalog,
+    EvaluationMatrixRunner,
     EvaluationProviderSummary,
     EvaluationRunner,
     FixtureBuilder,
@@ -37,7 +38,7 @@ from repopilot_guard.mcp import McpCapabilityRegistry, McpConfigError, McpConfig
 from repopilot_guard.mcp_runtime import MAX_MCP_INPUT_CHARS, McpRuntime, McpRuntimeError
 from repopilot_guard.permissions import FULL_ACCESS_CONFIRMATION, PermissionGrant, PermissionMode
 from repopilot_guard.processes import hidden_process_kwargs
-from repopilot_guard.plugins import PluginError, PluginRegistry
+from repopilot_guard.plugins import PluginError, PluginRegistry, sign_plugin_package
 from repopilot_guard.preflight import PreflightInspector
 from repopilot_guard.project_diagnostics import assess_task_admission, diagnose_project
 from repopilot_guard.project_registry import ProjectRegistry
@@ -63,12 +64,12 @@ def build_parser() -> argparse.ArgumentParser:
     terminal_parser.add_argument("--state-db", type=Path, help="SQLite 项目状态库路径")
     subparsers.add_parser("doctor", help="检查配置、Qdrant 与本地状态库")
     subparsers.add_parser("bootstrap-qdrant", help="幂等创建 Qdrant Collection 和 Payload 索引")
-    evaluate_parser = subparsers.add_parser("evaluate", help="准备并校验可重放 Java/Maven 评测 fixture")
+    evaluate_parser = subparsers.add_parser("evaluate", help="准备并校验可重放 Coding Agent 评测 fixture")
     evaluate_subparsers = evaluate_parser.add_subparsers(dest="evaluate_command", required=True)
-    evaluate_prepare = evaluate_subparsers.add_parser("prepare", help="为 15 条评测任务创建独立 Git 基线")
+    evaluate_prepare = evaluate_subparsers.add_parser("prepare", help="为所选评测目录创建独立 Git 基线")
     evaluate_prepare.add_argument("--output", required=True, type=Path, help="必须是不存在或为空的新评测目录")
     evaluate_prepare.add_argument("--catalog", type=Path, default=Path("evaluation/tasks.json"))
-    evaluate_baseline = evaluate_subparsers.add_parser("validate-baseline", help="不调用模型，验证修复前 Maven 基线")
+    evaluate_baseline = evaluate_subparsers.add_parser("validate-baseline", help="不调用模型，验证修复前 Build 基线")
     evaluate_baseline.add_argument("--fixtures", required=True, type=Path, help="evaluate prepare 的输出目录")
     evaluate_baseline.add_argument("--output", required=True, type=Path, help="必须是不存在或为空的新证据目录")
     evaluate_baseline.add_argument("--catalog", type=Path, default=Path("evaluation/tasks.json"))
@@ -80,10 +81,20 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate_run.add_argument("--output", required=True, type=Path, help="必须是不存在或为空的新结果目录")
     evaluate_run.add_argument("--catalog", type=Path, default=Path("evaluation/tasks.json"))
     task_selection = evaluate_run.add_mutually_exclusive_group(required=True)
-    task_selection.add_argument("--all", action="store_true", help="显式运行全部 15 项，可能消耗模型额度")
+    task_selection.add_argument("--all", action="store_true", help="显式运行当前评测目录全部任务，可能消耗模型额度")
     task_selection.add_argument("--task-id", action="append", help="运行一个或多个任务 ID，可重复指定")
     evaluate_run.add_argument("--approval", choices=["manual", "auto"], default="manual", help="auto 会在 fixture 内自动通过两级审批")
     evaluate_run.add_argument("--state-db", type=Path)
+    evaluate_matrix = evaluate_subparsers.add_parser("matrix", help="以真实模型重复运行 fixture，并生成跨轮稳定性统计")
+    evaluate_matrix.add_argument("--fixtures", required=True, type=Path, help="evaluate prepare 的输出目录")
+    evaluate_matrix.add_argument("--output", required=True, type=Path, help="必须是不存在或为空的新矩阵证据目录")
+    evaluate_matrix.add_argument("--catalog", type=Path, default=Path("evaluation/tasks.json"))
+    matrix_selection = evaluate_matrix.add_mutually_exclusive_group(required=True)
+    matrix_selection.add_argument("--all", action="store_true", help="显式重复运行当前评测目录全部任务，可能消耗较多模型额度")
+    matrix_selection.add_argument("--task-id", action="append", help="重复运行一个或多个任务 ID，可重复指定")
+    evaluate_matrix.add_argument("--approval", choices=["manual", "auto"], default="manual", help="auto 会在 fixture 内自动通过两级审批")
+    evaluate_matrix.add_argument("--repetitions", type=int, required=True, help="每个任务重复次数，必须在 2 到 30 之间")
+    evaluate_matrix.add_argument("--state-db", type=Path)
     api_parser = subparsers.add_parser("api", help="启动仅本机访问的桌面端后端")
     api_subparsers = api_parser.add_subparsers(dest="api_command", required=True)
     api_serve = api_subparsers.add_parser("serve", help="监听 127.0.0.1 的 FastAPI/SSE 服务")
@@ -120,6 +131,12 @@ def build_parser() -> argparse.ArgumentParser:
     plugin_install = plugin_subparsers.add_parser("install", help="登记本地插件目录并计算完整包哈希")
     plugin_install.add_argument("--source", required=True, type=Path)
     plugin_install.add_argument("--state-db", type=Path)
+    plugin_sign = plugin_subparsers.add_parser("sign", help="使用本机 Ed25519 PEM 私钥生成插件 detached 签名")
+    plugin_sign.add_argument("--source", required=True, type=Path)
+    plugin_sign.add_argument("--key-id", required=True)
+    plugin_sign.add_argument("--private-key-file", required=True, type=Path)
+    plugin_sign.add_argument("--lock-current-git-source", action="store_true", help="将当前本地 Git 远程地址和 HEAD 冻结进签名；不联网")
+    plugin_sign.add_argument("--state-db", type=Path)
     plugin_list = plugin_subparsers.add_parser("list", help="列出插件、启用状态和当前完整性结论")
     plugin_list.add_argument("--state-db", type=Path)
     plugin_enable = plugin_subparsers.add_parser("enable", help="启用已通过完整性校验的插件")
@@ -135,6 +152,26 @@ def build_parser() -> argparse.ArgumentParser:
     plugin_audit.add_argument("--plugin-id")
     plugin_audit.add_argument("--limit", type=int, default=100)
     plugin_audit.add_argument("--state-db", type=Path)
+    plugin_versions = plugin_subparsers.add_parser("versions", help="列出插件受控快照版本，不读取或执行源目录")
+    plugin_versions.add_argument("--plugin-id", required=True)
+    plugin_versions.add_argument("--state-db", type=Path)
+    plugin_rollback = plugin_subparsers.add_parser("rollback", help="显式回退到已验证的本机插件快照")
+    plugin_rollback.add_argument("--plugin-id", required=True)
+    plugin_rollback.add_argument("--package-sha256", required=True)
+    plugin_rollback.add_argument("--state-db", type=Path)
+    plugin_trust_add = plugin_subparsers.add_parser("trust-add", help="登记可信插件发布者的 Ed25519 公钥")
+    plugin_trust_add.add_argument("--key-id", required=True)
+    plugin_trust_add.add_argument("--public-key-base64", required=True)
+    plugin_trust_add.add_argument("--state-db", type=Path)
+    plugin_trust_list = plugin_subparsers.add_parser("trust-list", help="列出本机可信插件发布者公钥")
+    plugin_trust_list.add_argument("--state-db", type=Path)
+    plugin_trust_remove = plugin_subparsers.add_parser("trust-remove", help="撤销本机可信插件发布者公钥")
+    plugin_trust_remove.add_argument("--key-id", required=True)
+    plugin_trust_remove.add_argument("--state-db", type=Path)
+    plugin_trust_audit = plugin_subparsers.add_parser("trust-audit", help="查看可信发布者公钥变更审计")
+    plugin_trust_audit.add_argument("--key-id")
+    plugin_trust_audit.add_argument("--limit", type=int, default=100)
+    plugin_trust_audit.add_argument("--state-db", type=Path)
 
     workspace_parser = subparsers.add_parser("workspace", help="管理任务隔离 worktree")
     workspace_subparsers = workspace_parser.add_subparsers(dest="workspace_command", required=True)
@@ -243,6 +280,8 @@ def build_parser() -> argparse.ArgumentParser:
     task_start.add_argument("--start-ref", default="HEAD", help="安全隔离修复使用的 Git 起始分支或提交")
     task_start.add_argument("--include-uncommitted-changes", action="store_true", help="显式将未提交改动带入隔离工作区")
     task_start.add_argument("--approve-mcp-tool", action="append", default=[], help="显式授权本任务使用的只读 MCP capability ID，可重复提供")
+    task_start.add_argument("--approve-mcp-source", action="append", default=[], help="将 MCP 授权绑定到 project 或 plugin:<id> 来源，可重复提供")
+    task_start.add_argument("--approve-capability", action="append", default=[], help="显式授权任务使用的内置或扩展 capability ID，可重复提供")
     task_start.add_argument("--document-id", action="append", default=[], help="显式绑定一份已导入的 MD/TXT 研发文档到本任务，可重复提供，最多 4 份")
     task_start.add_argument("--thread-id", help="用于恢复和审计的稳定任务线程 ID")
     task_start.add_argument("--output", type=Path, default=default_output_root(), help="任务证据与报告产物目录")
@@ -269,6 +308,12 @@ def build_parser() -> argparse.ArgumentParser:
     task_decide.add_argument("--thread-id", required=True)
     task_decide.add_argument("--decision", choices=["approve", "revise", "reject"], required=True)
     task_decide.add_argument("--comment", help="要求重写时给出具体反馈，最多 2000 字符")
+    task_decide.add_argument(
+        "--select-patch-path",
+        action="append",
+        dest="selected_patch_paths",
+        help="执行审批时接受的预览补丁文件；可重复传入，省略则接受全部预览文件",
+    )
     task_decide.add_argument("--state-db", type=Path)
     task_artifacts = task_subparsers.add_parser("artifacts", help="列出任务的可审计产物，不读取正文")
     task_artifacts.add_argument("--thread-id", required=True)
@@ -285,6 +330,20 @@ def build_parser() -> argparse.ArgumentParser:
     task_archive = task_subparsers.add_parser("archive", help="归档终态任务，保留 checkpoint、证据和产物")
     task_archive.add_argument("--thread-id", required=True)
     task_archive.add_argument("--state-db", type=Path)
+    task_retention_preview = task_subparsers.add_parser(
+        "retention-preview",
+        help="只读预演可归档的旧终态任务，不改写任何数据",
+    )
+    task_retention_preview.add_argument("--older-than-days", type=int, default=30, help="仅列出超过该天数的终态任务，默认 30")
+    task_retention_preview.add_argument("--limit", type=int, default=50, help="最多返回 1-200 条，默认 50")
+    task_retention_preview.add_argument("--state-db", type=Path)
+    task_archive_eligible = task_subparsers.add_parser(
+        "archive-eligible",
+        help="显式归档符合保留条件的旧终态任务；不删除 checkpoint、证据或产物",
+    )
+    task_archive_eligible.add_argument("--older-than-days", type=int, default=30, help="仅归档超过该天数的终态任务，默认 30")
+    task_archive_eligible.add_argument("--limit", type=int, default=50, help="单次最多归档 1-200 条，默认 50")
+    task_archive_eligible.add_argument("--state-db", type=Path)
 
     agent_parser = subparsers.add_parser("agent", help="运行可恢复的只读 Coding Agent")
     agent_subparsers = agent_parser.add_subparsers(dest="agent_command", required=True)
@@ -304,6 +363,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="显式授权本任务使用的只读 MCP capability ID，可重复提供；安全模式默认不连接 MCP。",
     )
+    agent_plan.add_argument("--approve-mcp-source", action="append", default=[], help="将 MCP 授权绑定到 project 或 plugin:<id> 来源，可重复提供")
+    agent_plan.add_argument("--approve-capability", action="append", default=[], help="显式授权任务使用的内置或扩展 capability ID，可重复提供")
     agent_plan.add_argument("--confirm-full-access")
     agent_plan.add_argument("--mode", choices=[mode.value for mode in WorkspaceMode], default=WorkspaceMode.WORKTREE.value)
     agent_plan.add_argument("--task-mode", choices=[mode.value for mode in TaskMode], help="产品模式：安全隔离修复或完全本机控制")
@@ -425,7 +486,7 @@ def _run_evaluation(args: argparse.Namespace) -> int:
                 {
                     "status": "BLOCKED",
                     "code": "EVALUATION_BASELINE_VALIDATION_FAILED",
-                    "message": "基线验证未完成；请检查 fixture、Git、Maven、JDK 和空输出目录。",
+                    "message": "基线验证未完成；请检查 fixture、Git、对应 Build Runtime 和空输出目录。",
                 },
                 2,
             )
@@ -441,29 +502,58 @@ def _run_evaluation(args: argparse.Namespace) -> int:
             },
             0 if all_matched else 2,
         )
-    if args.evaluate_command != "run":
+    if args.evaluate_command not in {"run", "matrix"}:
         return 2
+    if args.evaluate_command == "matrix" and not 2 <= args.repetitions <= 30:
+        return _print_json_result(
+            {
+                "status": "BLOCKED",
+                "code": "EVALUATION_MATRIX_REPETITIONS_INVALID",
+                "message": "重复次数必须在 2 到 30 之间；未加载模型、Embedding 或 Qdrant。",
+            },
+            2,
+        )
     try:
         settings = AppSettings()
         checkpoint = SqliteCheckpointStore(_state_db_path(args.state_db))
         try:
-            runner = GraphRunner(create_live_graph(settings, checkpoint.checkpointer), default_budget=settings.task_budget())
             selected = None if args.all else set(args.task_id or [])
             provider_summary = EvaluationProviderSummary(
                 chat_model=settings.chat_model,
                 embedding_model=settings.embedding_model,
                 embedding_dimensions=settings.embedding_dimensions,
             )
-            results = EvaluationRunner(EvaluationCatalog(args.catalog), runner, provider_summary).run(
-                args.fixtures,
-                args.output,
-                task_ids=selected,
-                approval=args.approval,
-            )
+            runner_factory = lambda: GraphRunner(create_live_graph(settings, checkpoint.checkpointer), default_budget=settings.task_budget())
+            if args.evaluate_command == "matrix":
+                matrix = EvaluationMatrixRunner(EvaluationCatalog(args.catalog), runner_factory, provider_summary).run(
+                    args.fixtures,
+                    args.output,
+                    repetitions=args.repetitions,
+                    task_ids=selected,
+                    approval=args.approval,
+                )
+            else:
+                results = EvaluationRunner(EvaluationCatalog(args.catalog), runner_factory(), provider_summary).run(
+                    args.fixtures,
+                    args.output,
+                    task_ids=selected,
+                    approval=args.approval,
+                )
         finally:
             checkpoint.close()
     except (OSError, ValueError):
         return _print_json_result({"status": "BLOCKED", "code": "EVALUATION_RUN_FAILED", "message": "评测未完成；请检查模型、Embedding、Qdrant、Git 基线和结果目录。"}, 2)
+    if args.evaluate_command == "matrix":
+        return _print_json_result(
+            {
+                "status": "READY" if matrix.all_matched else "FAILED",
+                "repetitions": matrix.repetitions,
+                "all_matched": matrix.all_matched,
+                "report": str(args.output.expanduser().resolve() / "evaluation-matrix.json"),
+                "tasks": [item.to_dict() for item in matrix.tasks],
+            },
+            0 if matrix.all_matched else 2,
+        )
     matched = sum(item.matched_expectation for item in results)
     return _print_json_result({"status": "READY", "run_count": len(results), "matched_expectations": matched, "report": str(args.output.expanduser().resolve() / "evaluation-report.json"), "results": [item.to_dict() for item in results]})
 
@@ -489,6 +579,9 @@ def _run_api(args: argparse.Namespace) -> int:
             registry,
             default_output_root(),
             runtime_health_checks=lambda: (settings.chat_check(), settings.embedding_check(), qdrant_health()),
+            shell_runtime_enabled=settings.full_local_shell_enabled,
+            user_skill_roots=settings.user_skill_roots,
+            bundled_skill_roots=settings.bundled_skill_roots,
         )
         uvicorn.run(app, host=args.host, port=args.port)
     finally:
@@ -559,10 +652,14 @@ def _welcome_project_summary(project: object) -> dict[str, object]:
     diagnosis = diagnose_project(project)  # type: ignore[arg-type]
     project_payload = diagnosis["project"]
     task_modes = diagnosis["task_modes"]
-    java_profile = diagnosis["profiles"]["java_maven"]
+    profiles = diagnosis.get("profiles")
     assert isinstance(project_payload, dict)
     assert isinstance(task_modes, dict)
-    assert isinstance(java_profile, dict)
+    if not isinstance(profiles, dict):
+        profiles = {}
+    java_profile = profiles.get("java_maven")
+    if not isinstance(java_profile, dict):
+        java_profile = {"status": "NOT_DETECTED", "code": "JAVA_MAVEN_NOT_DETECTED"}
     safe_mode = task_modes["safe_isolated"]
     full_mode = task_modes["full_local"]
     assert isinstance(safe_mode, dict)
@@ -601,6 +698,15 @@ def _welcome_project_summary(project: object) -> dict[str, object]:
             "allowed_operations": full_allowed,
         },
         "java_maven": {"status": java_profile["status"], "code": java_profile["code"]},
+        "profiles": {
+            str(profile_id): {
+                key: profile[key]
+                for key in ("status", "code", "display_name", "execution_supported")
+                if key in profile
+            }
+            for profile_id, profile in profiles.items()
+            if isinstance(profile_id, str) and isinstance(profile, dict)
+        },
     }
 
 
@@ -997,6 +1103,18 @@ def _run_plugin(args: argparse.Namespace) -> int:
     try:
         if args.plugin_command == "install":
             return _print_json_result({"status": "READY", "plugin": registry.install(args.source).to_dict()})
+        if args.plugin_command == "sign":
+            return _print_json_result(
+                {
+                    "status": "READY",
+                    "signature": sign_plugin_package(
+                        args.source,
+                        args.key_id,
+                        args.private_key_file,
+                        lock_current_git_source=args.lock_current_git_source,
+                    ),
+                }
+            )
         if args.plugin_command == "list":
             return _print_json_result({"status": "READY", "plugins": [item.to_dict() for item in registry.list()]})
         if args.plugin_command == "enable":
@@ -1006,6 +1124,21 @@ def _run_plugin(args: argparse.Namespace) -> int:
         if args.plugin_command == "remove":
             registry.remove(args.plugin_id)
             return _print_json_result({"status": "READY", "code": "PLUGIN_REMOVED", "directory_deleted": False})
+        if args.plugin_command == "versions":
+            return _print_json_result({"status": "READY", "versions": [item.to_dict() for item in registry.versions(args.plugin_id)]})
+        if args.plugin_command == "rollback":
+            return _print_json_result({"status": "READY", "plugin": registry.rollback(args.plugin_id, args.package_sha256).to_dict()})
+        if args.plugin_command == "trust-add":
+            return _print_json_result(
+                {"status": "READY", "trust_key": registry.add_trust_key(args.key_id, args.public_key_base64).to_dict()}
+            )
+        if args.plugin_command == "trust-list":
+            return _print_json_result({"status": "READY", "trust_keys": [item.to_dict() for item in registry.trust_keys()]})
+        if args.plugin_command == "trust-remove":
+            registry.remove_trust_key(args.key_id)
+            return _print_json_result({"status": "READY", "code": "PLUGIN_TRUST_KEY_REMOVED"})
+        if args.plugin_command == "trust-audit":
+            return _print_json_result({"status": "READY", "events": list(registry.trust_audit(args.key_id, args.limit))})
         return _print_json_result({"status": "READY", "events": list(registry.audit(args.plugin_id, args.limit))})
     except PluginError as error:
         return _print_json_result({"status": "BLOCKED", "code": error.code, "message": error.message}, 2)
@@ -1092,12 +1225,16 @@ def _run_search(args: argparse.Namespace) -> int:
         health = bootstrapper.health_check()
         if not health.ready:
             return _print_checks((health,))
-        result = ContextRetriever(bootstrapper.client, provider.create_embeddings()).search(
-            args.query,
-            project_id=args.project_id,
-            repo_commit=args.repo_commit,
-            limit=args.limit,
-        )
+        store = ContextChunkStore(settings.state_db_path)
+        try:
+            result = ContextRetriever(bootstrapper.client, provider.create_embeddings(), store).search(
+                args.query,
+                project_id=args.project_id,
+                repo_commit=args.repo_commit,
+                limit=args.limit,
+            )
+        finally:
+            store.close()
         return _print_json_result(result.to_dict(), 0 if result.status == "READY" else 2)
     except ValueError:
         return _print_json_result({"status": "BLOCKED", "code": "CONTEXT_SEARCH_INPUT_INVALID", "message": "检索参数无效。"}, 2)
@@ -1270,7 +1407,7 @@ def _run_task(args: argparse.Namespace) -> int:
 
     registry: ProjectRegistry | None = None
     try:
-        if args.task_command in {"list", "events", "watch", "archive", "review"}:
+        if args.task_command in {"list", "events", "watch", "archive", "review", "retention-preview", "archive-eligible"}:
             return _run_task_store_command(args)
         if args.task_command in {"artifacts", "artifact", "export"}:
             return _run_task_artifact_command(args)
@@ -1310,14 +1447,24 @@ def _run_task(args: argparse.Namespace) -> int:
                     result, runtime_error = _run_cli_execution(
                         task_store,
                         args.thread_id,
-                        lambda: runner.resume(args.thread_id, decision=args.decision, comment=args.comment),
+                        lambda: runner.resume(
+                            args.thread_id,
+                            decision=args.decision,
+                            comment=args.comment,
+                            selected_patch_paths=args.selected_patch_paths,
+                        ),
                     )
                 except ValueError as error:
                     # 兼容第一版未写入任务索引、但仍存在 LangGraph checkpoint 的旧任务。
                     if str(error) != "TASK_NOT_FOUND":
                         raise
                     try:
-                        result = runner.resume(args.thread_id, decision=args.decision, comment=args.comment)
+                        result = runner.resume(
+                            args.thread_id,
+                            decision=args.decision,
+                            comment=args.comment,
+                            selected_patch_paths=args.selected_patch_paths,
+                        )
                     except Exception as runtime_error:
                         return _print_json_result(
                             _cli_runtime_failure_summary(args.thread_id, f"TASK_RUNTIME_FAILED: {type(runtime_error).__name__}"),
@@ -1353,6 +1500,8 @@ def _run_task(args: argparse.Namespace) -> int:
                         include_uncommitted_changes=args.include_uncommitted_changes,
                     ),
                     approved_mcp_tools=tuple(args.approve_mcp_tool),
+                    approved_mcp_sources=tuple(args.approve_mcp_source),
+                    approved_capabilities=tuple(args.approve_capability),
                     attached_document_ids=attached_document_ids,
                     operation=TaskOperation(args.operation),
                 )
@@ -1505,6 +1654,34 @@ def _run_task_store_command(args: argparse.Namespace) -> int:
                     "tasks": tasks,
                 }
             )
+        if args.task_command == "retention-preview":
+            candidates = store.archive_candidates(
+                older_than_days=args.older_than_days,
+                limit=args.limit,
+            )
+            return _print_json_result(
+                {
+                    "status": "READY",
+                    "code": "TASK_RETENTION_PREVIEW_READY",
+                    "older_than_days": args.older_than_days,
+                    "candidate_count": len(candidates),
+                    "candidates": [item.to_dict() for item in candidates],
+                    "deletion_performed": False,
+                }
+            )
+        if args.task_command == "archive-eligible":
+            result = store.archive_eligible(
+                older_than_days=args.older_than_days,
+                limit=args.limit,
+            )
+            return _print_json_result(
+                {
+                    "status": "READY" if not result.blocked else "BLOCKED",
+                    "code": "TASK_RETENTION_ARCHIVED" if not result.blocked else "TASK_RETENTION_PARTIAL",
+                    **result.to_dict(),
+                },
+                0 if not result.blocked else 2,
+            )
         if args.task_command == "watch":
             return _run_task_watch(store, args)
         if args.task_command == "events":
@@ -1556,9 +1733,16 @@ def _run_task_store_command(args: argparse.Namespace) -> int:
         allowed_codes = {
             "TASK_NOT_FOUND",
             "TASK_NOT_ARCHIVABLE",
+            "TASK_EVENT_ARCHIVE_TOO_LARGE",
+            "TASK_EVENT_ARCHIVE_WRITE_FAILED",
+            "TASK_EVENT_ARCHIVE_INTEGRITY_MISMATCH",
+            "TASK_EVENT_ARCHIVE_INVALID",
             "TASK_LIST_LIMIT_INVALID",
             "TASK_EVENT_CURSOR_INVALID",
             "TASK_EVENT_LIMIT_INVALID",
+            "TASK_RETENTION_DAYS_INVALID",
+            "TASK_RETENTION_LIMIT_INVALID",
+            "TASK_RETENTION_TIME_INVALID",
             "TASK_WATCH_INTERVAL_INVALID",
             "TASK_WATCH_TIMEOUT_INVALID",
         }
@@ -1980,10 +2164,11 @@ def _task_approval_summary(
     recipe = interrupt.get("recipe", plan_data.get("verification_recipe"))
     target_test_class = interrupt.get("target_test_class", plan_data.get("target_test_class"))
     interrupt_type = str(interrupt.get("type", "APPROVAL_REQUIRED"))
-    execution_review = interrupt_type == "EXECUTION_APPROVAL_REQUIRED"
+    execution_review = interrupt_type in {"EXECUTION_APPROVAL_REQUIRED", "SHELL_RISK_APPROVAL_REQUIRED"}
+    risk_review = interrupt_type == "SHELL_RISK_APPROVAL_REQUIRED"
     return {
         "stage": state.get("pending_approval_action")
-        or ("EXECUTION_REVIEW" if execution_review else "PLAN_REVIEW"),
+        or ("SHELL_RISK_REVIEW" if risk_review else "EXECUTION_REVIEW" if execution_review else "PLAN_REVIEW"),
         "type": interrupt_type,
         "candidate_files": candidate_files,
         "verification_recipe": recipe if isinstance(recipe, str) else None,
@@ -1991,6 +2176,9 @@ def _task_approval_summary(
         "write_after_approval": execution_review,
         "allowed_decisions": ["approve", "reject"] if execution_review else ["approve", "revise", "reject"],
         "summary": (
+            "此步骤只批准哈希未变化的网络或包管理命令；之后仍需审阅补丁与 Maven 执行。"
+            if risk_review
+            else
             "批准后才会生成受控补丁并执行固定 Maven 配方。"
             if execution_review
             else "请审阅计划范围；确认计划本身不会写入代码。"
@@ -2041,6 +2229,8 @@ def _run_agent(args: argparse.Namespace) -> int:
                         include_uncommitted_changes=args.include_uncommitted_changes,
                     ),
                     approved_mcp_tools=tuple(args.approve_mcp_tool),
+                    approved_mcp_sources=tuple(args.approve_mcp_source),
+                    approved_capabilities=tuple(args.approve_capability),
                     operation=TaskOperation(args.operation),
                 )
                 result = runner.run(request, args.thread_id, permission)

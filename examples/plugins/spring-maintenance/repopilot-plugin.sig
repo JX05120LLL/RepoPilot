@@ -1,0 +1,1 @@
+{"algorithm":"ed25519","key_id":"example.spring.publisher","package_sha256":"6a619b40f1c45988b4b46c418cbce990ea3b8c65b5d71444ab09bed7c482a6b8","schema_version":1,"signature":"U/XP9ywd3wcYwAtevO3TpekzS7nXbajTQha8JY/Qx/vsuiINKY+oCGfyhAXPMAw+lE0QPtYLPDgcxOWS4i7QCQ=="}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from difflib import unified_diff
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -10,8 +11,8 @@ from typing import Callable
 from pydantic import BaseModel, Field
 
 from repopilot_guard.permissions import PermissionGrant
-from repopilot_guard.policy import MavenRecipeName, PolicyGuard, ToolName
-from repopilot_guard.recipes import MavenExecutionResult, MavenRecipeRunner
+from repopilot_guard.policy import GradleRecipeName, MavenRecipeName, NodeRecipeName, PolicyGuard, PytestRecipeName, ToolName
+from repopilot_guard.recipes import GradleExecutionResult, GradleRecipeRunner, MavenExecutionResult, MavenRecipeRunner, NodeExecutionResult, NodeRecipeRunner, PytestExecutionResult, PytestRecipeRunner
 from repopilot_guard.workspace import GitClient
 
 
@@ -32,7 +33,7 @@ class PatchFileChange(BaseModel):
 class PatchProposal(BaseModel):
     summary: str = Field(min_length=1)
     changes: list[PatchFileChange] = Field(min_length=1, max_length=MAX_PATCH_FILES)
-    recipe: MavenRecipeName = MavenRecipeName.TEST
+    recipe: MavenRecipeName | GradleRecipeName | PytestRecipeName | NodeRecipeName = MavenRecipeName.TEST
     test_class: str | None = None
 
 
@@ -48,11 +49,21 @@ class PatchApplyResult:
 
 @dataclass(frozen=True, slots=True)
 class VerificationResult:
-    result: MavenExecutionResult
+    result: MavenExecutionResult | GradleExecutionResult | PytestExecutionResult | NodeExecutionResult
 
     @property
     def status(self) -> str:
         return self.result.status
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedPatchChange:
+    """已在内存校验的单文件替换；预览与实际写入必须共享同一校验规则。"""
+
+    target: Path
+    relative_path: str
+    original: bytes
+    updated: bytes
 
 
 class StructuredPatchApplier:
@@ -61,6 +72,37 @@ class StructuredPatchApplier:
     def __init__(self, git_client: GitClient | None = None) -> None:
         self._git = git_client or GitClient()
 
+    def preview(
+        self,
+        workspace_root: Path,
+        proposal: PatchProposal,
+        permission: PermissionGrant,
+        candidate_files: set[str] | None = None,
+    ) -> PatchApplyResult:
+        """只在内存中生成补丁预览，供执行审批绑定具体文件和 Diff。"""
+
+        root, prepared_or_error = self._prepare(workspace_root, proposal, permission, candidate_files)
+        if isinstance(prepared_or_error, PatchApplyResult):
+            return prepared_or_error
+        prepared = prepared_or_error
+        diff = "".join(
+            line
+            for item in prepared
+            for line in unified_diff(
+                item.original.decode("utf-8").splitlines(keepends=True),
+                item.updated.decode("utf-8").splitlines(keepends=True),
+                fromfile=f"a/{item.relative_path}",
+                tofile=f"b/{item.relative_path}",
+            )
+        )
+        return PatchApplyResult(
+            "READY",
+            "PATCH_PREVIEW_READY",
+            "结构化补丁已通过预校验，等待执行审批。",
+            tuple(item.relative_path for item in prepared),
+            diff,
+        )
+
     def apply(
         self,
         workspace_root: Path,
@@ -68,9 +110,36 @@ class StructuredPatchApplier:
         permission: PermissionGrant,
         candidate_files: set[str] | None = None,
     ) -> PatchApplyResult:
+        root, prepared_or_error = self._prepare(workspace_root, proposal, permission, candidate_files)
+        if isinstance(prepared_or_error, PatchApplyResult):
+            return prepared_or_error
+        prepared = prepared_or_error
+
+        replaced: list[_PreparedPatchChange] = []
+        try:
+            for item in prepared:
+                temporary = item.target.with_name(f".{item.target.name}.repopilot.tmp")
+                temporary.write_bytes(item.updated)
+                os.replace(temporary, item.target)
+                replaced.append(item)
+        except OSError as error:
+            for item in reversed(replaced):
+                item.target.write_bytes(item.original)
+            return PatchApplyResult("FAILED", "PATCH_WRITE_FAILED", f"写入补丁失败且已尝试回滚：{error}")
+
+        diff = self._git.run(root, "diff", "--binary", "HEAD")
+        return PatchApplyResult("READY", "PATCH_APPLIED", "结构化补丁已应用，尚未验证。", tuple(item.relative_path for item in prepared), diff)
+
+    @staticmethod
+    def _prepare(
+        workspace_root: Path,
+        proposal: PatchProposal,
+        permission: PermissionGrant,
+        candidate_files: set[str] | None,
+    ) -> tuple[Path, list[_PreparedPatchChange] | PatchApplyResult]:
         root = workspace_root.expanduser().resolve()
         guard = PolicyGuard(root, permission)
-        prepared: list[tuple[Path, bytes, bytes]] = []
+        prepared: list[_PreparedPatchChange] = []
         total_bytes = 0
         seen: set[Path] = set()
 
@@ -78,26 +147,26 @@ class StructuredPatchApplier:
             target = (root / change.path).resolve()
             decision = guard.check_path(ToolName.APPLY_PATCH, target)
             if not decision.allowed:
-                return PatchApplyResult("BLOCKED", decision.audit_code, decision.reason)
+                return root, PatchApplyResult("BLOCKED", decision.audit_code, decision.reason)
             if candidate_files is not None and change.path not in candidate_files:
-                return PatchApplyResult("BLOCKED", "PATCH_TARGET_NOT_RESEARCHED", f"补丁目标未出现在研究证据中：{change.path}")
+                return root, PatchApplyResult("BLOCKED", "PATCH_TARGET_NOT_RESEARCHED", f"补丁目标未出现在研究证据中：{change.path}")
             if target in seen:
-                return PatchApplyResult("BLOCKED", "PATCH_DUPLICATE_TARGET", f"同一文件只能替换一次：{change.path}")
+                return root, PatchApplyResult("BLOCKED", "PATCH_DUPLICATE_TARGET", f"同一文件只能替换一次：{change.path}")
             seen.add(target)
             if not target.is_file():
-                return PatchApplyResult("BLOCKED", "PATCH_TARGET_NOT_FILE", f"补丁目标不是文件：{change.path}")
+                return root, PatchApplyResult("BLOCKED", "PATCH_TARGET_NOT_FILE", f"补丁目标不是文件：{change.path}")
             if target.stat().st_size > MAX_FILE_BYTES:
-                return PatchApplyResult("BLOCKED", "PATCH_FILE_TOO_LARGE", f"补丁目标超过 {MAX_FILE_BYTES} 字节：{change.path}")
+                return root, PatchApplyResult("BLOCKED", "PATCH_FILE_TOO_LARGE", f"补丁目标超过 {MAX_FILE_BYTES} 字节：{change.path}")
             try:
                 # 保留 CRLF/LF 原样，避免模型使用 LF 时把整个 Windows 文件重写为 LF。
                 original_text = target.read_bytes().decode("utf-8")
             except UnicodeDecodeError:
-                return PatchApplyResult("BLOCKED", "PATCH_BINARY_FILE", f"补丁目标不是 UTF-8 文本：{change.path}")
+                return root, PatchApplyResult("BLOCKED", "PATCH_BINARY_FILE", f"补丁目标不是 UTF-8 文本：{change.path}")
             expected_old_text = _adapt_line_endings(change.expected_old_text, original_text)
             new_text = _adapt_line_endings(change.new_text, original_text)
             matches = original_text.count(expected_old_text)
             if matches != 1:
-                return PatchApplyResult(
+                return root, PatchApplyResult(
                     "BLOCKED",
                     "PATCH_OLD_TEXT_NOT_UNIQUE",
                     f"预期旧文本在 {change.path} 中匹配 {matches} 次，要求恰好一次",
@@ -106,23 +175,16 @@ class StructuredPatchApplier:
             updated = original_text.replace(expected_old_text, new_text, 1).encode("utf-8")
             total_bytes += len(updated)
             if total_bytes > MAX_PATCH_BYTES:
-                return PatchApplyResult("BLOCKED", "PATCH_TOTAL_TOO_LARGE", "结构化补丁总量超过限制")
-            prepared.append((target, original_text.encode("utf-8"), updated))
-
-        replaced: list[tuple[Path, bytes]] = []
-        try:
-            for target, original, updated in prepared:
-                temporary = target.with_name(f".{target.name}.repopilot.tmp")
-                temporary.write_bytes(updated)
-                os.replace(temporary, target)
-                replaced.append((target, original))
-        except OSError as error:
-            for target, original in reversed(replaced):
-                target.write_bytes(original)
-            return PatchApplyResult("FAILED", "PATCH_WRITE_FAILED", f"写入补丁失败且已尝试回滚：{error}")
-
-        diff = self._git.run(root, "diff", "--binary", "HEAD")
-        return PatchApplyResult("READY", "PATCH_APPLIED", "结构化补丁已应用，尚未验证。", tuple(change.path for change in proposal.changes), diff)
+                return root, PatchApplyResult("BLOCKED", "PATCH_TOTAL_TOO_LARGE", "结构化补丁总量超过限制")
+            prepared.append(
+                _PreparedPatchChange(
+                    target=target,
+                    relative_path=target.relative_to(root).as_posix(),
+                    original=original_text.encode("utf-8"),
+                    updated=updated,
+                )
+            )
+        return root, prepared
 
     def repair_snapshot(
         self,
@@ -154,8 +216,11 @@ class StructuredPatchApplier:
 
 
 class VerificationRunner:
-    def __init__(self, maven_runner: MavenRecipeRunner | None = None) -> None:
+    def __init__(self, maven_runner: MavenRecipeRunner | None = None, gradle_runner: GradleRecipeRunner | None = None, pytest_runner: PytestRecipeRunner | None = None, node_runner: NodeRecipeRunner | None = None) -> None:
         self._maven_runner = maven_runner or MavenRecipeRunner()
+        self._gradle_runner = gradle_runner or GradleRecipeRunner()
+        self._pytest_runner = pytest_runner or PytestRecipeRunner()
+        self._node_runner = node_runner or NodeRecipeRunner()
 
     def run(
         self,
@@ -164,6 +229,36 @@ class VerificationRunner:
         permission: PermissionGrant,
         cancellation_requested: Callable[[], bool] | None = None,
     ) -> VerificationResult:
+        if isinstance(proposal.recipe, GradleRecipeName):
+            return VerificationResult(
+                self._gradle_runner.run(
+                    workspace_root,
+                    proposal.recipe,
+                    permission,
+                    proposal.test_class,
+                    cancellation_requested=cancellation_requested,
+                )
+            )
+        if isinstance(proposal.recipe, PytestRecipeName):
+            return VerificationResult(
+                self._pytest_runner.run(
+                    workspace_root,
+                    proposal.recipe,
+                    permission,
+                    proposal.test_class,
+                    cancellation_requested=cancellation_requested,
+                )
+            )
+        if isinstance(proposal.recipe, NodeRecipeName):
+            return VerificationResult(
+                self._node_runner.run(
+                    workspace_root,
+                    proposal.recipe,
+                    permission,
+                    proposal.test_class,
+                    cancellation_requested=cancellation_requested,
+                )
+            )
         if cancellation_requested is None:
             return VerificationResult(
                 self._maven_runner.run(workspace_root, proposal.recipe, permission, proposal.test_class)

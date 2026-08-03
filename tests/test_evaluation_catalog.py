@@ -12,15 +12,80 @@ from repopilot_guard import __version__
 from repopilot_guard.evaluation import (
     BaselineValidator,
     EvaluationCatalog,
+    EvaluationMatrixRunner,
     EvaluationProviderSummary,
     EvaluationRunner,
     FixtureBuilder,
 )
 from repopilot_guard.cli import main
-from repopilot_guard.recipes import MavenExecutionResult
+from repopilot_guard.recipes import GradleExecutionResult, MavenExecutionResult, NodeExecutionResult, PytestExecutionResult
+from repopilot_guard.policy import GradleRecipeName, NodeRecipeName, PytestRecipeName
 
 
 class EvaluationCatalogTests(unittest.TestCase):
+    def test_baseline_validator_dispatches_gradle_and_pytest_and_projects_generic_evidence(self) -> None:
+        class SingleTaskCatalog:
+            def __init__(self, task: object, catalog_path: Path) -> None:
+                self._task = task
+                self.catalog_path = catalog_path
+
+            def load(self) -> tuple[object, ...]:
+                return (self._task,)
+
+        class FakeGradleRunner:
+            def run(self, repository: Path, recipe: object, permission: object, test_class: str | None = None) -> GradleExecutionResult:
+                self.repository = repository
+                return GradleExecutionResult("PASSED", "GRADLE_SUCCEEDED", recipe, ("gradle", "test"), 0, 8, "ok", "", ("build/test-results/test/TEST-demo.xml",))
+
+        class FakePytestRunner:
+            def run(self, repository: Path, recipe: object, permission: object, test_class: str | None = None) -> PytestExecutionResult:
+                self.repository = repository
+                return PytestExecutionResult("PASSED", "PYTEST_SUCCEEDED", recipe, ("python", "-m", "pytest", "-q"), 0, 6, "1 passed", "", ())
+
+        class FakeNodeRunner:
+            def run(self, repository: Path, recipe: object, permission: object, test_class: str | None = None) -> NodeExecutionResult:
+                self.repository = repository
+                return NodeExecutionResult("PASSED", "NODE_TEST_SUCCEEDED", recipe, ("npm", "run", "test", "--silent"), 0, 5, "ok", "", ())
+
+        catalog_path = Path(__file__).parents[1] / "evaluation" / "tasks.json"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            fixtures = root / "fixtures"
+            for task_id in ("G01", "P01", "N01"):
+                repository = fixtures / task_id / "repository"
+                repository.mkdir(parents=True)
+                FixtureBuilder._write_base_project(repository)
+                FixtureBuilder._git(repository, "init", "-b", "main")
+                FixtureBuilder._git(repository, "config", "user.name", "RepoPilot Test")
+                FixtureBuilder._git(repository, "config", "user.email", "test@example.invalid")
+                FixtureBuilder._git(repository, "add", ".")
+                FixtureBuilder._git(repository, "commit", "-m", "fixture")
+
+            gradle_task = SimpleNamespace(task_id="G01", category="gradle", recipe="gradle_test", target_test_class=None, baseline_status="PASSED")
+            gradle_results = BaselineValidator(
+                SingleTaskCatalog(gradle_task, catalog_path),
+                gradle_runner=FakeGradleRunner(),
+            ).validate(fixtures, root / "gradle-results")
+            pytest_task = SimpleNamespace(task_id="P01", category="python", recipe="pytest_test", target_test_class=None, baseline_status="PASSED")
+            pytest_results = BaselineValidator(
+                SingleTaskCatalog(pytest_task, catalog_path),
+                pytest_runner=FakePytestRunner(),
+            ).validate(fixtures, root / "pytest-results")
+            node_task = SimpleNamespace(task_id="N01", category="node", recipe="npm_test", target_test_class=None, baseline_status="PASSED")
+            node_results = BaselineValidator(
+                SingleTaskCatalog(node_task, catalog_path),
+                node_runner=FakeNodeRunner(),
+            ).validate(fixtures, root / "node-results")
+
+        self.assertEqual("gradle", gradle_results[0].build_system)
+        self.assertEqual("gradle_test_results", gradle_results[0].report_kind)
+        self.assertEqual(("build/test-results/test/TEST-demo.xml",), gradle_results[0].verification_reports)
+        self.assertEqual("pytest", pytest_results[0].build_system)
+        self.assertEqual("pytest_output", pytest_results[0].report_kind)
+        self.assertEqual((), pytest_results[0].verification_reports)
+        self.assertEqual("node", node_results[0].build_system)
+        self.assertEqual("node_test_output", node_results[0].report_kind)
+
     def test_catalog_has_fifteen_unique_tasks_and_safe_assertions(self) -> None:
         tasks = json.loads((Path(__file__).parents[1] / "evaluation" / "tasks.json").read_text(encoding="utf-8"))
         self.assertEqual(15, len(tasks))
@@ -32,6 +97,33 @@ class EvaluationCatalogTests(unittest.TestCase):
             {item["id"] for item in tasks if item.get("baseline_status") == "FAILED"},
         )
         self.assertEqual("com.repopilot.demo.OrderRequestValidationTest", tasks[3]["target_test_class"])
+
+    def test_profile_catalog_prepares_gradle_pytest_and_node_fixtures_with_normal_failure_safety_and_resume_cases(self) -> None:
+        catalog_path = Path(__file__).parents[1] / "evaluation" / "profiles" / "tasks.json"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "profile-fixtures"
+            results = FixtureBuilder(EvaluationCatalog(catalog_path)).prepare_all(output)
+            manifest = json.loads((output / "fixtures.json").read_text(encoding="utf-8"))
+            self.assertTrue((output / "G01/repository/build.gradle.kts").is_file())
+            gradle_build = (output / "G01/repository/build.gradle.kts").read_text(encoding="utf-8")
+            self.assertIn("org.junit.platform:junit-platform-launcher", gradle_build)
+            self.assertTrue((output / "G01/repository/src/test/java/com/repopilot/gradle/OrderServiceTest.java").is_file())
+            self.assertTrue((output / "P01/repository/pyproject.toml").is_file())
+            self.assertTrue((output / "P01/repository/tests/test_service.py").is_file())
+            self.assertTrue((output / "N01/repository/package.json").is_file())
+            self.assertTrue((output / "N01/repository/package-lock.json").is_file())
+            npm_package = json.loads((output / "N02/repository/package.json").read_text(encoding="utf-8"))
+            self.assertEqual("node --test", npm_package["scripts"]["test"])
+            self.assertTrue((output / "N02/repository/test/failure.test.js").is_file())
+            self.assertTrue((output / "Q01/repository/package.json").is_file())
+            self.assertTrue((output / "Q01/repository/pnpm-lock.yaml").is_file())
+            self.assertTrue((output / "Q02/repository/test/failure.test.js").is_file())
+            self.assertTrue((output / "G03/repository/.env").is_file())
+
+        self.assertEqual(16, len(results))
+        self.assertEqual(16, manifest["fixture_count"])
+        self.assertEqual({"java_gradle", "python_pytest", "node_npm", "node_pnpm"}, {result.profile for result in results})
+        self.assertTrue(all(result.expected_paths_present for result in results))
 
     def test_prepares_fifteen_independent_git_fixtures_and_machine_readable_manifest(self) -> None:
         catalog_path = Path(__file__).parents[1] / "evaluation" / "tasks.json"
@@ -216,6 +308,96 @@ class EvaluationCatalogTests(unittest.TestCase):
             self.assertTrue(report_path.is_file())
             self.assertTrue((root / "results" / "evaluation-report.csv").is_file())
             self.assertTrue((root / "results" / "evaluation-report.md").is_file())
+
+    def test_matrix_runner_keeps_each_run_evidence_and_aggregates_stability(self) -> None:
+        class StableGraphRunner:
+            def run(self, _request: object, _thread_id: str, _permission: object) -> object:
+                return SimpleNamespace(
+                    status="REPORT",
+                    verdict="PASSED",
+                    pending_approval=False,
+                    state={
+                        "git_diff": "diff --git",
+                        "patch_result": {"paths": ["src/main/java/com/repopilot/demo/web/OrderController.java"]},
+                        "verification_result": {
+                            "status": "PASSED",
+                            "code": "MAVEN_SUCCEEDED",
+                            "recipe": "test",
+                            "argv": ["mvn", "-q", "test"],
+                            "exit_code": 0,
+                            "duration_ms": 50,
+                            "surefire_reports": [],
+                        },
+                    },
+                )
+
+        catalog_path = Path(__file__).parents[1] / "evaluation" / "tasks.json"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            fixtures = root / "fixtures"
+            FixtureBuilder(EvaluationCatalog(catalog_path)).prepare_all(fixtures)
+            matrix = EvaluationMatrixRunner(
+                EvaluationCatalog(catalog_path),
+                StableGraphRunner,
+                EvaluationProviderSummary(chat_model="safe-model", embedding_model="sk-secret-token"),
+            ).run(
+                fixtures,
+                root / "matrix",
+                repetitions=3,
+                task_ids={"J01"},
+            )
+            report_text = (root / "matrix" / "evaluation-matrix.json").read_text(encoding="utf-8")
+            run_report_exists = (root / "matrix" / "run-001" / "evaluation-report.json").is_file()
+            csv_exists = (root / "matrix" / "evaluation-matrix.csv").is_file()
+            markdown_exists = (root / "matrix" / "evaluation-matrix.md").is_file()
+
+        self.assertTrue(matrix.all_matched)
+        self.assertEqual(3, matrix.repetitions)
+        self.assertEqual(3, len(matrix.runs))
+        self.assertEqual(("PASSED", 1), matrix.runs[0].status_counts[0])
+        self.assertEqual("J01", matrix.tasks[0].task_id)
+        self.assertEqual(3, matrix.tasks[0].matched_expectations)
+        self.assertEqual(1.0, matrix.tasks[0].match_rate)
+        self.assertNotIn("sk-secret-token", report_text)
+        self.assertTrue(run_report_exists)
+        self.assertTrue(csv_exists)
+        self.assertTrue(markdown_exists)
+
+    def test_matrix_runner_rejects_single_repetition_before_writing_evidence(self) -> None:
+        catalog_path = Path(__file__).parents[1] / "evaluation" / "tasks.json"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            with self.assertRaisesRegex(ValueError, "EVALUATION_MATRIX_REPETITIONS_INVALID"):
+                EvaluationMatrixRunner(EvaluationCatalog(catalog_path), object).run(
+                    root / "fixtures",
+                    root / "matrix",
+                    repetitions=1,
+                    task_ids={"J01"},
+                )
+
+        self.assertFalse((root / "matrix").exists())
+
+    def test_matrix_cli_rejects_invalid_repetitions_before_loading_model_configuration(self) -> None:
+        stream = StringIO()
+        with redirect_stdout(stream):
+            exit_code = main(
+                [
+                    "evaluate",
+                    "matrix",
+                    "--fixtures",
+                    "C:/fixtures",
+                    "--output",
+                    "C:/matrix",
+                    "--task-id",
+                    "J01",
+                    "--repetitions",
+                    "1",
+                ]
+            )
+
+        payload = json.loads(stream.getvalue())
+        self.assertEqual(2, exit_code)
+        self.assertEqual("EVALUATION_MATRIX_REPETITIONS_INVALID", payload["code"])
 
     def test_runner_rejects_green_maven_result_when_patch_is_outside_expected_scope(self) -> None:
         class OutOfScopeGraphRunner:

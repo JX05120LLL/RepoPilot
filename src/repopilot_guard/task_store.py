@@ -20,6 +20,13 @@ _INLINE_SECRET = re.compile(
 )
 _TASK_TITLE_MAX_LENGTH = 80
 _TASK_OPERATIONS = frozenset({"change", "research"})
+_EVENT_ARCHIVE_KIND = "event_archive"
+_EVENT_ARCHIVE_FILE_NAME = "events.jsonl"
+_EVENT_ARCHIVE_MAX_BYTES = 4 * 1024 * 1024
+_ARCHIVABLE_STATUSES = frozenset({"REPORT", "BLOCKED", "FAILED", "CANCELLED"})
+_RETENTION_MAX_DAYS = 36_500
+_MCP_ARTIFACT_PATH = re.compile(r"^mcp/outputs/([0-9a-f]{64})\.json$")
+_MCP_ARTIFACT_MAX_BYTES = 512 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +56,7 @@ class StoredTask:
     cancellation_requested_at: str | None
     cancellation_reason: str | None
     archived_at: str | None
+    event_archive_last_sequence: int
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -75,6 +83,7 @@ class StoredTask:
             "cancellation_requested_at": self.cancellation_requested_at,
             "cancellation_reason": self.cancellation_reason,
             "archived_at": self.archived_at,
+            "event_archive_last_sequence": self.event_archive_last_sequence,
             "interrupts": [],
         }
 
@@ -158,6 +167,53 @@ class StoredTaskArtifactVersion:
             "sha256": self.sha256,
             "size_bytes": self.size_bytes,
             "created_at": self.created_at,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class TaskArchiveCandidate:
+    """可归档任务的脱敏容量投影；仅用于显式保留治理，不承担删除语义。"""
+
+    thread_id: str
+    task_id: str
+    display_title: str | None
+    status: str
+    verdict: str | None
+    updated_at: str
+    live_event_count: int
+    artifact_count: int
+    artifact_bytes: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "thread_id": self.thread_id,
+            "task_id": self.task_id,
+            "display_title": self.display_title,
+            "status": self.status,
+            "verdict": self.verdict,
+            "updated_at": self.updated_at,
+            "live_event_count": self.live_event_count,
+            "artifact_count": self.artifact_count,
+            "artifact_bytes": self.artifact_bytes,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class TaskArchiveBatchResult:
+    """批量归档的可审计结果；归档失败不会被伪装为成功。"""
+
+    older_than_days: int
+    archived: tuple[TaskArchiveCandidate, ...]
+    blocked: tuple[dict[str, str], ...]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "older_than_days": self.older_than_days,
+            "archived_count": len(self.archived),
+            "blocked_count": len(self.blocked),
+            "archived": [item.to_dict() for item in self.archived],
+            "blocked": list(self.blocked),
+            "deletion_performed": False,
         }
 
 
@@ -428,14 +484,15 @@ class TaskStore:
             return tuple(recovered)
 
     def archive(self, thread_id: str) -> StoredTask:
-        """归档只隐藏任务列表，不删除证据、产物或 LangGraph checkpoint。"""
+        """归档终态任务，并将历史 SSE 事件转为可校验的本地产物。"""
 
         with self._lock:
             task = self._get_locked(thread_id)
             if task.archived_at:
                 return task
-            if task.status not in {"REPORT", "BLOCKED", "CANCELLED"} or task.lease_expires_at:
+            if task.status not in _ARCHIVABLE_STATUSES or task.lease_expires_at:
                 raise ValueError("TASK_NOT_ARCHIVABLE")
+            self._archive_events_locked(task)
             now = self._now()
             self._connection.execute(
                 "UPDATE tasks SET archived_at = ?, updated_at = ? WHERE thread_id = ?",
@@ -444,6 +501,95 @@ class TaskStore:
             self._append_event_locked(thread_id, "TASK_ARCHIVED", {"archived_at": now})
             self._connection.commit()
             return self._get_locked(thread_id)
+
+    def archive_candidates(
+        self,
+        *,
+        older_than_days: int,
+        limit: int = 100,
+        now: str | None = None,
+    ) -> tuple[TaskArchiveCandidate, ...]:
+        """预演可归档终态任务，绝不改变任务、事件、产物或 checkpoint。"""
+
+        _validate_retention_request(older_than_days, limit)
+        cutoff = self._retention_cutoff(older_than_days, now)
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT
+                    task.thread_id,
+                    task.task_id,
+                    task.display_title,
+                    task.status,
+                    task.verdict,
+                    task.updated_at,
+                    COALESCE(events.live_event_count, 0) AS live_event_count,
+                    COALESCE(artifacts.artifact_count, 0) AS artifact_count,
+                    COALESCE(artifacts.artifact_bytes, 0) AS artifact_bytes
+                FROM tasks AS task
+                LEFT JOIN (
+                    SELECT thread_id, COUNT(*) AS live_event_count
+                    FROM task_events
+                    GROUP BY thread_id
+                ) AS events ON events.thread_id = task.thread_id
+                LEFT JOIN (
+                    SELECT thread_id, SUM(size_bytes) AS artifact_bytes, COUNT(*) AS artifact_count
+                    FROM (
+                        SELECT thread_id, size_bytes FROM task_artifacts
+                        UNION ALL
+                        SELECT thread_id, size_bytes FROM task_artifact_versions
+                    )
+                    GROUP BY thread_id
+                ) AS artifacts ON artifacts.thread_id = task.thread_id
+                WHERE task.archived_at IS NULL
+                  AND task.lease_expires_at IS NULL
+                  AND task.status IN ('REPORT', 'BLOCKED', 'FAILED', 'CANCELLED')
+                  AND task.updated_at <= ?
+                ORDER BY task.updated_at ASC, task.thread_id ASC
+                LIMIT ?
+                """,
+                (cutoff, limit),
+            ).fetchall()
+            return tuple(
+                TaskArchiveCandidate(
+                    thread_id=row["thread_id"],
+                    task_id=row["task_id"],
+                    display_title=row["display_title"],
+                    status=row["status"],
+                    verdict=row["verdict"],
+                    updated_at=row["updated_at"],
+                    live_event_count=int(row["live_event_count"]),
+                    artifact_count=int(row["artifact_count"]),
+                    artifact_bytes=int(row["artifact_bytes"]),
+                )
+                for row in rows
+            )
+
+    def archive_eligible(
+        self,
+        *,
+        older_than_days: int,
+        limit: int = 100,
+        now: str | None = None,
+    ) -> TaskArchiveBatchResult:
+        """显式批量归档已过期终态任务；从不删除任务、证据、产物或 checkpoint。"""
+
+        candidates = self.archive_candidates(older_than_days=older_than_days, limit=limit, now=now)
+        archived: list[TaskArchiveCandidate] = []
+        blocked: list[dict[str, str]] = []
+        for candidate in candidates:
+            try:
+                self.archive(candidate.thread_id)
+            except ValueError as error:
+                # 候选到执行间可能发生恢复或并发操作；逐项如实报告，不扩大操作范围。
+                blocked.append({"thread_id": candidate.thread_id, "code": str(error)})
+            else:
+                archived.append(candidate)
+        return TaskArchiveBatchResult(
+            older_than_days=older_than_days,
+            archived=tuple(archived),
+            blocked=tuple(blocked),
+        )
 
     def rename(self, thread_id: str, display_title: str) -> StoredTask:
         """更新侧栏会话标题，同时保留原始任务描述、证据和 checkpoint。"""
@@ -462,6 +608,77 @@ class TaskStore:
                 thread_id,
                 "TASK_RENAMED",
                 {"status": task.status},
+            )
+            self._connection.commit()
+            return self._get_locked(thread_id)
+
+    def record_workspace_branch_created(self, thread_id: str, branch: str) -> StoredTask:
+        """记录用户将终态隔离工作区转为 Git 分支的显式动作。"""
+
+        with self._lock:
+            task = self._get_locked(thread_id)
+            if task.archived_at:
+                raise ValueError("WORKSPACE_TASK_ARCHIVED")
+            if task.status not in {"REPORT", "BLOCKED", "FAILED", "CANCELLED"} or task.lease_expires_at:
+                raise ValueError("WORKSPACE_TASK_NOT_FINISHED")
+            now = self._now()
+            self._connection.execute(
+                "UPDATE tasks SET updated_at = ? WHERE thread_id = ?",
+                (now, thread_id),
+            )
+            self._append_event_locked(
+                thread_id,
+                "WORKSPACE_BRANCH_CREATED",
+                {"status": task.status, "branch": branch},
+            )
+            self._connection.commit()
+            return self._get_locked(thread_id)
+
+    def workspace_handoff_recorded(self, thread_id: str) -> bool:
+        """交接只能成功记录一次，避免界面重试重复写入 Local。"""
+
+        with self._lock:
+            self._get_locked(thread_id)
+            row = self._connection.execute(
+                "SELECT 1 FROM task_events WHERE thread_id = ? AND event_type = 'WORKSPACE_LOCAL_HANDOFF_APPLIED' LIMIT 1",
+                (thread_id,),
+            ).fetchone()
+            return row is not None
+
+    def record_workspace_local_handoff(
+        self,
+        thread_id: str,
+        *,
+        diff_sha256: str,
+        changed_file_count: int,
+    ) -> StoredTask:
+        """记录用户确认后的 Local 交接，不存补丁正文或源仓库路径。"""
+
+        if not re.fullmatch(r"[0-9a-f]{64}", diff_sha256) or changed_file_count < 1:
+            raise ValueError("WORKSPACE_HANDOFF_AUDIT_INVALID")
+        with self._lock:
+            task = self._get_locked(thread_id)
+            if task.archived_at:
+                raise ValueError("WORKSPACE_TASK_ARCHIVED")
+            if task.status not in {"REPORT", "BLOCKED", "FAILED", "CANCELLED"} or task.lease_expires_at:
+                raise ValueError("WORKSPACE_TASK_NOT_FINISHED")
+            if self.workspace_handoff_recorded(thread_id):
+                raise ValueError("LOCAL_HANDOFF_ALREADY_APPLIED")
+            now = self._now()
+            self._connection.execute(
+                "UPDATE tasks SET updated_at = ? WHERE thread_id = ?",
+                (now, thread_id),
+            )
+            self._append_event_locked(
+                thread_id,
+                "WORKSPACE_LOCAL_HANDOFF_APPLIED",
+                {
+                    "status": task.status,
+                    "code": "LOCAL_HANDOFF_APPLIED",
+                    "audit_code": "USER_GRANTED_FULL_ACCESS",
+                    "diff_sha256": diff_sha256,
+                    "changed_file_count": changed_file_count,
+                },
             )
             self._connection.commit()
             return self._get_locked(thread_id)
@@ -619,30 +836,9 @@ class TaskStore:
         if limit is not None and not 1 <= limit <= 1000:
             raise ValueError("TASK_EVENT_LIMIT_INVALID")
         with self._lock:
-            self._get_locked(thread_id)
-            query = """
-                SELECT event.sequence, event.event_id, event.event_type, event.payload_json, event.created_at, task.trace_id
-                FROM task_events AS event
-                INNER JOIN tasks AS task ON task.thread_id = event.thread_id
-                WHERE event.thread_id = ? AND event.sequence > ?
-                ORDER BY event.sequence ASC
-            """
-            parameters: tuple[object, ...] = (thread_id, sequence)
-            if limit is not None:
-                query += " LIMIT ?"
-                parameters = (*parameters, limit)
-            rows = self._connection.execute(query, parameters).fetchall()
-        return tuple(
-            StoredTaskEvent(
-                sequence=int(row["sequence"]),
-                event_id=row["event_id"],
-                trace_id=row["trace_id"],
-                event_type=row["event_type"],
-                payload=json.loads(row["payload_json"]),
-                created_at=row["created_at"],
-            )
-            for row in rows
-        )
+            task = self._get_locked(thread_id)
+            events = [event for event in self._all_events_locked(task) if event.sequence > sequence]
+            return tuple(events[:limit] if limit is not None else events)
 
     def recent_events(self, thread_id: str, *, limit: int = 8) -> tuple[StoredTaskEvent, ...]:
         """返回最近的脱敏事件，并按发生顺序排列，供只读任务审阅使用。"""
@@ -650,29 +846,8 @@ class TaskStore:
         if not 1 <= limit <= 50:
             raise ValueError("TASK_EVENT_LIMIT_INVALID")
         with self._lock:
-            self._get_locked(thread_id)
-            rows = self._connection.execute(
-                """
-                SELECT event.sequence, event.event_id, event.event_type, event.payload_json, event.created_at, task.trace_id
-                FROM task_events AS event
-                INNER JOIN tasks AS task ON task.thread_id = event.thread_id
-                WHERE event.thread_id = ?
-                ORDER BY event.sequence DESC
-                LIMIT ?
-                """,
-                (thread_id, limit),
-            ).fetchall()
-        return tuple(
-            StoredTaskEvent(
-                sequence=int(row["sequence"]),
-                event_id=row["event_id"],
-                trace_id=row["trace_id"],
-                event_type=row["event_type"],
-                payload=json.loads(row["payload_json"]),
-                created_at=row["created_at"],
-            )
-            for row in reversed(rows)
-        )
+            task = self._get_locked(thread_id)
+            return tuple(self._all_events_locked(task)[-limit:])
 
     def telemetry(self, thread_id: str) -> dict[str, object]:
         """按已持久化证据事件重建遥测，进程重启后仍可查询。"""
@@ -776,11 +951,7 @@ class TaskStore:
             ).fetchone()
             if existing:
                 return
-        sequence = int(
-            self._connection.execute(
-                "SELECT COALESCE(MAX(sequence), 0) FROM task_events WHERE thread_id = ?", (thread_id,)
-            ).fetchone()[0]
-        ) + 1
+        sequence = self._latest_event_sequence_locked(thread_id) + 1
         event_id = f"{thread_id}:{sequence}"
         self._connection.execute(
             """
@@ -796,6 +967,171 @@ class TaskStore:
                 source_index,
                 self._now(),
             ),
+        )
+
+    def _latest_event_sequence_locked(self, thread_id: str) -> int:
+        """归档后仍沿用单调 sequence，避免 SSE 游标和 Event ID 倒退。"""
+
+        live_sequence = int(
+            self._connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) FROM task_events WHERE thread_id = ?", (thread_id,)
+            ).fetchone()[0]
+        )
+        archived_sequence = int(
+            self._connection.execute(
+                "SELECT COALESCE(event_archive_last_sequence, 0) FROM tasks WHERE thread_id = ?", (thread_id,)
+            ).fetchone()[0]
+        )
+        return max(live_sequence, archived_sequence)
+
+    def _all_events_locked(self, task: StoredTask) -> list[StoredTaskEvent]:
+        archived = list(self._archived_events_locked(task))
+        live = self._live_events_locked(task.thread_id)
+        events = [*archived, *live]
+        events.sort(key=lambda item: item.sequence)
+        seen_sequences: set[int] = set()
+        for event in events:
+            if event.sequence in seen_sequences:
+                raise ValueError("TASK_EVENT_ARCHIVE_INVALID")
+            seen_sequences.add(event.sequence)
+        return events
+
+    def _live_events_locked(self, thread_id: str) -> list[StoredTaskEvent]:
+        rows = self._connection.execute(
+            """
+            SELECT event.sequence, event.event_id, event.event_type, event.payload_json, event.created_at, task.trace_id
+            FROM task_events AS event
+            INNER JOIN tasks AS task ON task.thread_id = event.thread_id
+            WHERE event.thread_id = ?
+            ORDER BY event.sequence ASC
+            """,
+            (thread_id,),
+        ).fetchall()
+        return [
+            StoredTaskEvent(
+                sequence=int(row["sequence"]),
+                event_id=row["event_id"],
+                trace_id=row["trace_id"],
+                event_type=row["event_type"],
+                payload=json.loads(row["payload_json"]),
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+
+    def _archived_events_locked(self, task: StoredTask) -> tuple[StoredTaskEvent, ...]:
+        row = self._connection.execute(
+            """
+            SELECT thread_id, kind, relative_path, sha256, size_bytes, created_at, updated_at
+            FROM task_artifacts WHERE thread_id = ? AND kind = ?
+            """,
+            (task.thread_id, _EVENT_ARCHIVE_KIND),
+        ).fetchone()
+        if not row:
+            return ()
+        artifact = self._artifact_from_row(row)
+        try:
+            content = self._read_artifact_content_locked(task, artifact, max_bytes=_EVENT_ARCHIVE_MAX_BYTES)
+        except ValueError as error:
+            code = str(error)
+            if code in {"TASK_ARTIFACT_TOO_LARGE", "TASK_ARTIFACT_UNAVAILABLE", "TASK_ARTIFACT_INTEGRITY_MISMATCH"}:
+                raise ValueError("TASK_EVENT_ARCHIVE_INTEGRITY_MISMATCH") from error
+            raise
+        events: list[StoredTaskEvent] = []
+        previous_sequence = 0
+        for line in content.splitlines():
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError("TASK_EVENT_ARCHIVE_INVALID") from error
+            event = _archived_event_from_dict(raw, task)
+            if event.sequence <= previous_sequence:
+                raise ValueError("TASK_EVENT_ARCHIVE_INVALID")
+            previous_sequence = event.sequence
+            events.append(event)
+        if task.event_archive_last_sequence and (not events or events[-1].sequence != task.event_archive_last_sequence):
+            raise ValueError("TASK_EVENT_ARCHIVE_INVALID")
+        return tuple(events)
+
+    def _archive_events_locked(self, task: StoredTask) -> None:
+        """将终态任务的已有事件转为公开字段 JSONL，并在提交后释放 SQLite 行。"""
+
+        existing = list(self._archived_events_locked(task))
+        live = self._live_events_locked(task.thread_id)
+        if not live:
+            return
+        all_events = [*existing, *live]
+        all_events.sort(key=lambda item: item.sequence)
+        if len({event.sequence for event in all_events}) != len(all_events):
+            raise ValueError("TASK_EVENT_ARCHIVE_INVALID")
+        content = "".join(
+            json.dumps(event.to_public_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+            for event in all_events
+        ).encode("utf-8")
+        if len(content) > _EVENT_ARCHIVE_MAX_BYTES:
+            raise ValueError("TASK_EVENT_ARCHIVE_TOO_LARGE")
+        try:
+            self._write_artifact_locked(task, _EVENT_ARCHIVE_KIND, _EVENT_ARCHIVE_FILE_NAME, content)
+        except OSError as error:
+            raise ValueError("TASK_EVENT_ARCHIVE_WRITE_FAILED") from error
+        last_sequence = all_events[-1].sequence
+        self._connection.execute("DELETE FROM task_events WHERE thread_id = ?", (task.thread_id,))
+        self._connection.execute(
+            "UPDATE tasks SET event_archive_last_sequence = ? WHERE thread_id = ?",
+            (last_sequence, task.thread_id),
+        )
+        self._append_event_locked(
+            task.thread_id,
+            "TASK_EVENTS_ARCHIVED",
+            {"artifact_count": 1, "source_count": len(live), "status": task.status},
+        )
+
+    def _write_artifact_locked(self, task: StoredTask, kind: str, file_name: str, content: bytes) -> None:
+        """写当前产物并保存不可变版本；所有路径和名称均由服务端固定。"""
+
+        path = self._artifact_path_locked(task, file_name)
+        now = self._now()
+        content_sha256 = sha256(content).hexdigest()
+        current = self._connection.execute(
+            """
+            SELECT thread_id, kind, relative_path, sha256, size_bytes, created_at, updated_at
+            FROM task_artifacts WHERE thread_id = ? AND kind = ?
+            """,
+            (task.thread_id, kind),
+        ).fetchone()
+        if current and current["sha256"] == content_sha256:
+            return
+        version = int(
+            self._connection.execute(
+                """
+                SELECT COALESCE(MAX(version), 0) FROM task_artifact_versions
+                WHERE thread_id = ? AND kind = ?
+                """,
+                (task.thread_id, kind),
+            ).fetchone()[0]
+        ) + 1
+        history_relative_path = _artifact_history_relative_path(kind, version, file_name, content_sha256)
+        history_path = self._artifact_path_locked(task, history_relative_path)
+        _atomic_write(history_path, content)
+        _atomic_write(path, content)
+        self._connection.execute(
+            """
+            INSERT INTO task_artifacts(thread_id, kind, relative_path, sha256, size_bytes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(thread_id, kind) DO UPDATE SET
+                relative_path = excluded.relative_path,
+                sha256 = excluded.sha256,
+                size_bytes = excluded.size_bytes,
+                updated_at = excluded.updated_at
+            """,
+            (task.thread_id, kind, file_name, content_sha256, len(content), now, now),
+        )
+        self._connection.execute(
+            """
+            INSERT INTO task_artifact_versions(thread_id, kind, version, relative_path, sha256, size_bytes, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (task.thread_id, kind, version, history_relative_path, content_sha256, len(content), now),
         )
 
     def _sync_artifacts_locked(self, task: StoredTask, graph_state: dict[str, object]) -> None:
@@ -889,6 +1225,78 @@ class TaskStore:
                     "TASK_ARTIFACT_WRITE_FAILED",
                     {"kind": kind, "code": type(error).__name__},
                 )
+        self._sync_mcp_output_artifacts_locked(task, graph_state.get("tool_events"))
+
+    def _sync_mcp_output_artifacts_locked(self, task: StoredTask, events: object) -> None:
+        """登记 MCP 原始输出前重新校验事件引用，绝不把 checkpoint 中的路径当作可信输入。"""
+
+        if not isinstance(events, list):
+            return
+        seen: set[str] = set()
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            reference = event.get("artifact")
+            if not isinstance(reference, dict) or reference.get("status") != "READY":
+                continue
+            if reference.get("kind") != "mcp_tool_output":
+                continue
+            validated = self._validated_mcp_artifact_reference(task, reference)
+            if validated is None:
+                self._append_event_locked(
+                    task.thread_id,
+                    "MCP_ARTIFACT_REFERENCE_REJECTED",
+                    {"code": "MCP_ARTIFACT_REFERENCE_INVALID"},
+                )
+                continue
+            relative_path, digest, expected_size = validated
+            if digest in seen:
+                continue
+            seen.add(digest)
+            try:
+                source = self._artifact_path_locked(task, relative_path)
+                content = source.read_bytes()
+                if len(content) != expected_size or len(content) > _MCP_ARTIFACT_MAX_BYTES:
+                    raise OSError("MCP_ARTIFACT_SIZE_MISMATCH")
+                if sha256(content).hexdigest() != digest:
+                    raise OSError("MCP_ARTIFACT_INTEGRITY_MISMATCH")
+                # kind 不接收外部输入，避免同名工具污染其他任务产物。
+                self._write_artifact_locked(task, f"mcp_output_{digest[:16]}", relative_path, content)
+            except OSError as error:
+                self._append_event_locked(
+                    task.thread_id,
+                    "MCP_ARTIFACT_REGISTER_FAILED",
+                    {"code": str(error) or type(error).__name__, "sha256": digest},
+                )
+
+    @staticmethod
+    def _validated_mcp_artifact_reference(
+        task: StoredTask,
+        reference: dict[str, object],
+    ) -> tuple[str, str, int] | None:
+        relative_path = reference.get("relative_path")
+        digest = reference.get("sha256")
+        output_digest = reference.get("output_sha256")
+        size_bytes = reference.get("size_bytes")
+        if (
+            not isinstance(relative_path, str)
+            or not isinstance(digest, str)
+            or not isinstance(output_digest, str)
+            or not isinstance(size_bytes, int)
+            or isinstance(size_bytes, bool)
+            or not 1 <= size_bytes <= _MCP_ARTIFACT_MAX_BYTES
+        ):
+            return None
+        match = _MCP_ARTIFACT_PATH.fullmatch(relative_path)
+        if not match or digest != match.group(1) or output_digest != digest:
+            return None
+        try:
+            path = TaskStore._artifact_path_locked(task, relative_path)
+        except OSError:
+            return None
+        if path.name != f"{digest}.json":
+            return None
+        return relative_path, digest, size_bytes
 
     @staticmethod
     def _artifact_path_locked(task: StoredTask, relative_path: str) -> Path:
@@ -950,7 +1358,8 @@ class TaskStore:
                     lease_expires_at TEXT,
                     cancellation_requested_at TEXT,
                     cancellation_reason TEXT,
-                    archived_at TEXT
+                    archived_at TEXT,
+                    event_archive_last_sequence INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS task_events (
                     thread_id TEXT NOT NULL,
@@ -998,6 +1407,7 @@ class TaskStore:
             self._ensure_column_locked("tasks", "cancellation_requested_at", "TEXT")
             self._ensure_column_locked("tasks", "cancellation_reason", "TEXT")
             self._ensure_column_locked("tasks", "archived_at", "TEXT")
+            self._ensure_column_locked("tasks", "event_archive_last_sequence", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column_locked("tasks", "trace_id", "TEXT")
             self._ensure_column_locked("tasks", "display_title", "TEXT")
             self._ensure_column_locked("tasks", "conversation_id", "TEXT")
@@ -1058,6 +1468,7 @@ class TaskStore:
             cancellation_requested_at=row["cancellation_requested_at"],
             cancellation_reason=row["cancellation_reason"],
             archived_at=row["archived_at"],
+            event_archive_last_sequence=int(row["event_archive_last_sequence"] or 0),
         )
 
     @staticmethod
@@ -1089,12 +1500,30 @@ class TaskStore:
         return datetime.now(timezone.utc).isoformat()
 
     @staticmethod
+    def _retention_cutoff(older_than_days: int, now: str | None) -> str:
+        """使用 UTC ISO 时间计算截止点，测试可注入时间而不依赖本机时钟。"""
+
+        reference = datetime.fromisoformat(now) if now else datetime.now(timezone.utc)
+        if reference.tzinfo is None:
+            raise ValueError("TASK_RETENTION_TIME_INVALID")
+        return (reference.astimezone(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+
+    @staticmethod
     def _lease_deadline(lease_seconds: int) -> str:
         return (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat()
 
     @staticmethod
     def _new_trace_id() -> str:
         return f"trace-{uuid4().hex}"
+
+
+def _validate_retention_request(older_than_days: int, limit: int) -> None:
+    """保留治理参数必须有界，避免一次操作意外覆盖整个历史库。"""
+
+    if not isinstance(older_than_days, int) or isinstance(older_than_days, bool) or not 0 <= older_than_days <= _RETENTION_MAX_DAYS:
+        raise ValueError("TASK_RETENTION_DAYS_INVALID")
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 200:
+        raise ValueError("TASK_RETENTION_LIMIT_INVALID")
 
 
 def _normalize_task_title(value: str | None) -> str | None:
@@ -1127,6 +1556,7 @@ def _public_event_payload(payload: dict[str, object]) -> dict[str, object]:
     safe: dict[str, object] = {}
     scalar_keys = (
         "code",
+        "audit_code",
         "status",
         "node",
         "tool_name",
@@ -1141,6 +1571,12 @@ def _public_event_payload(payload: dict[str, object]) -> dict[str, object]:
         "reported",
         "source_count",
         "artifact_count",
+        "branch",
+        "selected_file_count",
+        "selection_sha256",
+        "selected_preview_sha256",
+        "diff_sha256",
+        "changed_file_count",
     )
     for key in scalar_keys:
         value = payload.get(key)
@@ -1163,6 +1599,39 @@ def _public_event_payload(payload: dict[str, object]) -> dict[str, object]:
         if safe_checks:
             safe["checks"] = safe_checks
     return safe
+
+
+def _archived_event_from_dict(raw: object, task: StoredTask) -> StoredTaskEvent:
+    """只接受本服务写出的公开事件格式，损坏归档不能悄悄降级为缺失事件。"""
+
+    if not isinstance(raw, dict):
+        raise ValueError("TASK_EVENT_ARCHIVE_INVALID")
+    sequence = raw.get("sequence")
+    event_id = raw.get("event_id")
+    trace_id = raw.get("trace_id")
+    event_type = raw.get("type")
+    payload = raw.get("payload")
+    created_at = raw.get("created_at")
+    if (
+        not isinstance(sequence, int)
+        or sequence < 1
+        or event_id != f"{task.thread_id}:{sequence}"
+        or trace_id != task.trace_id
+        or not isinstance(event_type, str)
+        or not event_type
+        or not isinstance(payload, dict)
+        or not isinstance(created_at, str)
+        or not created_at
+    ):
+        raise ValueError("TASK_EVENT_ARCHIVE_INVALID")
+    return StoredTaskEvent(
+        sequence=sequence,
+        event_id=event_id,
+        trace_id=trace_id,
+        event_type=event_type,
+        payload=payload,
+        created_at=created_at,
+    )
 
 
 def _atomic_write(path: Path, content: bytes) -> None:
@@ -1191,7 +1660,7 @@ def _plan_markdown(plan: dict[str, object]) -> str:
     summary = plan.get("summary") or plan.get("problem_summary")
     if isinstance(summary, str) and summary:
         lines.extend(["## 问题摘要", "", summary, ""])
-    for key, title in (("candidate_files", "候选文件"), ("steps", "修改步骤"), ("verification", "验证建议"), ("risks", "风险与假设")):
+    for key, title in (("candidate_files", "候选文件"), ("unverified_candidate_files", "未证实候选（不会进入补丁范围）"), ("steps", "修改步骤"), ("verification", "验证建议"), ("risks", "风险与假设")):
         value = plan.get(key)
         if not value:
             continue

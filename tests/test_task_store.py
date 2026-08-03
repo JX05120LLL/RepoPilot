@@ -4,12 +4,138 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from hashlib import sha256
 from pathlib import Path
 
 from repopilot_guard.task_store import TaskStore
 
 
 class TaskStoreTests(unittest.TestCase):
+    def test_registers_hashed_mcp_output_artifact_from_metadata_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            store = TaskStore(root / "state.sqlite")
+            try:
+                self._create_task(store, root, "thread-mcp-output")
+                content = ("x" * 30_000 + "仅产物可见的尾部内容").encode("utf-8")
+                digest = sha256(content).hexdigest()
+                relative_path = f"mcp/outputs/{digest}.json"
+                source = root / "runs" / "task-thread-mcp-output" / relative_path
+                source.parent.mkdir(parents=True)
+                source.write_bytes(content)
+                event = {
+                    "type": "TOOL_CALL",
+                    "name": "mcp__docs__search",
+                    "status": "READY",
+                    "code": "MCP_TOOL_COMPLETED",
+                    "artifact": {
+                        "status": "READY",
+                        "kind": "mcp_tool_output",
+                        "relative_path": relative_path,
+                        "sha256": digest,
+                        "output_sha256": digest,
+                        "size_bytes": len(content),
+                    },
+                }
+                store.sync_graph_result(
+                    {
+                        "thread_id": "thread-mcp-output",
+                        "status": "REPORT",
+                        "pending_approval": False,
+                        "verdict": "UNVERIFIED",
+                        "state": {"tool_events": [event]},
+                    }
+                )
+
+                kind = f"mcp_output_{digest[:16]}"
+                artifact, saved = store.read_artifact("thread-mcp-output", kind)
+                self.assertEqual(relative_path, artifact.relative_path)
+                self.assertEqual(content.decode("utf-8"), saved)
+                persisted_events = store.events_after("thread-mcp-output", 0)
+                self.assertNotIn("仅产物可见的尾部内容", json.dumps([event.payload for event in persisted_events], ensure_ascii=False))
+                self.assertNotIn("artifact", next(item for item in persisted_events if item.event_type == "TOOL_CALL").to_public_dict()["payload"])
+            finally:
+                store.close()
+
+    def test_rejects_tampered_mcp_output_artifact_before_registration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            store = TaskStore(root / "state.sqlite")
+            try:
+                self._create_task(store, root, "thread-mcp-tampered")
+                content = b"original output"
+                digest = sha256(content).hexdigest()
+                relative_path = f"mcp/outputs/{digest}.json"
+                source = root / "runs" / "task-thread-mcp-tampered" / relative_path
+                source.parent.mkdir(parents=True)
+                source.write_bytes(b"tampered output")
+                store.sync_graph_result(
+                    {
+                        "thread_id": "thread-mcp-tampered",
+                        "status": "REPORT",
+                        "pending_approval": False,
+                        "verdict": "UNVERIFIED",
+                        "state": {
+                            "tool_events": [
+                                {
+                                    "type": "TOOL_CALL",
+                                    "artifact": {
+                                        "status": "READY",
+                                        "kind": "mcp_tool_output",
+                                        "relative_path": relative_path,
+                                        "sha256": digest,
+                                        "output_sha256": digest,
+                                        "size_bytes": len(content),
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                )
+
+                self.assertNotIn(f"mcp_output_{digest[:16]}", {item.kind for item in store.artifacts("thread-mcp-tampered")})
+                failure = next(item for item in store.events_after("thread-mcp-tampered", 0) if item.event_type == "MCP_ARTIFACT_REGISTER_FAILED")
+                self.assertIn(
+                    failure.payload["code"],
+                    {"MCP_ARTIFACT_SIZE_MISMATCH", "MCP_ARTIFACT_INTEGRITY_MISMATCH"},
+                )
+            finally:
+                store.close()
+
+    def test_persists_patch_selection_audit_hashes_without_exposing_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            store = TaskStore(root / "state.sqlite")
+            try:
+                self._create_task(store, root, "thread-patch-selection")
+                store.sync_graph_result(
+                    {
+                        "thread_id": "thread-patch-selection",
+                        "status": "WAITING_APPROVAL",
+                        "pending_approval": True,
+                        "state": {
+                            "tool_events": [
+                                {
+                                    "type": "PATCH_SELECTION_APPROVED",
+                                    "selected_file_count": 1,
+                                    "selection_sha256": "a" * 64,
+                                    "selected_preview_sha256": "b" * 64,
+                                    "selected_paths": ["src/main/java/OrderService.java"],
+                                }
+                            ]
+                        },
+                    }
+                )
+                event = next(item for item in store.recent_events("thread-patch-selection", limit=8) if item.event_type == "PATCH_SELECTION_APPROVED")
+            finally:
+                store.close()
+
+        payload = event.to_public_dict()["payload"]
+        self.assertEqual(1, payload["selected_file_count"])
+        self.assertEqual("a" * 64, payload["selection_sha256"])
+        self.assertEqual("b" * 64, payload["selected_preview_sha256"])
+        self.assertNotIn("selected_paths", payload)
+
     @staticmethod
     def _create_task(store: TaskStore, root: Path, thread_id: str = "thread-lease") -> None:
         store.create(
@@ -90,6 +216,121 @@ class TaskStoreTests(unittest.TestCase):
                 self.assertEqual(1, len(reopened.list()))
             finally:
                 reopened.close()
+
+    def test_archiving_terminal_task_moves_events_to_hashed_artifact_without_breaking_cursor_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            database_path = root / "state.sqlite"
+            store = TaskStore(database_path)
+            try:
+                self._create_task(store, root, "thread-event-archive")
+                store.sync_graph_result(
+                    {
+                        "thread_id": "thread-event-archive",
+                        "status": "REPORT",
+                        "pending_approval": False,
+                        "verdict": "UNVERIFIED",
+                        "state": {
+                            "error_summary": None,
+                            "tool_events": [{"type": "FILE_READ", "duration_ms": 12, "arguments": {"path": "pom.xml"}}],
+                        },
+                    }
+                )
+                before = store.events_after("thread-event-archive", 0)
+                archived = store.archive("thread-event-archive")
+                after = store.events_after("thread-event-archive", 0)
+                artifacts = {artifact.kind: artifact for artifact in store.artifacts("thread-event-archive")}
+
+                self.assertIsNotNone(archived.archived_at)
+                self.assertIn("event_archive", artifacts)
+                self.assertEqual([event.sequence for event in after], list(range(1, len(after) + 1)))
+                self.assertEqual([event.event_type for event in before], [event.event_type for event in after[: len(before)]])
+                self.assertEqual("TASK_EVENTS_ARCHIVED", after[-2].event_type)
+                self.assertEqual("TASK_ARCHIVED", after[-1].event_type)
+                self.assertEqual((), store.events_after("thread-event-archive", after[-1].sequence))
+            finally:
+                store.close()
+
+            reopened = TaskStore(database_path)
+            try:
+                replayed = reopened.events_after("thread-event-archive", 0)
+                self.assertEqual("TASK_CREATED", replayed[0].event_type)
+                self.assertEqual("TASK_ARCHIVED", replayed[-1].event_type)
+                self.assertTrue(reopened.get("thread-event-archive").archived_at)
+                archive_path = root / "runs" / "task-thread-event-archive" / "events.jsonl"
+                archive_path.write_text("tampered\n", encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "TASK_EVENT_ARCHIVE_INTEGRITY_MISMATCH"):
+                    reopened.events_after("thread-event-archive", 0)
+            finally:
+                reopened.close()
+
+    def test_retention_preview_and_explicit_batch_archive_keep_evidence_replayable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            store = TaskStore(root / "state.sqlite")
+            try:
+                self._create_task(store, root, "thread-retention-old")
+                self._create_task(store, root, "thread-retention-running")
+                store.sync_graph_result(
+                    {
+                        "thread_id": "thread-retention-old",
+                        "status": "REPORT",
+                        "pending_approval": False,
+                        "verdict": "UNVERIFIED",
+                        "state": {"tool_events": [{"type": "PLAN_GENERATED"}]},
+                    }
+                )
+                # 用固定历史时间验证筛选，不依赖执行机器的系统时钟。
+                store._connection.execute(
+                    "UPDATE tasks SET updated_at = ? WHERE thread_id = ?",
+                    ("2026-01-01T00:00:00+00:00", "thread-retention-old"),
+                )
+                store._connection.commit()
+
+                before = store.events_after("thread-retention-old", 0)
+                candidates = store.archive_candidates(
+                    older_than_days=30,
+                    limit=20,
+                    now="2026-03-01T00:00:00+00:00",
+                )
+
+                self.assertEqual(["thread-retention-old"], [item.thread_id for item in candidates])
+                self.assertGreater(candidates[0].live_event_count, 0)
+                self.assertGreater(candidates[0].artifact_count, 0)
+                self.assertIsNone(store.get("thread-retention-old").archived_at)
+                self.assertIsNone(store.get("thread-retention-running").archived_at)
+
+                result = store.archive_eligible(
+                    older_than_days=30,
+                    limit=20,
+                    now="2026-03-01T00:00:00+00:00",
+                )
+                replayed = store.events_after("thread-retention-old", 0)
+
+                self.assertEqual(["thread-retention-old"], [item.thread_id for item in result.archived])
+                self.assertEqual((), result.blocked)
+                self.assertFalse(result.to_dict()["deletion_performed"])
+                self.assertIsNotNone(store.get("thread-retention-old").archived_at)
+                self.assertIsNone(store.get("thread-retention-running").archived_at)
+                self.assertEqual([event.event_type for event in before], [event.event_type for event in replayed[: len(before)]])
+                self.assertEqual("TASK_ARCHIVED", replayed[-1].event_type)
+                self.assertIn("report", {item.kind for item in store.artifacts("thread-retention-old")})
+            finally:
+                store.close()
+
+    def test_retention_rejects_unbounded_requests_and_naive_clock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            store = TaskStore(root / "state.sqlite")
+            try:
+                with self.assertRaisesRegex(ValueError, "TASK_RETENTION_DAYS_INVALID"):
+                    store.archive_candidates(older_than_days=-1)
+                with self.assertRaisesRegex(ValueError, "TASK_RETENTION_LIMIT_INVALID"):
+                    store.archive_candidates(older_than_days=1, limit=201)
+                with self.assertRaisesRegex(ValueError, "TASK_RETENTION_TIME_INVALID"):
+                    store.archive_candidates(older_than_days=1, now="2026-03-01T00:00:00")
+            finally:
+                store.close()
 
     def test_conversation_allows_only_one_active_task_and_preserves_task_history(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

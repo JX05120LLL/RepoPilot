@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -16,6 +17,7 @@ from uuid import UUID
 from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
 from qdrant_client import models
 
+from repopilot_guard.document_parser import SUPPORTED_DOCUMENT_EXTENSIONS, extract_document_text
 from repopilot_guard.permissions import PermissionGrant
 from repopilot_guard.policy import PolicyGuard, ToolName
 
@@ -30,8 +32,39 @@ MAX_RETRIEVAL_CANDIDATES = 64
 MAX_ATTACHED_DOCUMENT_CHUNKS = 1
 TRANSIENT_OPERATION_ATTEMPTS = 3
 TRANSIENT_RETRY_BASE_DELAY_SECONDS = 1.0
-CODE_EXTENSIONS = frozenset({".java", ".xml"})
-DOCUMENT_EXTENSIONS = frozenset({".md", ".txt"})
+CODE_EXTENSIONS = frozenset({".java", ".xml", ".py", ".js", ".jsx", ".ts", ".tsx", ".gradle", ".kts"})
+DOCUMENT_EXTENSIONS = SUPPORTED_DOCUMENT_EXTENSIONS
+BUILD_DESCRIPTOR_NAMES = frozenset(
+    {
+        "pom.xml",
+        "package.json",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "pyproject.toml",
+        "pytest.ini",
+        "requirements.txt",
+        "settings.gradle",
+        "settings.gradle.kts",
+    }
+)
+CONFIGURATION_FILE_PATTERN = re.compile(r"^(?:application(?:-[a-z0-9_.-]+)?|config)\.(?:json|ya?ml)$", re.IGNORECASE)
+SENSITIVE_CONFIGURATION_KEYS = frozenset(
+    {
+        "accesskey",
+        "accesstoken",
+        "apikey",
+        "authorization",
+        "clientsecret",
+        "credential",
+        "credentials",
+        "password",
+        "passwd",
+        "privatekey",
+        "refreshtoken",
+        "secret",
+        "token",
+    }
+)
 SKIPPED_DIRECTORIES = frozenset({"target", ".venv", "node_modules", "build", ".idea"})
 
 
@@ -58,6 +91,7 @@ class ContextChunk:
     line_end: int
     content_sha256: str
     verified: bool = False
+    symbols: tuple[str, ...] = ()
 
     def payload(self) -> dict[str, object]:
         return {
@@ -70,6 +104,7 @@ class ContextChunk:
             "line_end": self.line_end,
             "content_sha256": self.content_sha256,
             "verified": self.verified,
+            "symbols": list(self.symbols),
             "content": self.content,
         }
 
@@ -131,6 +166,9 @@ class RetrievedContext:
     document_id: str
     vector_score: float | None = None
     lexical_score: float = 0.0
+    bm25_score: float | None = None
+    symbols: tuple[str, ...] = ()
+    symbol_score: float = 0.0
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -143,6 +181,9 @@ class RetrievedContext:
             "document_id": self.document_id,
             "vector_score": self.vector_score,
             "lexical_score": self.lexical_score,
+            "bm25_score": self.bm25_score,
+            "symbols": list(self.symbols),
+            "symbol_score": self.symbol_score,
         }
 
 
@@ -173,11 +214,12 @@ class RetrievalResult:
 
 
 class ContextChunkStore:
-    """保存已成功 upsert 的 chunk 哈希，避免重复向量写入。"""
+    """保存向量增量状态，并在本机 SQLite 中维护受控 BM25 倒排索引。"""
 
     def __init__(self, database_path: Path) -> None:
         self._database_path = database_path.expanduser().resolve()
         self._database_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lexical_available = False
         connection = sqlite3.connect(self._database_path)
         try:
             connection.execute(
@@ -188,6 +230,28 @@ class ContextChunkStore:
                 )
                 """
             )
+            try:
+                # 元数据列不参与分词，只能作为项目和提交隔离过滤条件使用。
+                connection.execute(
+                    """
+                    CREATE VIRTUAL TABLE IF NOT EXISTS context_lexical_chunks USING fts5(
+                        chunk_id UNINDEXED,
+                        project_id UNINDEXED,
+                        repo_commit UNINDEXED,
+                        source_type UNINDEXED,
+                        path UNINDEXED,
+                        document_id UNINDEXED,
+                        line_start UNINDEXED,
+                        line_end UNINDEXED,
+                        symbols,
+                        content
+                    )
+                    """
+                )
+                self._lexical_available = True
+            except sqlite3.OperationalError:
+                # 少数 Python/SQLite 构建可能不带 FTS5；向量检索仍可用，不能伪造 BM25 已启用。
+                self._lexical_available = False
             connection.commit()
         finally:
             connection.close()
@@ -213,6 +277,110 @@ class ContextChunkStore:
         finally:
             connection.close()
 
+    @property
+    def lexical_available(self) -> bool:
+        """本机 SQLite 是否支持并已初始化 FTS5。"""
+
+        return self._lexical_available
+
+    def is_lexically_indexed(self, chunk: ContextChunk) -> bool:
+        if not self._lexical_available:
+            return False
+        connection = sqlite3.connect(self._database_path)
+        try:
+            row = connection.execute(
+                "SELECT 1 FROM context_lexical_chunks WHERE chunk_id = ? LIMIT 1", (chunk.chunk_id,)
+            ).fetchone()
+        finally:
+            connection.close()
+        return row is not None
+
+    def index_lexical(self, chunks: list[ContextChunk]) -> None:
+        """以 chunk_id 替换写入，避免同一代码片段在 BM25 索引中重复。"""
+
+        if not self._lexical_available or not chunks:
+            return
+        connection = sqlite3.connect(self._database_path)
+        try:
+            connection.executemany(
+                "DELETE FROM context_lexical_chunks WHERE chunk_id = ?",
+                [(chunk.chunk_id,) for chunk in chunks],
+            )
+            connection.executemany(
+                """
+                INSERT INTO context_lexical_chunks(
+                    chunk_id, project_id, repo_commit, source_type, path, document_id,
+                    line_start, line_end, symbols, content
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        chunk.chunk_id,
+                        chunk.project_id,
+                        chunk.repo_commit,
+                        chunk.source_type,
+                        chunk.path,
+                        chunk.document_id,
+                        chunk.line_start,
+                        chunk.line_end,
+                        " ".join(chunk.symbols),
+                        chunk.content,
+                    )
+                    for chunk in chunks
+                ],
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+    def search_lexical(
+        self,
+        query: str,
+        *,
+        project_id: str,
+        repo_commit: str,
+        limit: int,
+    ) -> tuple[RetrievedContext, ...]:
+        """只在已冻结的项目和提交内执行 FTS5 BM25 查询。"""
+
+        terms = _fts_query_terms(query)
+        if not self._lexical_available or not terms or limit < 1:
+            return ()
+        # 仅由受限分词函数生成 MATCH 表达式，避免把用户输入解释为 FTS 语法。
+        match_query = " OR ".join(f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms)
+        connection = sqlite3.connect(self._database_path)
+        try:
+            rows = connection.execute(
+                """
+                SELECT chunk_id, source_type, path, document_id, line_start, line_end, symbols, content,
+                       bm25(context_lexical_chunks) AS bm25_rank
+                FROM context_lexical_chunks
+                WHERE context_lexical_chunks MATCH ?
+                  AND project_id = ?
+                  AND repo_commit = ?
+                ORDER BY bm25_rank ASC, path ASC, line_start ASC, line_end ASC
+                LIMIT ?
+                """,
+                (match_query, project_id, repo_commit, limit),
+            ).fetchall()
+        finally:
+            connection.close()
+        total = len(rows)
+        return tuple(
+            RetrievedContext(
+                content=str(row[7]),
+                score=0.0,
+                path=str(row[2]),
+                line_start=int(row[4]),
+                line_end=int(row[5]),
+                source_type=str(row[1]),
+                document_id=str(row[3]),
+                bm25_score=round(1.0 - (rank / max(total, 1)), 6),
+                symbols=tuple(item for item in str(row[6]).split(" ") if item),
+            )
+            for rank, row in enumerate(rows)
+        )
+
     def close(self) -> None:
         """兼容旧调用；索引清单使用短连接，不保留文件句柄。"""
 
@@ -226,6 +394,7 @@ class ManagedDocument:
     managed_path: Path
     content_sha256: str
     imported_at: str
+    source_format: str = "text"
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -233,6 +402,7 @@ class ManagedDocument:
             "display_name": self.display_name,
             "content_sha256": self.content_sha256,
             "imported_at": self.imported_at,
+            "source_format": self.source_format,
         }
 
 
@@ -279,10 +449,14 @@ class ManagedDocumentStore:
                     managed_path TEXT NOT NULL,
                     content_sha256 TEXT NOT NULL,
                     imported_at TEXT NOT NULL,
+                    source_format TEXT NOT NULL DEFAULT 'text',
                     PRIMARY KEY(project_id, document_id)
                 )
                 """
             )
+            columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(managed_documents)").fetchall()}
+            if "source_format" not in columns:
+                connection.execute("ALTER TABLE managed_documents ADD COLUMN source_format TEXT NOT NULL DEFAULT 'text'")
             connection.commit()
         finally:
             connection.close()
@@ -296,7 +470,8 @@ class ManagedDocumentStore:
         if source_candidate.is_symlink():
             raise ValueError("DOCUMENT_SYMLINK_BLOCKED")
         source = source_candidate.resolve()
-        if source.suffix.lower() not in DOCUMENT_EXTENSIONS:
+        suffix = source.suffix.lower()
+        if suffix not in DOCUMENT_EXTENSIONS:
             raise ValueError("UNSUPPORTED_DOCUMENT_TYPE")
         try:
             if not source.is_file():
@@ -304,26 +479,24 @@ class ManagedDocumentStore:
             raw = source.read_bytes()
         except OSError as error:
             raise ValueError("DOCUMENT_UNREADABLE") from error
-        if len(raw) > MAX_FILE_BYTES:
-            raise ValueError("DOCUMENT_TOO_LARGE")
-        if b"\0" in raw:
-            raise ValueError("DOCUMENT_UNREADABLE")
         try:
-            raw.decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise ValueError("DOCUMENT_UNREADABLE") from error
+            text = _redact_configuration_secrets(extract_document_text(raw, suffix))
+        except ValueError as error:
+            raise ValueError(str(error)) from error
 
-        content_sha256 = hashlib.sha256(raw).hexdigest()
+        raw_sha256 = hashlib.sha256(raw).hexdigest()
+        normalized = text.encode("utf-8")
+        content_sha256 = hashlib.sha256(normalized).hexdigest()
         document_id = hashlib.sha256(
-            f"managed-document|{project_id}|{source.name}|{content_sha256}".encode("utf-8")
+            f"managed-document|{project_id}|{source.name}|{raw_sha256}".encode("utf-8")
         ).hexdigest()
-        display_name = _safe_document_name(source.name, source.suffix.lower())
+        display_name = _safe_document_name(source.name, suffix)
         target_directory = self._documents_root / hashlib.sha256(project_id.encode("utf-8")).hexdigest()[:24]
-        target = target_directory / f"{document_id}{source.suffix.lower()}"
+        target = target_directory / f"{document_id}{'.md' if suffix == '.md' else '.txt'}"
         target_directory.mkdir(parents=True, exist_ok=True)
         try:
             if not target.exists():
-                target.write_bytes(raw)
+                target.write_bytes(normalized)
             elif hashlib.sha256(target.read_bytes()).hexdigest() != content_sha256:
                 raise ValueError("MANAGED_DOCUMENT_INTEGRITY_FAILED")
         except OSError as error:
@@ -334,20 +507,21 @@ class ManagedDocumentStore:
         try:
             connection.execute(
                 """
-                INSERT INTO managed_documents(project_id, document_id, display_name, managed_path, content_sha256, imported_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO managed_documents(project_id, document_id, display_name, managed_path, content_sha256, imported_at, source_format)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(project_id, document_id) DO UPDATE SET
                     display_name=excluded.display_name,
                     managed_path=excluded.managed_path,
                     content_sha256=excluded.content_sha256,
-                    imported_at=excluded.imported_at
+                    imported_at=excluded.imported_at,
+                    source_format=excluded.source_format
                 """,
-                (project_id, document_id, display_name, str(target), content_sha256, imported_at),
+                (project_id, document_id, display_name, str(target), content_sha256, imported_at, suffix.lstrip(".")),
             )
             connection.commit()
         finally:
             connection.close()
-        return ManagedDocument(document_id, display_name, target, content_sha256, imported_at)
+        return ManagedDocument(document_id, display_name, target, content_sha256, imported_at, suffix.lstrip("."))
 
     def chunks_for(
         self,
@@ -465,7 +639,7 @@ class ManagedDocumentStore:
         try:
             rows = connection.execute(
                 """
-                SELECT document_id, display_name, managed_path, content_sha256, imported_at
+                SELECT document_id, display_name, managed_path, content_sha256, imported_at, source_format
                 FROM managed_documents WHERE project_id = ? ORDER BY imported_at DESC
                 """,
                 (project_id,),
@@ -479,6 +653,7 @@ class ManagedDocumentStore:
                 managed_path=Path(str(row[2])),
                 content_sha256=str(row[3]),
                 imported_at=str(row[4]),
+                source_format=str(row[5]),
             )
             for row in rows
         )
@@ -509,17 +684,18 @@ class ContextLoader:
             for filename in sorted(filenames):
                 path = current / filename
                 relative = path.relative_to(project_root).as_posix()
-                if path.suffix.lower() not in CODE_EXTENSIONS | DOCUMENT_EXTENSIONS:
+                if not _is_allowed_project_file(path):
                     skipped_files += 1
                     continue
                 if not guard.check_path(ToolName.READ_FILE, path).allowed:
                     skipped_files += 1
                     continue
-                text = _read_text(path)
+                # 配置文件先在本地完成确定性脱敏，再允许其进入切块、Embedding 或本地倒排索引。
+                text = _read_project_text(path)
                 if text is None:
                     skipped_files += 1
                     continue
-                source_type = "code" if path.suffix.lower() in CODE_EXTENSIONS else "repository_document"
+                source_type = _project_source_type(path)
                 chunks.extend(
                     split_context(
                         text,
@@ -562,6 +738,113 @@ class ContextLoader:
         )
 
 
+def _is_allowed_project_file(path: Path) -> bool:
+    """只放行源码、文档、构建描述和受治理的常见配置，避免宽泛索引 JSON/YAML 凭证。"""
+
+    return (
+        path.suffix.lower() in CODE_EXTENSIONS | DOCUMENT_EXTENSIONS
+        or path.name in BUILD_DESCRIPTOR_NAMES
+        or bool(CONFIGURATION_FILE_PATTERN.fullmatch(path.name))
+    )
+
+
+def _project_source_type(path: Path) -> str:
+    if path.name in BUILD_DESCRIPTOR_NAMES or path.suffix.lower() in {".gradle", ".kts"}:
+        return "build_config"
+    if CONFIGURATION_FILE_PATTERN.fullmatch(path.name):
+        return "configuration"
+    return "code" if path.suffix.lower() in CODE_EXTENSIONS else "repository_document"
+
+
+def _read_project_text(path: Path) -> str | None:
+    """读取项目文件，并在配置内容离开本机文件系统前移除常见凭证值。"""
+
+    text = _read_text(path)
+    if text is None:
+        return None
+    if path.suffix.lower() == ".json":
+        return _redact_json_configuration_secrets(text)
+    if path.suffix.lower() in {".yaml", ".yml"}:
+        return _redact_configuration_secrets(text)
+    return text
+
+
+def _redact_json_configuration_secrets(text: str) -> str:
+    """优先解析 JSON 并递归脱敏，嵌套凭证对象也不能保留任何子字段。"""
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        # 用户项目中可能存在带注释的 JSONC；无法可靠解析时仍保守按行脱敏，
+        # 不因为格式不标准而回退为原文索引。
+        return _redact_configuration_secrets(text)
+    sanitized = _redact_json_value(parsed)
+    return json.dumps(sanitized, ensure_ascii=False, indent=2) + "\n"
+
+
+def _redact_json_value(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: "[REDACTED]" if _is_sensitive_configuration_key(str(key)) else _redact_json_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_json_value(item) for item in value]
+    if isinstance(value, str):
+        return _redact_connection_credentials(value)
+    return value
+
+
+def _redact_configuration_secrets(text: str) -> str:
+    """对 JSON/YAML 的敏感键和值做保守脱敏，不依赖宽松解析器或外部库。"""
+
+    lines: list[str] = []
+    blocked_block_indent: int | None = None
+    for line in text.splitlines():
+        indentation = len(line) - len(line.lstrip(" "))
+        if blocked_block_indent is not None:
+            if line.strip() and indentation <= blocked_block_indent:
+                blocked_block_indent = None
+            elif not line.strip() or indentation > blocked_block_indent:
+                lines.append(" " * indentation + "# [REDACTED]")
+                continue
+
+        json_match = re.match(
+            r'^(?P<prefix>\s*"(?P<key>[^\"]+)"\s*:\s*)(?P<value>.*?)(?P<suffix>,?\s*)$',
+            line,
+        )
+        if json_match and _is_sensitive_configuration_key(json_match.group("key")):
+            lines.append(f'{json_match.group("prefix")}"[REDACTED]"{json_match.group("suffix")}')
+            continue
+
+        key_match = re.match(
+            r"^(?P<prefix>\s*(?:-\s*)?[\"']?(?P<key>[A-Za-z0-9_.-]+)[\"']?\s*:\s*)(?P<value>.*)$",
+            line,
+        )
+        if key_match and _is_sensitive_configuration_key(key_match.group("key")):
+            value = key_match.group("value").strip()
+            if value.startswith(("|", ">")):
+                blocked_block_indent = indentation
+            lines.append(f"{key_match.group('prefix')}[REDACTED]")
+            continue
+
+        # 连接串中的用户信息也不能以普通配置值的形式进入上下文。
+        lines.append(_redact_connection_credentials(line))
+    return "\n".join(lines)
+
+
+def _redact_connection_credentials(value: str) -> str:
+    return re.sub(r"(://)[^\s/@:]+:[^\s/@]+@", r"\1[REDACTED]@", value)
+
+
+def _is_sensitive_configuration_key(value: str) -> bool:
+    """只匹配明确的键名或最后一级键，避免把 tokenizer 一类正常字段误判为密钥。"""
+
+    key = value.rsplit(".", 1)[-1]
+    normalized = re.sub(r"[^a-z0-9]", "", key.lower())
+    return normalized in SENSITIVE_CONFIGURATION_KEYS
+
+
 class ContextIndexer:
     """将受控 chunk 写入 coding_context，失败不制造成功结果。"""
 
@@ -571,10 +854,15 @@ class ContextIndexer:
         self._chunk_store = chunk_store
 
     def index(self, chunks: tuple[ContextChunk, ...], skipped_files: int = 0) -> IndexResult:
-        pending = [chunk for chunk in chunks if not self._chunk_store or not self._chunk_store.is_current(chunk)]
-        if not pending:
+        vector_pending = [chunk for chunk in chunks if not self._chunk_store or not self._chunk_store.is_current(chunk)]
+        lexical_pending = (
+            [chunk for chunk in chunks if not self._chunk_store.is_lexically_indexed(chunk)]
+            if self._chunk_store and self._chunk_store.lexical_available
+            else []
+        )
+        if not vector_pending and not lexical_pending:
             return IndexResult("READY", "CONTEXT_ALREADY_INDEXED", "上下文没有变化，无需重复写入。", skipped_chunks=len(chunks), skipped_files=skipped_files)
-        for batch in _batches(pending, EMBEDDING_BATCH_SIZE):
+        for batch in _batches(vector_pending, EMBEDDING_BATCH_SIZE):
             try:
                 vectors = _with_transient_retry(lambda: self._embeddings.embed_documents([chunk.content for chunk in batch]))
                 points = [
@@ -603,12 +891,13 @@ class ContextIndexer:
                 )
         try:
             if self._chunk_store:
-                self._chunk_store.mark_indexed(pending)
+                self._chunk_store.mark_indexed(vector_pending)
+                self._chunk_store.index_lexical(lexical_pending)
         except sqlite3.Error as error:
             return IndexResult(
                 "BLOCKED",
                 "CONTEXT_INDEX_FAILED",
-                "索引状态写入失败，未报告为成功。",
+                "向量状态或 BM25 索引写入失败，未报告为完整成功。",
                 skipped_files=skipped_files,
                 failure_component="state_database",
                 failure_reason=type(error).__name__,
@@ -617,8 +906,8 @@ class ContextIndexer:
             "READY",
             "CONTEXT_INDEXED",
             "代码与文档上下文已索引。",
-            indexed_chunks=len(pending),
-            skipped_chunks=len(chunks) - len(pending),
+            indexed_chunks=len(vector_pending),
+            skipped_chunks=len(chunks) - len(vector_pending),
             skipped_files=skipped_files,
         )
 
@@ -798,11 +1087,12 @@ class ProjectMemoryRetriever:
 
 
 class ContextRetriever:
-    """只在同一项目和基线提交内检索，并以向量、关键词和路径信号稳定重排。"""
+    """只在同一项目和基线提交内融合向量、BM25、关键词、路径和符号信号。"""
 
-    def __init__(self, client: Any, embeddings: EmbeddingsClient) -> None:
+    def __init__(self, client: Any, embeddings: EmbeddingsClient, chunk_store: ContextChunkStore | None = None) -> None:
         self._client = client
         self._embeddings = embeddings
+        self._chunk_store = chunk_store
 
     def search(self, query: str, *, project_id: str, repo_commit: str, limit: int = 8) -> RetrievalResult:
         if not query.strip() or limit < 1:
@@ -841,13 +1131,13 @@ class ContextRetriever:
                 failure_reason=type(error).__name__,
             )
         candidates: list[tuple[RetrievedContext, int]] = []
-        seen: set[tuple[str, int, int]] = set()
+        by_source: dict[tuple[str, int, int], int] = {}
         for vector_rank, point in enumerate(response.points):
             payload = point.payload or {}
             key = (str(payload.get("path", "")), int(payload.get("line_start", 0)), int(payload.get("line_end", 0)))
-            if key in seen:
+            if key in by_source:
                 continue
-            seen.add(key)
+            by_source[key] = len(candidates)
             candidates.append(
                 (
                     RetrievedContext(
@@ -859,18 +1149,55 @@ class ContextRetriever:
                         source_type=str(payload.get("source_type", "")),
                         document_id=str(payload.get("document_id", "")),
                         vector_score=float(point.score),
+                        symbols=_payload_symbols(payload),
                     ),
                     vector_rank,
                 )
             )
+        lexical_candidates: tuple[RetrievedContext, ...] = ()
+        if self._chunk_store and self._chunk_store.lexical_available:
+            try:
+                lexical_candidates = self._chunk_store.search_lexical(
+                    query,
+                    project_id=project_id,
+                    repo_commit=repo_commit,
+                    limit=candidate_limit,
+                )
+            except sqlite3.Error:
+                # 本地增强索引不可用时仍保留 Qdrant 的严格项目/提交隔离检索。
+                lexical_candidates = ()
+        for lexical_rank, lexical_context in enumerate(lexical_candidates):
+            key = (lexical_context.path, lexical_context.line_start, lexical_context.line_end)
+            existing_index = by_source.get(key)
+            if existing_index is None:
+                by_source[key] = len(candidates)
+                candidates.append((lexical_context, candidate_limit + lexical_rank))
+                continue
+            vector_context, vector_rank = candidates[existing_index]
+            candidates[existing_index] = (
+                RetrievedContext(
+                    content=vector_context.content,
+                    score=vector_context.score,
+                    path=vector_context.path,
+                    line_start=vector_context.line_start,
+                    line_end=vector_context.line_end,
+                    source_type=vector_context.source_type,
+                    document_id=vector_context.document_id,
+                    vector_score=vector_context.vector_score,
+                    bm25_score=lexical_context.bm25_score,
+                    symbols=vector_context.symbols or lexical_context.symbols,
+                ),
+                vector_rank,
+            )
         contexts = _hybrid_rerank(query, candidates, limit)
+        uses_bm25 = bool(self._chunk_store and self._chunk_store.lexical_available)
         return RetrievalResult(
             "READY",
             "CONTEXT_RETRIEVED",
             "上下文检索完成。",
             contexts,
             len(response.points) >= candidate_limit,
-            strategy="hybrid_vector_lexical_path",
+            strategy="hybrid_vector_bm25_lexical_symbol_path" if uses_bm25 else "hybrid_vector_lexical_symbol_path",
             candidate_count=len(candidates),
         )
 
@@ -886,9 +1213,10 @@ def _hybrid_rerank(
     ranked: list[tuple[float, RetrievedContext]] = []
     candidate_count = len(candidates)
     for context, vector_rank in candidates:
-        semantic_score = 1.0 - (vector_rank / max(candidate_count, 1))
-        lexical_score = _lexical_relevance(query, context)
-        hybrid_score = round(semantic_score * 0.45 + lexical_score * 0.55, 6)
+        semantic_score = 1.0 - (vector_rank / max(candidate_count, 1)) if context.vector_score is not None else 0.0
+        lexical_score = max(_lexical_relevance(query, context), context.bm25_score or 0.0)
+        symbol_score = _symbol_relevance(query, context.symbols)
+        hybrid_score = round(semantic_score * 0.3 + lexical_score * 0.4 + symbol_score * 0.3, 6)
         ranked.append(
             (
                 hybrid_score,
@@ -902,6 +1230,9 @@ def _hybrid_rerank(
                     document_id=context.document_id,
                     vector_score=context.vector_score,
                     lexical_score=lexical_score,
+                    bm25_score=context.bm25_score,
+                    symbols=context.symbols,
+                    symbol_score=symbol_score,
                 ),
             )
         )
@@ -928,6 +1259,40 @@ def _lexical_relevance(query: str, context: RetrievedContext) -> float:
     return min(1.0, round(score, 6))
 
 
+_JAVA_TYPE_PATTERN = re.compile(r"\b(?:class|interface|enum|record)\s+([A-Za-z_$][A-Za-z0-9_$]*)")
+_JAVA_METHOD_PATTERN = re.compile(
+    r"(?m)^\s*(?:(?:public|protected|private|static|final|abstract|synchronized|native|default)\s+)*"
+    r"(?:[A-Za-z_$][A-Za-z0-9_$<>?,.\[\]\s]*\s+)([A-Za-z_$][A-Za-z0-9_$]*)\s*\("
+)
+_JAVA_NON_METHOD_NAMES = frozenset({"if", "for", "while", "switch", "catch", "return", "throw", "new"})
+
+
+def _java_symbols(content: str) -> tuple[str, ...]:
+    """提取切块内稳定的 Java 声明名，不尝试构建完整 AST 或调用关系。"""
+
+    values = [*_JAVA_TYPE_PATTERN.findall(content)]
+    values.extend(name for name in _JAVA_METHOD_PATTERN.findall(content) if name not in _JAVA_NON_METHOD_NAMES)
+    return tuple(sorted(dict.fromkeys(values)))[:32]
+
+
+def _payload_symbols(payload: dict[str, object]) -> tuple[str, ...]:
+    values = payload.get("symbols")
+    if not isinstance(values, list):
+        return ()
+    return tuple(symbol for symbol in values if isinstance(symbol, str) and symbol)[:32]
+
+
+def _symbol_relevance(query: str, symbols: tuple[str, ...]) -> float:
+    terms = _query_terms(query)
+    if not terms or not symbols:
+        return 0.0
+    normalized = {symbol.lower() for symbol in symbols}
+    compact_query = re.sub(r"[^a-z0-9_$]", "", query.lower())
+    if compact_query and compact_query in normalized:
+        return 1.0
+    return round(sum(1 for term in terms if term in normalized) / len(terms), 6)
+
+
 def _is_safe_memory_path(path: str) -> bool:
     """记忆路径来自补丁执行结果，仍做最小结构校验避免污染长期索引。"""
 
@@ -940,6 +1305,13 @@ def _query_terms(query: str) -> tuple[str, ...]:
     normalized = re.sub(r"([a-z])([A-Z])", r"\1 \2", query).lower()
     terms = re.findall(r"[a-z0-9_]{2,}|[\u4e00-\u9fff]{2,}", normalized)
     return tuple(dict.fromkeys(terms))
+
+
+def _fts_query_terms(query: str) -> tuple[str, ...]:
+    """同时保留原始标识符与 camelCase 拆分词，避免 FTS 漏掉精确类名。"""
+
+    raw_terms = re.findall(r"[a-z0-9_]{2,}|[\u4e00-\u9fff]{2,}", query.lower())
+    return tuple(dict.fromkeys((*raw_terms, *_query_terms(query))))
 
 
 def split_context(
@@ -983,6 +1355,7 @@ def split_context(
                         line_start=line_start,
                         line_end=line_end,
                         content_sha256=content_hash,
+                        symbols=_java_symbols(content) if path.lower().endswith(".java") else (),
                     )
                 )
             if end >= len(segment):

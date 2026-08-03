@@ -62,6 +62,20 @@ class BlockedPreflightChecker(GraphPreflightChecker):
 
 
 class AppSettingsTests(unittest.TestCase):
+    def test_skill_roots_parse_semicolon_lists_and_keep_first_occurrence(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "REPOPILOT_USER_SKILL_ROOTS": "C:\\skills\\personal; C:\\skills\\personal ;D:\\team-skills",
+                "REPOPILOT_BUNDLED_SKILL_ROOTS": "D:\\repopilot\\bundled\nD:\\repopilot\\extra",
+            },
+            clear=True,
+        ):
+            settings = AppSettings(_env_file=None)
+
+        self.assertEqual((Path("C:/skills/personal"), Path("D:/team-skills")), settings.user_skill_roots)
+        self.assertEqual((Path("D:/repopilot/bundled"), Path("D:/repopilot/extra")), settings.bundled_skill_roots)
+
     def test_task_budget_is_optional_but_validates_positive_token_limit(self) -> None:
         with patch.dict(os.environ, {"REPOPILOT_TASK_MAX_TOTAL_TOKENS": "12000", "REPOPILOT_TASK_MAX_ESTIMATED_COST": "0.5"}, clear=True):
             budget = AppSettings(_env_file=None).task_budget()
@@ -238,7 +252,7 @@ class CodingGraphTests(unittest.TestCase):
         self.assertIn("MISSING_CONFIGURATION", str(result.state["tool_events"]))
         self.assertNotIn("PLAN_GENERATED", str(result.state["tool_events"]))
 
-    def test_same_thread_can_interrupt_then_resume_from_sqlite_checkpoint(self) -> None:
+    def test_same_thread_resume_fails_closed_when_minimal_graph_cannot_generate_patch_preview(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             repository = root / "repository"
@@ -267,10 +281,14 @@ class CodingGraphTests(unittest.TestCase):
             completed = resumed_runner.resume("thread-resume", approved=True)
             resumed_store.close()
 
-        self.assertEqual("WAITING_APPROVAL", completed.status)
-        self.assertEqual("EXECUTION_REVIEW", completed.state["pending_approval_action"])
-        self.assertTrue(completed.pending_approval)
-        self.assertEqual("EXECUTION_APPROVAL_REQUIRED", completed.interrupts[0]["type"])
+        self.assertEqual("BLOCKED", completed.status)
+        self.assertIn(
+            "未写入代码",
+            completed.state["error_summary"],
+        )
+        self.assertIn("PATCH_PROPOSAL_FAILED", str(completed.state["tool_events"]))
+        self.assertFalse(completed.pending_approval)
+        self.assertFalse(completed.interrupts)
 
     def test_blocked_graph_never_reaches_approval_or_passed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

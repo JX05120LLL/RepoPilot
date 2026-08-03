@@ -32,6 +32,25 @@ class TaskProgressTests(unittest.TestCase):
         self.assertEqual("current", _stage_state(progress, "execution_approval"))
         self.assertEqual("pending", _stage_state(progress, "patch"))
 
+    def test_shell_node_stays_in_controlled_write_stage(self) -> None:
+        progress = build_task_progress(status="SHELL", task_operation="change")
+
+        self.assertEqual("patch", progress["current_stage"])
+        self.assertEqual("current", _stage_state(progress, "patch"))
+
+    def test_verification_observation_stays_in_verification_stage(self) -> None:
+        progress = build_task_progress(
+            status="VERIFICATION_OBSERVATION",
+            task_operation="change",
+            tool_events=[
+                {"type": "NODE_COMPLETED", "node": "VERIFY"},
+                {"type": "NODE_COMPLETED", "node": "VERIFICATION_OBSERVATION"},
+            ],
+        )
+
+        self.assertEqual("verify", progress["current_stage"])
+        self.assertEqual("current", _stage_state(progress, "verify"))
+
     def test_maven_failure_is_marked_as_failed_without_passing_report(self) -> None:
         progress = build_task_progress(
             status="REPORT",

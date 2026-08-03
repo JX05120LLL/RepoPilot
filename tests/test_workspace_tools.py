@@ -194,6 +194,9 @@ class PermissionAndRepositoryToolsTests(unittest.TestCase):
 
             listed = tools.list_files(max_depth=1)
             searched = tools.search_code("OrderService")
+            symbol = tools.find_symbol("OrderService")
+            invalid_symbol = tools.find_symbol("OrderService|.*")
+            protected_symbol = tools.find_symbol("OrderService", Path(".git"))
             read = tools.read_file(Path("README.md"))
             secret = tools.read_file(Path(".env"))
             binary = tools.read_file(Path("binary.bin"))
@@ -208,13 +211,17 @@ class PermissionAndRepositoryToolsTests(unittest.TestCase):
                 "src/main/java/com/example/OrderService.java",
                 {item["path"] for item in searched.data["matches"]},
             )
+            self.assertEqual("READY", symbol.status)
+            self.assertEqual("type", symbol.data["matches"][0]["kind"])
+            self.assertEqual("INVALID_SYMBOL", invalid_symbol.code)
+            self.assertEqual("BLOCKED", protected_symbol.status)
             self.assertEqual("READY", read.status)
             self.assertEqual("BLOCKED", secret.status)
             self.assertEqual("BINARY_FILE", binary.code)
             self.assertEqual("FILE_TOO_LARGE", large.code)
             self.assertEqual("sample-service", build.data["pom"]["artifact_id"])
             event_types = [line for line in evidence.events_path.read_text(encoding="utf-8").splitlines()]
-            self.assertGreaterEqual(len(event_types), 7)
+            self.assertGreaterEqual(len(event_types), 10)
 
 
 class WorkspaceCliTests(unittest.TestCase):

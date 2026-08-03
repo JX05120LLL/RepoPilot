@@ -56,6 +56,7 @@ class CapabilityDescriptor:
     risks: frozenset[CapabilityRisk] = field(default_factory=lambda: frozenset({CapabilityRisk.READ}))
     enabled: bool = True
     metadata: Mapping[str, object] = field(default_factory=dict)
+    requires_approval: bool = False
 
     def __post_init__(self) -> None:
         if not _CAPABILITY_ID_PATTERN.fullmatch(self.capability_id):
@@ -80,6 +81,7 @@ class CapabilityDescriptor:
             "source": self.source,
             "risks": sorted(risk.value for risk in self.risks),
             "enabled": self.enabled,
+            "requires_approval": self.requires_approval,
             "metadata": deepcopy(dict(self.metadata)),
         }
 
@@ -114,6 +116,15 @@ class CapabilityPolicy:
     ) -> CapabilityDecision:
         if not descriptor.enabled:
             return CapabilityDecision(False, False, "CAPABILITY_DISABLED", "能力已被配置禁用。")
+
+        # 完全本机控制只扩大项目工作区范围，不会把任务级高风险能力自动设为已批准。
+        if descriptor.requires_approval and not approved:
+            return CapabilityDecision(
+                False,
+                True,
+                "CAPABILITY_APPROVAL_REQUIRED",
+                "该能力需要用户针对当前任务显式批准。",
+            )
 
         if permission.is_full_access:
             return CapabilityDecision(

@@ -17,20 +17,30 @@ from repopilot_guard.permissions import PermissionGrant
 from repopilot_guard.skills import SkillRegistry
 
 
-def _write_skill(root: Path, name: str, description: str, body: str, *, disabled: bool = False) -> Path:
+def _write_skill(
+    root: Path,
+    name: str,
+    description: str,
+    body: str,
+    *,
+    disabled: bool = False,
+    allowed_tools: tuple[str, ...] = ("read_file",),
+) -> Path:
     path = root / ".agents" / "skills" / name
     path.mkdir(parents=True)
     disable = "true" if disabled else "false"
     skill = path / "SKILL.md"
     skill.write_text(
-        "---\n"
-        f"name: {name}\n"
-        f"description: {description}\n"
-        f"disable-model-invocation: {disable}\n"
-        "allowed-tools:\n"
-        "  - read_file\n"
-        "---\n"
-        f"{body}\n",
+        (
+            "---\n"
+            f"name: {name}\n"
+            f"description: {description}\n"
+            f"disable-model-invocation: {disable}\n"
+            "allowed-tools:\n"
+            + "".join(f"  - {tool}\n" for tool in allowed_tools)
+            + "---\n"
+            + f"{body}\n"
+        ),
         encoding="utf-8",
     )
     return skill
@@ -49,6 +59,58 @@ def _retrieval() -> RetrievalResult:
 
 
 class ContextBrokerTests(unittest.TestCase):
+    def test_user_skill_root_participates_in_agent_context_without_becoming_project_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            user_root = root / "user-skills"
+            _write_skill(user_root, "team-java", "团队 Java 规范", "只读取 Service 与测试。")
+            capabilities = CapabilityRegistry(
+                (
+                    CapabilityDescriptor("read_file", "read_file", "读取文件。", CapabilityKind.BUILTIN_TOOL, CapabilityScope.BUNDLED, "test", frozenset({CapabilityRisk.READ})),
+                )
+            )
+            result = ContextBroker(
+                capabilities=capabilities,
+                user_skill_roots=(user_root / ".agents" / "skills",),
+            ).assemble(
+                task_description="修复订单查询 @team-java",
+                project_id="orders",
+                repo_commit="abc123",
+                workspace_root=root / "project",
+                retrieval=_retrieval(),
+                permission=PermissionGrant.safe(),
+            )
+
+        self.assertEqual("user", result.snapshot.selected_skills[0]["scope"])
+        self.assertEqual(["read_file"], result.snapshot.selected_skills[0]["effective_tools"])
+        self.assertIn("team-java", result.model_message)
+
+    def test_verification_context_keeps_only_bounded_structured_metadata(self) -> None:
+        result = ContextBroker(budget=ContextBudget(verification_result_chars=240)).verification_result_context(
+            {
+                "status": "FAILED",
+                "code": "MAVEN_FAILED",
+                "build_system": "maven",
+                "recipe": "test",
+                "exit_code": 1,
+                "duration_ms": 912,
+                "report_kind": "maven_surefire",
+                "build_reports": ["target/surefire-reports/OrderServiceTest.txt"],
+                "stdout_summary": "password=should-not-enter-model-context",
+                "stderr_summary": "authorization: should-not-enter-model-context",
+                "argv": ["mvnw.cmd", "test"],
+            }
+        )
+
+        self.assertIsNotNone(result.source)
+        self.assertEqual("verification_result", result.source.source_type)
+        self.assertIn('"status":"FAILED"', result.model_message)
+        self.assertIn('"report_count":1', result.model_message)
+        self.assertNotIn("should-not-enter-model-context", result.model_message)
+        self.assertNotIn("stdout_summary", result.model_message)
+        self.assertNotIn("mvnw.cmd", result.model_message)
+        self.assertNotIn("should-not-enter-model-context", str(result.event()))
+
     def test_assembles_budgeted_untrusted_context_and_freezes_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -58,7 +120,6 @@ class ContextBrokerTests(unittest.TestCase):
             capabilities = CapabilityRegistry(
                 (
                     CapabilityDescriptor("read_file", "read_file", "读取文件。", CapabilityKind.BUILTIN_TOOL, CapabilityScope.BUNDLED, "test", frozenset({CapabilityRisk.READ})),
-                    CapabilityDescriptor("mcp__docs__search", "search", "远程文档搜索。", CapabilityKind.MCP_TOOL, CapabilityScope.PROJECT, "mcp:docs", frozenset({CapabilityRisk.NETWORK})),
                 )
             )
             result = ContextBroker(
@@ -83,6 +144,7 @@ class ContextBrokerTests(unittest.TestCase):
             self.assertIn("skill__java-orders", result.snapshot.capability_ids)
             self.assertNotIn("mcp__docs__search", result.snapshot.capability_ids)
             self.assertEqual(("java-orders",), tuple(item["name"] for item in result.snapshot.selected_skills))
+            self.assertEqual(["read_file"], result.snapshot.selected_skills[0]["effective_tools"])
             self.assertEqual(
                 {"project_rule", "skill", "code", "repository_document"},
                 {source.source_type for source in result.snapshot.sources},
@@ -174,6 +236,52 @@ class ContextBrokerTests(unittest.TestCase):
             )
             self.assertIn("task_attachment", {source.source_type for source in result.snapshot.sources})
             self.assertNotIn("订单查询必须按租户过滤。", str(result.snapshot.to_dict()))
+
+    def test_skill_tool_request_is_intersected_with_task_bound_and_policy_allowed_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            _write_skill(
+                root,
+                "java-orders",
+                "Java 订单维护",
+                "检查订单查询。",
+                allowed_tools=("read_file", "search_code", "mcp__docs__search"),
+            )
+            capabilities = CapabilityRegistry(
+                (
+                    CapabilityDescriptor("read_file", "read_file", "读取文件。", CapabilityKind.BUILTIN_TOOL, CapabilityScope.BUNDLED, "test", frozenset({CapabilityRisk.READ})),
+                    CapabilityDescriptor("mcp__docs__search", "search", "远程文档搜索。", CapabilityKind.MCP_TOOL, CapabilityScope.PROJECT, "mcp:docs", frozenset({CapabilityRisk.NETWORK})),
+                )
+            )
+            result = ContextBroker(capabilities=capabilities).assemble(
+                task_description="使用 @java-orders 修复订单",
+                project_id="orders",
+                repo_commit="abc123",
+                workspace_root=root,
+                retrieval=_retrieval(),
+                permission=PermissionGrant.safe(),
+                bound_tool_ids=("read_file", "search_code", "mcp__docs__search"),
+            )
+
+            skill = result.snapshot.selected_skills[0]
+            self.assertEqual(["read_file", "search_code", "mcp__docs__search"], skill["allowed_tools"])
+            self.assertEqual(["read_file"], skill["effective_tools"])
+            self.assertEqual(("read_file",), result.snapshot.bound_tool_ids)
+            self.assertIn('"java-orders": ["read_file"]', result.model_message)
+
+    def test_execution_diff_is_budgeted_for_model_but_audit_event_only_keeps_hash(self) -> None:
+        broker = ContextBroker(budget=ContextBudget(execution_diff_chars=40))
+        diff = "diff --git a/src/OrderService.java b/src/OrderService.java\n+" + ("+private-token-like-value\n" * 8)
+
+        result = broker.execution_diff_context(diff)
+
+        self.assertIn("不可信执行后真实 Diff", result.model_message)
+        self.assertIn("[上下文已按预算截断]", result.model_message)
+        self.assertTrue(result.truncated)
+        self.assertEqual(40, result.included_chars)
+        self.assertEqual("git_diff", result.source.source_type if result.source else None)
+        self.assertEqual(64, len(result.source.content_sha256 if result.source else ""))
+        self.assertNotIn("private-token-like-value", str(result.event()))
 
 
 if __name__ == "__main__":

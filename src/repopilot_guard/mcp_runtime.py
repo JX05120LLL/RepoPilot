@@ -42,6 +42,7 @@ DEFAULT_CONNECT_ATTEMPTS = 2
 DEFAULT_RETRY_BACKOFF_SECONDS = 0.5
 DEFAULT_CIRCUIT_FAILURES = 3
 DEFAULT_CIRCUIT_COOLDOWN_SECONDS = 60
+DEFAULT_MAX_PENDING_COMMANDS = 32
 
 
 class McpConnectionState(str, Enum):
@@ -201,6 +202,8 @@ class McpToolCallResult:
     output_sha256: str
     original_chars: int
     duration_ms: int
+    # 仅供受控任务 Artifact 写入使用；to_dict()、日志、SSE 与 checkpoint 均不会序列化此字段。
+    artifact_content: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -354,12 +357,13 @@ class _McpServerActor:
         environment: Mapping[str, str],
         workspace_root: Path | None,
         failure_count: int,
+        max_pending_commands: int,
     ) -> None:
         self.config = config
         self._connector = connector
         self._environment = dict(environment)
         self._workspace_root = workspace_root
-        self._queue: asyncio.Queue[_ActorCommand] = asyncio.Queue()
+        self._queue: asyncio.Queue[_ActorCommand] = asyncio.Queue(maxsize=max_pending_commands)
         self._ready: asyncio.Future[McpServerSnapshot] | None = None
         self._task: asyncio.Task[None] | None = None
         self.discovery = McpToolDiscovery(())
@@ -391,8 +395,11 @@ class _McpServerActor:
     async def stop(self) -> McpServerSnapshot:
         if self._task is None or self._task.done():
             return self.snapshot
+        # 关闭不能因背压被拒绝；按队列顺序等待已接受调用完成后再关闭连接。
+        future: asyncio.Future[object] = asyncio.get_running_loop().create_future()
         with suppress(McpRuntimeError):
-            await self._request("close")
+            await self._queue.put(_ActorCommand("close", future))
+            await future
         with suppress(asyncio.CancelledError, Exception):
             await self._task
         return self.snapshot
@@ -406,7 +413,10 @@ class _McpServerActor:
         if self._task is None or self._task.done() or self.snapshot.state is not McpConnectionState.READY:
             raise McpRuntimeError("MCP_SERVER_NOT_READY", self.snapshot.state)
         future: asyncio.Future[object] = asyncio.get_running_loop().create_future()
-        await self._queue.put(_ActorCommand(operation, future, tool_name, arguments))
+        try:
+            self._queue.put_nowait(_ActorCommand(operation, future, tool_name, arguments))
+        except asyncio.QueueFull as error:
+            raise McpRuntimeError("MCP_SERVER_BUSY", McpConnectionState.READY) from error
         return await future
 
     async def _run(self) -> None:
@@ -521,9 +531,16 @@ class McpRuntime:
         retry_backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS,
         circuit_failures: int = DEFAULT_CIRCUIT_FAILURES,
         circuit_cooldown_seconds: int = DEFAULT_CIRCUIT_COOLDOWN_SECONDS,
+        max_pending_commands: int = DEFAULT_MAX_PENDING_COMMANDS,
         event_sink: Callable[[McpRuntimeEvent], None] | None = None,
     ) -> None:
-        if connect_attempts < 1 or retry_backoff_seconds < 0 or circuit_failures < 1 or circuit_cooldown_seconds < 1:
+        if (
+            connect_attempts < 1
+            or retry_backoff_seconds < 0
+            or circuit_failures < 1
+            or circuit_cooldown_seconds < 1
+            or max_pending_commands < 1
+        ):
             raise ValueError("INVALID_MCP_RUNTIME_LIMITS")
         self._configuration = configuration
         self._configs = {server.name: server for server in configuration.servers}
@@ -534,6 +551,7 @@ class McpRuntime:
         self._retry_backoff_seconds = retry_backoff_seconds
         self._circuit_failures = circuit_failures
         self._circuit_cooldown_seconds = circuit_cooldown_seconds
+        self._max_pending_commands = max_pending_commands
         self._event_sink = event_sink
         self._events: list[McpRuntimeEvent] = []
         self._sequence = 0
@@ -635,6 +653,7 @@ class McpRuntime:
                 environment,
                 self._workspace_root,
                 self._failures[server_name],
+                self._max_pending_commands,
             )
             self._actors[server_name] = actor
             last_snapshot = await actor.start()
@@ -666,6 +685,9 @@ class McpRuntime:
         try:
             await actor.ping()
         except McpRuntimeError as error:
+            if error.code == "MCP_SERVER_BUSY":
+                self._event("MCP_PING_BLOCKED", server_name, error.code)
+                return {"status": "BLOCKED", "code": error.code, "server_name": server_name}
             await actor.stop()
             self._capture_actor_failure(server_name, actor, error.code)
             return {"status": "BLOCKED", "code": error.code, "server_name": server_name}
@@ -724,6 +746,16 @@ class McpRuntime:
             raw = await actor.call_tool(descriptor.name, arguments)
         except McpRuntimeError as error:
             duration_ms = _elapsed_ms(started)
+            if error.code == "MCP_SERVER_BUSY":
+                self._event(
+                    "MCP_TOOL_BLOCKED",
+                    server_name,
+                    error.code,
+                    tool_name=capability_id,
+                    duration_ms=duration_ms,
+                    argument_keys=tuple(sorted(arguments)),
+                )
+                return _blocked_call(error.code, server_name, capability_id, duration_ms)
             await actor.stop()
             self._capture_actor_failure(server_name, actor, error.code)
             self._event(
@@ -956,6 +988,7 @@ def _bounded_tool_result(
         digest,
         len(serialized),
         duration_ms,
+        serialized,
     )
 
 

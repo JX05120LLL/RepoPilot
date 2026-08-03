@@ -7,6 +7,8 @@ from pathlib import Path
 
 from repopilot_guard.models import TaskMode, TaskOperation
 from repopilot_guard.preflight import PreflightInspector
+from repopilot_guard.project_profiles import profile_payload
+from repopilot_guard.profile_runtime import ProfileRuntimeInspector
 from repopilot_guard.project_registry import ProjectRecord
 from repopilot_guard.workspace import GitClient, GitCommandError
 
@@ -113,8 +115,12 @@ def assess_task_admission(
     )
 
 
-def diagnose_project(project: ProjectRecord) -> dict[str, object]:
-    """按实际工作区规则说明两种产品模式和 Java/Maven Profile 的可用性。"""
+def diagnose_project(
+    project: ProjectRecord,
+    *,
+    runtime_inspector: ProfileRuntimeInspector | None = None,
+) -> dict[str, object]:
+    """按实际工作区规则说明两种产品模式和已识别技术栈的可用性。"""
 
     preflight = PreflightInspector().inspect(project.root_path)
     safe_mode: dict[str, object]
@@ -175,14 +181,43 @@ def diagnose_project(project: ProjectRecord) -> dict[str, object]:
         if full_change_ready
         else [TaskOperation.RESEARCH.value]
     )
-    java_profile = {
-        "status": "READY" if preflight.has_pom_xml else "PARTIAL",
-        "code": "JAVA_MAVEN_PROFILE_READY" if preflight.has_pom_xml else "MAVEN_POM_NOT_FOUND",
-        "has_pom_xml": preflight.has_pom_xml,
-        "java_source_root": str(preflight.java_source_root) if preflight.java_source_root else None,
-        "maven_wrapper": str(preflight.maven_wrapper) if preflight.maven_wrapper else None,
-        "warnings": list(preflight.warnings),
-    }
+    profiles = profile_payload(project.root_path)
+    inspector = runtime_inspector or ProfileRuntimeInspector()
+    for profile_id, profile in profiles.items():
+        profile["runtime"] = inspector.inspect(profile_id, project.root_path).to_dict()
+    if "java_maven" in profiles:
+        profiles["java_maven"].update(
+            {
+                "has_pom_xml": preflight.has_pom_xml,
+                "java_source_root": str(preflight.java_source_root) if preflight.java_source_root else None,
+                "maven_wrapper": str(preflight.maven_wrapper) if preflight.maven_wrapper else None,
+                "warnings": list(preflight.warnings),
+            }
+        )
+    if "java_gradle" in profiles:
+        profiles["java_gradle"].update(
+            {
+                "has_gradle_build": preflight.has_gradle_build,
+                "gradle_wrapper": str(preflight.gradle_wrapper) if preflight.gradle_wrapper else None,
+                "warnings": list(preflight.warnings),
+            }
+        )
+    if "python_pytest" in profiles:
+        profiles["python_pytest"].update(
+            {
+                "has_pytest_project": preflight.has_pytest_project,
+                "warnings": list(preflight.warnings),
+            }
+        )
+    for profile_id in ("node_npm", "node_pnpm"):
+        if profile_id in profiles:
+            profiles[profile_id].update(
+                {
+                    "has_node_project": preflight.has_node_project,
+                    "package_manager": "pnpm" if profile_id == "node_pnpm" else "npm",
+                    "warnings": list(preflight.warnings),
+                }
+            )
     recommended_mode = "safe-isolated" if safe_mode["status"] == "READY" else "full-local"
     recommended_operation = (
         TaskOperation.CHANGE.value
@@ -201,7 +236,7 @@ def diagnose_project(project: ProjectRecord) -> dict[str, object]:
             "baseline_commit": baseline_commit,
             "dirty_entry_count": len(dirty_entries),
         },
-        "profiles": {"java_maven": java_profile},
+        "profiles": profiles,
         "next_actions": (
             ["可以使用 task start 的默认安全隔离修复模式。"]
             if recommended_mode == "safe-isolated"
