@@ -42,7 +42,7 @@ from repopilot_guard.execution import PatchApplyResult, PatchProposal, Structure
 from repopilot_guard.config import ComponentCheck
 from repopilot_guard.models import TaskBudget, TaskOperation, TaskRequest, VerificationContract, WorkspaceMode, WorkspaceSelection
 from repopilot_guard.permissions import FULL_ACCESS_CONFIRMATION, PermissionGrant, PermissionMode
-from repopilot_guard.policy import GradleRecipeName, NodeRecipeName, PytestRecipeName
+from repopilot_guard.policy import GradleRecipeName, NodeRecipeName, NoVerificationRecipeName, PytestRecipeName
 from repopilot_guard.recipes import GradleRecipeRunner, NodeRecipeRunner, PytestRecipeRunner, RecipeCommand
 from repopilot_guard.shell_runtime import ShellCommandProposal, ShellRuntime
 from repopilot_guard.workspace import WorkspaceManager
@@ -1214,6 +1214,63 @@ class PhaseFourGraphTests(unittest.TestCase):
         self.assertEqual("NON_GIT_LOCAL_READY", repository_check["code"])
         self.assertEqual("READY", repository_check["status"])
 
+    def test_full_local_change_uses_non_git_file_snapshot_and_text_diff(self) -> None:
+        class NonGitChangeModel(PlannedResearchModel):
+            def plan(self, messages: list[dict[str, str]], state: object) -> PlanGenerationResult:
+                return PlanGenerationResult(
+                    super().plan(messages, state).plan.model_copy(
+                        update={"verification_recipe": NoVerificationRecipeName.NONE}
+                    )
+                )
+
+            def propose_patch(self, messages: list[dict[str, str]], state: object) -> PatchGenerationResult:
+                return PatchGenerationResult(
+                    PatchProposal(
+                        summary="非 Git 文本补丁",
+                        changes=[{
+                            "path": "src/main/java/com/example/OrderService.java",
+                            "expected_old_text": "void findOrder() {}",
+                            "new_text": "void findOrder() { /* verified */ }",
+                        }],
+                        recipe=NoVerificationRecipeName.NONE,
+                    )
+                )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            directory = root / "plain-project"
+            source = directory / "src" / "main" / "java" / "com" / "example" / "OrderService.java"
+            source.parent.mkdir(parents=True)
+            source.write_text("class OrderService { void findOrder() {} }\n", encoding="utf-8")
+            runner, store = self._runner(root / "state.sqlite", NonGitChangeModel())
+            source_after_execution = ""
+            try:
+                initial = runner.run(
+                    TaskRequest(
+                        directory,
+                        "修复订单查询的权限校验",
+                        root / "runs",
+                        operation=TaskOperation.CHANGE,
+                        workspace_selection=WorkspaceSelection(mode=WorkspaceMode.LOCAL),
+                    ),
+                    "non-git-change-thread",
+                    PermissionGrant(PermissionMode.FULL, FULL_ACCESS_CONFIRMATION),
+                )
+                execution_review = runner.resume("non-git-change-thread", approved=True)
+                completed = runner.resume("non-git-change-thread", approved=True)
+                source_after_execution = source.read_text(encoding="utf-8")
+            finally:
+                store.close()
+
+        self.assertTrue(initial.pending_approval)
+        self.assertTrue(str(initial.state["base_commit"]).startswith("non-git-"))
+        self.assertTrue(execution_review.pending_approval)
+        self.assertIn("--- a/src/main/java/com/example/OrderService.java", execution_review.state["patch_preview"]["diff"])
+        self.assertEqual("REPORT", completed.status)
+        self.assertEqual("UNVERIFIED", completed.verdict)
+        self.assertIn("verified", source_after_execution)
+        self.assertIn("--- a/src/main/java/com/example/OrderService.java", completed.state["git_diff"])
+
     def test_confirmed_full_local_research_can_observe_project_git_state_with_shell(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -1288,7 +1345,7 @@ class PhaseFourGraphTests(unittest.TestCase):
         self.assertEqual("authorization: [REDACTED]", arguments["argv"][3])
         self.assertEqual("src/main/java", arguments["path"])
 
-    def test_non_git_preflight_bypass_requires_research_operation(self) -> None:
+    def test_non_git_preflight_bypass_allows_full_local_file_snapshot_operation(self) -> None:
         result = PhaseOnePreflightResult(
             False,
             (
@@ -1308,7 +1365,7 @@ class PhaseFourGraphTests(unittest.TestCase):
         }
 
         self.assertTrue(_allows_non_git_local_research(base_state, result))
-        self.assertFalse(
+        self.assertTrue(
             _allows_non_git_local_research(
                 {**base_state, "task_operation": TaskOperation.CHANGE.value},
                 result,

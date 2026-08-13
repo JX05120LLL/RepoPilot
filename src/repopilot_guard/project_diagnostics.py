@@ -82,6 +82,8 @@ def assess_task_admission(
             allowed,
         )
 
+    # 完全本机控制不依赖 Git：没有可解析 HEAD 时，后续工作区会冻结文件哈希并
+    # 生成统一文本 Diff。它仍要求任务级完全权限确认，不能替代安全隔离 Worktree。
     baseline_available = False
     if preflight.is_git_repository:
         try:
@@ -89,24 +91,7 @@ def assess_task_admission(
             baseline_available = True
         except GitCommandError:
             pass
-    allowed = (TaskOperation.CHANGE, TaskOperation.RESEARCH) if baseline_available else (TaskOperation.RESEARCH,)
-    if operation not in allowed:
-        code = (
-            "FULL_LOCAL_CHANGE_REQUIRES_GIT_BASELINE"
-            if preflight.is_git_repository
-            else "FULL_LOCAL_CHANGE_REQUIRES_GIT"
-        )
-        message = (
-            "当前 Git 仓库没有可解析的提交，无法生成可信基线和 Diff；请先创建提交，或改用仅研究。"
-            if preflight.is_git_repository
-            else "非 Git 项目无法提供可信基线和 Diff，当前只允许仅研究；如需修改代码，请先初始化 Git 并创建提交。"
-        )
-        return TaskAdmission(
-            False,
-            code,
-            message,
-            allowed,
-        )
+    allowed = (TaskOperation.CHANGE, TaskOperation.RESEARCH)
     return TaskAdmission(
         True,
         "FULL_LOCAL_TASK_READY",
@@ -160,14 +145,16 @@ def diagnose_project(
     full_change_ready = baseline_commit is not None
     full_mode = {
         "status": "READY",
-        "code": "FULL_LOCAL_READY" if full_change_ready else "FULL_LOCAL_RESEARCH_ONLY",
+        "code": "FULL_LOCAL_READY" if full_change_ready else "FULL_LOCAL_FILE_SNAPSHOT_READY",
         "message": (
             "完全本机控制可在 Local 工作区执行已实现的受控工具，仍需按任务二次确认。"
             if full_change_ready
             else (
-                "当前 Git 仓库没有可解析的提交，只能进行研究；创建基线提交后才能修改代码。"
+                "当前 Git 仓库尚无可解析提交；完全本机控制会冻结文件快照并生成文本 Diff，"
+                "但不能创建 Worktree、分支或 Git 级交接记录。"
                 if preflight.is_git_repository
-                else "非 Git 项目可在完全本机控制下进行研究；无法创建 Worktree 或提供可信 Git Diff。"
+                else "非 Git 项目可在完全本机控制下执行受控分析和修改；系统会冻结文件快照并生成文本 Diff，"
+                "但不能创建 Worktree、分支或 Git 级交接记录。"
             )
         ),
     }
@@ -176,11 +163,7 @@ def diagnose_project(
         if safe_mode["status"] == "READY"
         else []
     )
-    full_mode["allowed_operations"] = (
-        [operation.value for operation in TaskOperation]
-        if full_change_ready
-        else [TaskOperation.RESEARCH.value]
-    )
+    full_mode["allowed_operations"] = [operation.value for operation in TaskOperation]
     profiles = profile_payload(project.root_path)
     inspector = runtime_inspector or ProfileRuntimeInspector()
     for profile_id, profile in profiles.items():
@@ -219,11 +202,7 @@ def diagnose_project(
                 }
             )
     recommended_mode = "safe-isolated" if safe_mode["status"] == "READY" else "full-local"
-    recommended_operation = (
-        TaskOperation.CHANGE.value
-        if full_change_ready
-        else TaskOperation.RESEARCH.value
-    )
+    recommended_operation = TaskOperation.CHANGE.value
     return {
         "status": "READY",
         "code": "PROJECT_DIAGNOSIS_READY",
@@ -240,6 +219,9 @@ def diagnose_project(
         "next_actions": (
             ["可以使用 task start 的默认安全隔离修复模式。"]
             if recommended_mode == "safe-isolated"
-            else ["如需安全隔离修复，请初始化 Git 并创建至少一个干净提交。", "如仅需研究，可使用完整本机控制并完成任务级确认。"]
+            else [
+                "如需安全隔离修复，请初始化 Git 并创建至少一个干净提交。",
+                "非 Git 或无提交项目可切换到完全本机控制：系统将使用文件快照与文本 Diff，不会自动初始化或提交 Git。",
+            ]
         ),
     }

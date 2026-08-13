@@ -2418,7 +2418,27 @@ export function App() {
         await sendChat();
         return;
       }
-      await start(route.intent === "code_research" ? "research" : "change");
+      const nextOperation: Operation = route.intent === "code_research" ? "research" : "change";
+      // 非 Git 项目不能安全创建 Worktree。Router 识别为代码任务时，主动切到
+      // 可用的本地快照模式，仍要求用户完成完全本机确认后才能写入。
+      if (
+        currentProject &&
+        !currentProject.is_git_repository &&
+        (projectDiagnosis?.task_modes.full_local.allowed_operations ?? []).includes(nextOperation)
+      ) {
+        setMode("full-local");
+        setConfirmed(false);
+        setOperation(nextOperation);
+        setComposerMode(nextOperation);
+        setRequestError(
+          nextOperation === "change"
+            ? "非 Git 项目将使用本地文件快照。请确认“完全本机访问”后再次发送，才会修改文件。"
+            : "已切换到完全本机的文件快照分析模式，请再次发送以开始只读研究。",
+        );
+        return;
+      }
+      setOperation(nextOperation);
+      await start(nextOperation);
     } catch (error) {
       setRequestError(error instanceof Error ? error.message : "无法识别请求意图");
     } finally {
@@ -2854,7 +2874,7 @@ export function App() {
   const taskAdmissionMessage = operationAllowed
     ? ""
     : mode === "full-local" && operation === "change"
-      ? "当前项目不是 Git 仓库，无法生成可信基线和 Diff；请使用计划模式，或先初始化 Git 并创建提交。"
+      ? "当前项目暂不支持所选修改流程；请刷新项目诊断后重试。"
       : (selectedModeReadiness?.message ?? "当前项目不支持所选任务类型。");
   const safeModeBlockedByProject = Boolean(
     currentProject && (safeModeReadiness ? safeModeReadiness.status !== "READY" : !currentProject.is_git_repository),
@@ -2863,8 +2883,8 @@ export function App() {
   const projectStatusLabel = projectDiagnosis
     ? projectDiagnosis.task_modes.safe_isolated.status === "READY"
       ? "隔离修复可用"
-      : projectDiagnosis.task_modes.full_local.code === "FULL_LOCAL_RESEARCH_ONLY"
-        ? "仅完整本机计划"
+      : projectDiagnosis.task_modes.full_local.code === "FULL_LOCAL_FILE_SNAPSHOT_READY"
+        ? "本地快照修改可用"
         : projectDiagnosis.task_modes.safe_isolated.code
     : currentProject
       ? currentProject.is_git_repository
@@ -2886,11 +2906,11 @@ export function App() {
           value:
             projectDiagnosis?.task_modes.safe_isolated.status === "READY"
               ? "安全隔离可用"
-              : "完整本机研究",
+              : "本地快照模式",
         },
         {
           label: "Git 基线",
-          value: currentProject.is_git_repository ? "已识别" : "未初始化",
+          value: currentProject.is_git_repository ? "已识别" : "未初始化（可用文件快照）",
         },
         {
           label: "工程 Profile",
@@ -4075,6 +4095,7 @@ export function App() {
                       onChange={(event) => {
                         setDescription(event.target.value);
                         setIntentRoute(null);
+                        setRequestError("");
                       }}
                       onKeyDown={(event) => {
                         if (

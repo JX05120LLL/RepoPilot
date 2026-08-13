@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from repopilot_guard.permissions import PermissionGrant
 from repopilot_guard.policy import GradleRecipeName, MavenRecipeName, NodeRecipeName, NoVerificationRecipeName, PolicyGuard, PytestRecipeName, ToolName
 from repopilot_guard.recipes import GradleExecutionResult, GradleRecipeRunner, MavenExecutionResult, MavenRecipeRunner, NodeExecutionResult, NodeRecipeRunner, PytestExecutionResult, PytestRecipeRunner
-from repopilot_guard.workspace import GitClient
+from repopilot_guard.workspace import GitClient, GitCommandError
 
 
 MAX_PATCH_FILES = 8
@@ -127,8 +127,25 @@ class StructuredPatchApplier:
                 item.target.write_bytes(item.original)
             return PatchApplyResult("FAILED", "PATCH_WRITE_FAILED", f"写入补丁失败且已尝试回滚：{error}")
 
-        diff = self._git.run(root, "diff", "--binary", "HEAD")
+        diff = self._render_diff(root, prepared)
         return PatchApplyResult("READY", "PATCH_APPLIED", "结构化补丁已应用，尚未验证。", tuple(item.relative_path for item in prepared), diff)
+
+    def _render_diff(self, root: Path, prepared: list[_PreparedPatchChange]) -> str:
+        """优先保留 Git 二进制 Diff；非 Git 项目回退到同一批已校验文本的统一 Diff。"""
+
+        try:
+            return self._git.run(root, "diff", "--binary", "HEAD")
+        except GitCommandError:
+            return "".join(
+                line
+                for item in prepared
+                for line in unified_diff(
+                    item.original.decode("utf-8").splitlines(keepends=True),
+                    item.updated.decode("utf-8").splitlines(keepends=True),
+                    fromfile=f"a/{item.relative_path}",
+                    tofile=f"b/{item.relative_path}",
+                )
+            )
 
     @staticmethod
     def _prepare(

@@ -152,11 +152,12 @@ class WorkspaceManager:
                     permission=permission,
                     snapshot=None,
                     workspace_path=request.repository,
-                    message="已绑定非 Git 的 Local 工作区；允许只读研究，但无法提供 Worktree 或 Git Diff 证据。",
+                    message="已绑定 Local 文件快照工作区；允许受控分析和修改，使用文件哈希基线与文本 Diff，"
+                    "但无法提供 Worktree、分支或 Git Diff 证据。",
                     created_at=created_at,
                     source_unchanged=False,
                     mode=selection.mode,
-                    base_commit=f"non-git-{fingerprint[:16]}",
+                    base_commit=f"non-git-{fingerprint}",
                 )
             return WorkspacePreparationResult(
                 status="BLOCKED",
@@ -296,13 +297,26 @@ class WorkspaceManager:
 
     def status(self, workspace_path: Path) -> dict[str, object]:
         workspace = workspace_path.expanduser().resolve()
-        return {
-            "status": "READY",
-            "workspace_path": str(workspace),
-            "head_commit": self._git.head_commit(workspace),
-            "branch": self._git.run(workspace, "rev-parse", "--abbrev-ref", "HEAD").strip(),
-            "dirty_entries": list(self._git.status_porcelain(workspace)),
-        }
+        try:
+            return {
+                "status": "READY",
+                "workspace_path": str(workspace),
+                "head_commit": self._git.head_commit(workspace),
+                "branch": self._git.run(workspace, "rev-parse", "--abbrev-ref", "HEAD").strip(),
+                "dirty_entries": list(self._git.status_porcelain(workspace)),
+                "content_sha256": self._content_digest(workspace),
+                "baseline_kind": "git",
+            }
+        except GitCommandError:
+            return {
+                "status": "READY",
+                "workspace_path": str(workspace),
+                "head_commit": None,
+                "branch": None,
+                "dirty_entries": [],
+                "content_sha256": self._filesystem_digest(workspace),
+                "baseline_kind": "file_snapshot",
+            }
 
     def handoff_to_local(
         self,

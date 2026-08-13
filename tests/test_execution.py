@@ -9,7 +9,7 @@ from pathlib import Path
 
 from repopilot_guard.execution import PatchFileChange, PatchProposal, StructuredPatchApplier
 from repopilot_guard.models import TaskMode, WorkspaceMode
-from repopilot_guard.permissions import PermissionGrant
+from repopilot_guard.permissions import FULL_ACCESS_CONFIRMATION, PermissionGrant, PermissionMode
 from repopilot_guard.policy import GradleRecipeName, MavenRecipeName, NodeRecipeName, PytestRecipeName
 from repopilot_guard.recipes import GradleRecipeCatalog, GradleRecipeRunner, MavenRecipeRunner, NodeRecipeCatalog, NodeRecipeRunner, PytestRecipeCatalog, PytestRecipeRunner, RecipeCommand
 
@@ -83,6 +83,22 @@ class StructuredPatchApplierTests(unittest.TestCase):
             self.assertIn("-class Preview { String value = \"old\"; }", result.diff)
             self.assertIn("+class Preview { String value = \"new\"; }", result.diff)
             self.assertIn("old", source.read_text(encoding="utf-8"))
+
+    def test_non_git_workspace_uses_unified_diff_after_applying_patch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "Sample.java"
+            source.write_text("class Sample { String value = \"old\"; }\n", encoding="utf-8")
+            proposal = PatchProposal(
+                summary="替换演示值",
+                changes=[PatchFileChange(path="Sample.java", expected_old_text='String value = "old";', new_text='String value = "new";')],
+            )
+
+            result = StructuredPatchApplier().apply(root, proposal, PermissionGrant(PermissionMode.FULL, FULL_ACCESS_CONFIRMATION), {"Sample.java"})
+
+        self.assertEqual("READY", result.status)
+        self.assertIn("--- a/Sample.java", result.diff)
+        self.assertIn('+class Sample { String value = "new"; }', result.diff)
 
     @staticmethod
     def _init_repository(root: Path) -> None:

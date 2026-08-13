@@ -1213,7 +1213,7 @@ class CodingGraphFactory:
         graph.add_conditional_edges(
             "VERIFY",
             self._route_after_verification,
-            {"observe": "VERIFICATION_OBSERVATION", "report": "REPORT"},
+            {"observe": "VERIFICATION_OBSERVATION", "review": "REVIEW", "report": "REPORT"},
         )
         graph.add_conditional_edges(
             "VERIFICATION_OBSERVATION",
@@ -1411,7 +1411,7 @@ class CodingGraphFactory:
                     component=check.component,
                     ready=True,
                     code="NON_GIT_LOCAL_READY",
-                    message="完全本机控制允许非 Git 项目进入只读研究；无法提供 Git 基线证据。",
+                    message="完全本机控制允许非 Git 项目使用文件快照基线；无法提供 Git 基线、Worktree 或分支证据。",
                 ) if check.component == "repository" else check
                 for check in result.checks
             )
@@ -2299,6 +2299,16 @@ class CodingGraphFactory:
                     "current_entry_count": len(current_dirty_entries),
                 },
             )
+        if str(state.get("base_commit", "")).startswith("non-git-"):
+            expected_digest = str(state["base_commit"])[len("non-git-"):]
+            current_digest = workspace_status.get("content_sha256")
+            if current_digest != expected_digest:
+                return _blocked(
+                    state,
+                    "WORKSPACE_CHANGED_AFTER_APPROVAL",
+                    "工作区文件快照在任务准备后发生变化；为避免覆盖并发改动，已拒绝生成和应用补丁。",
+                    {"type": "WORKSPACE_FILE_SNAPSHOT_DRIFT_BLOCKED"},
+                )
         if not draft_only and state.get("patch_proposal") is not None:
             try:
                 proposal = PatchProposal.model_validate(state["patch_proposal"])
@@ -3268,13 +3278,12 @@ def _project_id(state: GraphState) -> str:
 
 
 def _allows_non_git_local_research(state: GraphState, result: PhaseOnePreflightResult) -> bool:
-    """完全本机控制下的只读研究可进入非 Git 目录，写入任务仍必须保留 Git 基线。"""
+    """完全本机控制可进入非 Git 目录，使用文件快照而非伪造 Git 基线。"""
     repository_check = next((check for check in result.checks if check.component == "repository"), None)
     return bool(
         repository_check
         and state.get("workspace_mode") == WorkspaceMode.LOCAL.value
         and state.get("permission_mode") == PermissionMode.FULL.value
-        and state.get("task_operation") == TaskOperation.RESEARCH.value
         and repository_check.code == "REPOSITORY_PREFLIGHT_FAILED"
         and "Repository is not a Git working tree." in repository_check.missing_fields
     )
