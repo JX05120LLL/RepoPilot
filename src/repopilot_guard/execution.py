@@ -11,7 +11,7 @@ from typing import Callable
 from pydantic import BaseModel, Field
 
 from repopilot_guard.permissions import PermissionGrant
-from repopilot_guard.policy import GradleRecipeName, MavenRecipeName, NodeRecipeName, PolicyGuard, PytestRecipeName, ToolName
+from repopilot_guard.policy import GradleRecipeName, MavenRecipeName, NodeRecipeName, NoVerificationRecipeName, PolicyGuard, PytestRecipeName, ToolName
 from repopilot_guard.recipes import GradleExecutionResult, GradleRecipeRunner, MavenExecutionResult, MavenRecipeRunner, NodeExecutionResult, NodeRecipeRunner, PytestExecutionResult, PytestRecipeRunner
 from repopilot_guard.workspace import GitClient
 
@@ -33,7 +33,7 @@ class PatchFileChange(BaseModel):
 class PatchProposal(BaseModel):
     summary: str = Field(min_length=1)
     changes: list[PatchFileChange] = Field(min_length=1, max_length=MAX_PATCH_FILES)
-    recipe: MavenRecipeName | GradleRecipeName | PytestRecipeName | NodeRecipeName = MavenRecipeName.TEST
+    recipe: MavenRecipeName | GradleRecipeName | PytestRecipeName | NodeRecipeName | NoVerificationRecipeName = MavenRecipeName.TEST
     test_class: str | None = None
 
 

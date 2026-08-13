@@ -2945,7 +2945,8 @@ textarea::placeholder {
 
 .composer-error,
 .attachment-row,
-.full-access-confirmation {
+.full-access-confirmation,
+.intent-route-confirmation {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -2972,6 +2973,39 @@ textarea::placeholder {
 
 .full-access-confirmation b {
   display: block;
+}
+
+.intent-route-confirmation {
+  justify-content: space-between;
+  color: #354252;
+  background: #eff5fb;
+  border: 1px solid #d5e2ee;
+}
+
+.intent-route-confirmation b,
+.intent-route-confirmation span {
+  display: block;
+}
+
+.intent-route-confirmation span {
+  margin-top: 3px;
+  color: #667382;
+}
+
+.intent-route-actions {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 6px;
+}
+
+.intent-route-actions button {
+  border: 1px solid #c8d7e6;
+  border-radius: 5px;
+  padding: 4px 7px;
+  color: #355a7a;
+  background: #fff;
+  font: inherit;
+  cursor: pointer;
 }
 
 .attachment-row {

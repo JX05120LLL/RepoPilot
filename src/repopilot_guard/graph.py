@@ -54,7 +54,7 @@ from repopilot_guard.hooks import HookDecision, HookEvent, HookRuntime
 from repopilot_guard.mcp_agent import McpToolBinding, TaskMcpBindingService, bindings_registry
 from repopilot_guard.models import TaskBudget, TaskOperation, TaskRequest, VerificationContract, WorkspaceMode, WorkspaceSelection
 from repopilot_guard.permissions import PermissionGrant, PermissionMode, PermissionSnapshot
-from repopilot_guard.policy import GradleRecipeName, MavenRecipeName, NodeRecipeName, PytestRecipeName, TaskIntentGuard
+from repopilot_guard.policy import GradleRecipeName, MavenRecipeName, NodeRecipeName, NoVerificationRecipeName, PytestRecipeName, TaskIntentGuard
 from repopilot_guard.preflight import PreflightInspector
 from repopilot_guard.providers import OpenAICompatibleProvider
 from repopilot_guard.qdrant_bootstrap import QdrantBootstrapper, check_qdrant_health
@@ -207,7 +207,7 @@ class ChangePlan(BaseModel):
     verification: list[str] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
-    verification_recipe: MavenRecipeName | GradleRecipeName | PytestRecipeName | NodeRecipeName = MavenRecipeName.TEST
+    verification_recipe: MavenRecipeName | GradleRecipeName | PytestRecipeName | NodeRecipeName | NoVerificationRecipeName = MavenRecipeName.TEST
     target_test_class: str | None = None
 
     @model_validator(mode="after")
@@ -1378,6 +1378,19 @@ class CodingGraphFactory:
             profile = "node_pnpm" if recipe == "pnpm_test" else "node_npm"
             verification_contract = VerificationContract(recipe).to_dict()
             profile_event = {"type": "PROFILE_VERIFICATION_CONTRACT_FROZEN", "profile": profile, "recipe": recipe}
+        # 只读研究不执行补丁或验证，不需要冻结验证契约。
+        # Maven 项目沿用既有 Maven 验证约定；只有未识别构建入口的修改任务才跳过自动验证。
+        if (
+            verification_contract is None
+            and TaskOperation(state["task_operation"]) is TaskOperation.CHANGE
+            and not (workspace_root / "pom.xml").is_file()
+        ):
+            verification_contract = VerificationContract("none").to_dict()
+            profile_event = {
+                "type": "PROFILE_VERIFICATION_NOT_CONFIGURED",
+                "recipe": "none",
+                "message": "未识别自动验证入口；允许补丁执行，但最终只能标记为未验证。",
+            }
         return {
             "status": "PREFLIGHT",
             "workspace_path": str(result.workspace_path),
@@ -1400,6 +1413,23 @@ class CodingGraphFactory:
                     code="NON_GIT_LOCAL_READY",
                     message="完全本机控制允许非 Git 项目进入只读研究；无法提供 Git 基线证据。",
                 ) if check.component == "repository" else check
+                for check in result.checks
+            )
+            result = PhaseOnePreflightResult(ready=all(check.ready for check in checks), checks=checks)
+        # 只读研究的最低条件是可读项目目录与对话模型。向量库和 Embedding 是检索增强，
+        # 不应让用户连项目概览、文件定位都无法获得。
+        if TaskOperation(state["task_operation"]) is TaskOperation.RESEARCH:
+            optional_components = {"embedding_provider", "qdrant_settings", "qdrant"}
+            checks = tuple(
+                ComponentCheck(
+                    component=check.component,
+                    ready=True,
+                    code="OPTIONAL_RESEARCH_DEPENDENCY_UNAVAILABLE",
+                    message="只读研究将跳过不可用的 RAG 依赖，并退化为受控仓库工具。",
+                    missing_fields=check.missing_fields,
+                )
+                if check.component in optional_components and not check.ready
+                else check
                 for check in result.checks
             )
             result = PhaseOnePreflightResult(ready=all(check.ready for check in checks), checks=checks)
@@ -1435,6 +1465,19 @@ class CodingGraphFactory:
         workspace = _workspace_from_state(state)
         result = self._context_service.ingest(workspace, _project_id(state), _permission_from_state(state))
         event = {"type": "CONTEXT_INGESTED", **result.to_dict()}
+        if result.status != "READY" and TaskOperation(state["task_operation"]) is TaskOperation.RESEARCH:
+            return {
+                "status": "RETRIEVE",
+                "tool_events": [
+                    *state["tool_events"],
+                    event,
+                    {
+                        "type": "CONTEXT_INGEST_SKIPPED",
+                        "code": result.code,
+                        "message": "RAG 索引不可用；继续使用受控仓库工具进行只读研究。",
+                    },
+                ],
+            }
         if result.status != "READY":
             return _blocked(state, result.code, result.message, event)
         return {"status": "RETRIEVE", "tool_events": [*state["tool_events"], event]}
@@ -1444,6 +1487,13 @@ class CodingGraphFactory:
         if cancelled:
             return cancelled
         result = self._context_service.retrieve(state["task_description"], _project_id(state), str(state["base_commit"]))
+        if result.status != "READY" and TaskOperation(state["task_operation"]) is TaskOperation.RESEARCH:
+            result = RetrievalResult(
+                "READY",
+                "CONTEXT_RETRIEVAL_SKIPPED",
+                "RAG 检索不可用；继续使用受控仓库工具进行只读研究。",
+                strategy="repository_tools_fallback",
+            )
         attachment_contexts = ()
         attachment_documents: list[dict[str, str]] = []
         attachment_event: dict[str, object] | None = None
@@ -2530,6 +2580,30 @@ class CodingGraphFactory:
         if cancelled:
             return cancelled
         proposal = PatchProposal.model_validate(state["patch_proposal"])
+        if proposal.recipe is NoVerificationRecipeName.NONE:
+            return {
+                "status": "REVIEW",
+                "verification_result": {
+                    "status": "UNVERIFIED",
+                    "code": "VERIFICATION_NOT_CONFIGURED",
+                    "build_system": None,
+                    "recipe": proposal.recipe.value,
+                    "argv": [],
+                    "exit_code": None,
+                    "duration_ms": 0,
+                    "report_kind": None,
+                    "build_reports": [],
+                    "surefire_reports": [],
+                },
+                "tool_events": [
+                    *state["tool_events"],
+                    {
+                        "type": "VERIFICATION_SKIPPED",
+                        "code": "VERIFICATION_NOT_CONFIGURED",
+                        "message": "未识别自动验证入口，未执行 Maven 或其他构建命令。",
+                    },
+                ],
+            }
         result = self._verification_runner.run(
             Path(str(state["workspace_path"])),
             proposal,
@@ -2685,6 +2759,15 @@ class CodingGraphFactory:
                     memory_event,
                 ],
             }
+        if state.get("git_diff") and verification.get("status") == "UNVERIFIED":
+            return {
+                "status": "REPORT",
+                "verdict": "UNVERIFIED",
+                "tool_events": [
+                    *state["tool_events"],
+                    {"type": "REVIEW_UNVERIFIED", "code": "DIFF_WITHOUT_VERIFICATION_EVIDENCE"},
+                ],
+            }
         return {"status": "REPORT", "verdict": "FAILED", "tool_events": [*state["tool_events"], {"type": "REVIEW_FAILED", "code": "VERIFICATION_NOT_PASSED"}]}
 
     def _record_project_memory(self, state: GraphState, verification: dict[str, object]) -> dict[str, object]:
@@ -2751,7 +2834,12 @@ class CodingGraphFactory:
 
     @staticmethod
     def _route_after_verification(state: GraphState) -> str:
-        return "report" if state["status"] == "BLOCKED" else "observe"
+        if state["status"] == "BLOCKED":
+            return "report"
+        verification = state.get("verification_result")
+        if isinstance(verification, dict) and verification.get("status") == "UNVERIFIED":
+            return "review"
+        return "observe"
 
     @staticmethod
     def _route_after_verification_observation(state: GraphState) -> str:

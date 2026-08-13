@@ -10,6 +10,8 @@ from docx import Document
 
 from repopilot_guard.context import ManagedDocumentStore
 from repopilot_guard.document_parser import DocumentParseError, extract_document_text
+from repopilot_guard.document_indexing import index_uploaded_document
+from repopilot_guard.project_registry import ProjectRegistry
 
 
 class DocumentParserTests(unittest.TestCase):
@@ -81,6 +83,25 @@ class DocumentParserTests(unittest.TestCase):
 
             self.assertIn("[REDACTED]", contents)
             self.assertNotIn("sk-should-not-enter-rag", contents)
+
+    def test_non_git_project_imports_document_even_when_rag_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            project_root = root / "project"
+            project_root.mkdir()
+            source = root / "requirements.txt"
+            source.write_text("订单接口必须校验租户。\n", encoding="utf-8")
+            registry = ProjectRegistry(root / "state.sqlite")
+            try:
+                project = registry.add(project_root, "非 Git 项目")
+                result = index_uploaded_document(registry, project.project_id, source)
+
+                self.assertEqual("READY", result["status"])
+                self.assertEqual("DOCUMENT_IMPORTED_WITHOUT_RAG", result["code"])
+                self.assertEqual("requirements.txt", result["document"]["display_name"])
+                self.assertEqual(1, len(ManagedDocumentStore(registry.database_path).list_documents(project_id=project.project_id)))
+            finally:
+                registry.close()
 
 
 if __name__ == "__main__":

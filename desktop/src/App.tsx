@@ -72,7 +72,7 @@ const capabilityRiskLabels: Record<string, string> = {
 type Mode = "safe-isolated" | "full-local";
 type Operation = "change" | "research";
 type ConversationMode = "goal" | "plan";
-type ComposerMode = "chat" | "research" | "change";
+type ComposerMode = "auto" | "chat" | "research" | "change";
 type WorkspaceView = "task" | "context" | "settings" | "review";
 type EvidenceScope = "key" | "all";
 type EventStreamState = "idle" | "connecting" | "connected" | "reconnecting" | "offline" | "closed";
@@ -115,6 +115,14 @@ type ConversationContextState = {
 type StreamingChat = {
   conversationId: string;
   content: string;
+};
+type IntentRouteName = "chat" | "project_qa" | "code_research" | "code_change";
+type IntentRoute = {
+  intent: IntentRouteName;
+  confidence: number;
+  reason: string;
+  source: string;
+  requires_confirmation: boolean;
 };
 type RenameTarget =
   | { kind: "project"; id: string; title: string }
@@ -733,7 +741,9 @@ export function App() {
   const [description, setDescription] = useState("");
   const [mode, setMode] = useState<Mode>("safe-isolated");
   const [operation, setOperation] = useState<Operation>("change");
-  const [composerMode, setComposerMode] = useState<ComposerMode>("chat");
+  const [composerMode, setComposerMode] = useState<ComposerMode>("auto");
+  const [intentRoute, setIntentRoute] = useState<IntentRoute | null>(null);
+  const [routingIntent, setRoutingIntent] = useState(false);
   const [chatBusy, setChatBusy] = useState(false);
   const [activeView, setActiveView] = useState<WorkspaceView>(
     () => savedWorkbenchPreferences.activeView ?? "task",
@@ -2150,7 +2160,9 @@ export function App() {
     }
   }
 
-  async function start() {
+  async function start(operationOverride?: Operation) {
+    const requestedOperation = operationOverride ?? operation;
+    const requestedOperationAllowed = allowedOperations.includes(requestedOperation);
     if (
       taskBlocksNewTurn ||
       !projectId ||
@@ -2168,7 +2180,7 @@ export function App() {
       );
       return;
     }
-    if (!operationAllowed) {
+    if (!requestedOperationAllowed) {
       setRequestError(taskAdmissionMessage);
       return;
     }
@@ -2190,7 +2202,7 @@ export function App() {
           body: JSON.stringify({
             project_id: projectId,
             display_title: description.trim().slice(0, 80),
-            mode: operation === "research" ? "plan" : "goal",
+            mode: requestedOperation === "research" ? "plan" : "goal",
           }),
         });
         const createdPayload = await created.json();
@@ -2223,7 +2235,7 @@ export function App() {
           conversation_id: activeConversation.conversation_id,
           description,
           task_mode: mode,
-          operation,
+          operation: requestedOperation,
           confirmation: confirmed ? "我已了解完全权限风险" : null,
           approved_mcp_tools: approvedMcpTools,
           approved_mcp_sources:
@@ -2292,7 +2304,10 @@ export function App() {
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ content: submittedContent }),
+          body: JSON.stringify({
+            content: submittedContent,
+            attached_document_ids: attachedDocumentIds,
+          }),
         },
       );
       if (!response.ok) {
@@ -2373,11 +2388,64 @@ export function App() {
   }
 
   function sendComposerMessage() {
-    if (composerMode === "chat") {
+    if (composerMode === "auto") {
+      void routeAndDispatch();
+      return;
+    }
+    const resolvedComposerMode = composerMode;
+    if (resolvedComposerMode === "chat") {
       void sendChat();
       return;
     }
-    void start();
+    void start(resolvedComposerMode);
+  }
+
+  async function routeAndDispatch(selectedRoute?: IntentRoute) {
+    if (!description.trim() || routingIntent) return;
+    setRequestError("");
+    setRoutingIntent(true);
+    try {
+      const route = selectedRoute ?? await requestIntentRoute();
+      if (!route) return;
+      setIntentRoute(route);
+      if (route.source === "project_required") {
+        setRequestError(route.reason);
+        return;
+      }
+      if (route.requires_confirmation && !selectedRoute) return;
+      setIntentRoute(null);
+      if (route.intent === "chat" || route.intent === "project_qa") {
+        await sendChat();
+        return;
+      }
+      await start(route.intent === "code_research" ? "research" : "change");
+    } catch (error) {
+      setRequestError(error instanceof Error ? error.message : "无法识别请求意图");
+    } finally {
+      setRoutingIntent(false);
+    }
+  }
+
+  async function requestIntentRoute(): Promise<IntentRoute | null> {
+    const response = await fetch(`${API}/intent-route`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: description.trim(), project_id: projectId || null }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || !payload.route) {
+      throw new Error(typeof payload.detail === "string" ? payload.detail : "无法识别请求意图");
+    }
+    return payload.route as IntentRoute;
+  }
+
+  function routeLabel(route: IntentRoute): string {
+    return {
+      chat: "普通对话",
+      project_qa: "项目问答",
+      code_research: "只读代码分析",
+      code_change: "代码修改任务",
+    }[route.intent];
   }
 
   async function probeMcp() {
@@ -2556,7 +2624,8 @@ export function App() {
     setContextSnapshot(null);
     setTaskAttachments([]);
     setTelemetry(null);
-    setDescription("");
+      setDescription("");
+      setAttachedDocumentIds([]);
     setMode("safe-isolated");
     setOperation("change");
     setConfirmed(false);
@@ -2969,14 +3038,18 @@ export function App() {
   useEffect(() => {
     setSelectedPatchPaths(executionApproval ? approvalPatchPaths : []);
   }, [patchSelectionKey, executionApproval]);
+  // 智能模式必须等待后端 Router 返回，不能由前端关键词提前决定权限或流程。
+  const effectiveComposerMode = composerMode === "auto" ? "chat" : composerMode;
+  const effectiveOperation: Operation | null = effectiveComposerMode === "chat" ? null : effectiveComposerMode;
+  const effectiveOperationAllowed = effectiveOperation ? allowedOperations.includes(effectiveOperation) : true;
   const canStart =
     !taskBlocksNewTurn &&
     Boolean(projectId && description.trim()) &&
     runtimeHealth.status === "READY" &&
-    operationAllowed &&
+    effectiveOperationAllowed &&
     !(safeModeBlockedByProject && mode === "safe-isolated") &&
     !(mode === "full-local" && !confirmed);
-  const canSubmit = composerMode === "chat"
+  const canSubmit = effectiveComposerMode === "chat"
     ? !taskBlocksNewTurn && Boolean(description.trim()) && !chatBusy
     : canStart;
   const commandItems: CommandPaletteItem[] = [
@@ -3937,9 +4010,9 @@ export function App() {
                 <>
                   <div className="composer">
                     {(requestError ||
-                      (composerMode !== "chat" && apiReady && runtimeHealth.status !== "READY") ||
-                      (composerMode !== "chat" && Boolean(currentProject) && !operationAllowed) ||
-                      (composerMode !== "chat" && mode === "safe-isolated" && safeModeBlockedByProject)) && (
+                      (effectiveComposerMode !== "chat" && apiReady && runtimeHealth.status !== "READY") ||
+                      (effectiveComposerMode !== "chat" && Boolean(currentProject) && !effectiveOperationAllowed) ||
+                      (effectiveComposerMode !== "chat" && mode === "safe-isolated" && safeModeBlockedByProject)) && (
                       <div className="composer-error">
                         <WarningCircle size={16} />
                         <span>
@@ -3952,19 +4025,19 @@ export function App() {
                                   runtimeHealth.code +
                                   "）"
                                 : "本机 Agent API 版本需要更新"
-                              : !operationAllowed
+                              : !effectiveOperationAllowed
                                 ? taskAdmissionMessage
                                 : safeModeWarningMessage)}
                         </span>
                       </div>
                     )}
-                    {composerMode !== "chat" && mode === "full-local" && !confirmed && (
+                    {effectiveComposerMode !== "chat" && mode === "full-local" && !confirmed && (
                       <label className="full-access-confirmation">
                         <input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />
                         <span><b>确认完全本机访问</b>Agent 将直接在当前项目目录中执行已实现的高风险操作。</span>
                       </label>
                     )}
-                    {composerMode !== "chat" && attachedDocuments.length > 0 && (
+                    {attachedDocuments.length > 0 && (
                       <div className="attachment-row">
                         <FileArrowUp size={16} />
                         <span className="attachment-label">已加入当前上下文</span>
@@ -3974,7 +4047,7 @@ export function App() {
                             {document.display_name}
                             <button
                               type="button"
-                              title="从当前任务移除此文档"
+                            title="从当前上下文移除此文档"
                               aria-label={`移除 ${document.display_name}`}
                               onClick={() => setAttachedDocumentIds((current) => current.filter((id) => id !== document.document_id))}
                             >
@@ -3984,10 +4057,25 @@ export function App() {
                         ))}
                       </div>
                     )}
+                    {intentRoute && (
+                      <div className="intent-route-confirmation">
+                        <div>
+                          <b>我理解为：{routeLabel(intentRoute)}</b>
+                          <span>{intentRoute.reason}（置信度 {Math.round(intentRoute.confidence * 100)}%）</span>
+                        </div>
+                        <div className="intent-route-actions">
+                          <button type="button" onClick={() => void routeAndDispatch(intentRoute)}>按此继续</button>
+                          <button type="button" onClick={() => setIntentRoute(null)}>我自己选择</button>
+                        </div>
+                      </div>
+                    )}
                     <textarea
                       ref={taskDescriptionRef}
                       value={description}
-                      onChange={(event) => setDescription(event.target.value)}
+                      onChange={(event) => {
+                        setDescription(event.target.value);
+                        setIntentRoute(null);
+                      }}
                       onKeyDown={(event) => {
                         if (
                           event.key === "Enter" &&
@@ -3999,7 +4087,9 @@ export function App() {
                           sendComposerMessage();
                         }
                       }}
-                      placeholder={composerMode === "chat"
+                      placeholder={composerMode === "auto"
+                        ? "描述你想了解、分析或修改的内容，RepoPilot 会选择合适的流程"
+                        : composerMode === "chat"
                         ? "向 RepoPilot 提问"
                         : composerMode === "research"
                           ? "描述要理解、定位或评估的代码问题"
@@ -4009,6 +4099,16 @@ export function App() {
                     <div className="composer-toolbar">
                       <div className="composer-tools">
                         <div className="operation-control" role="group" aria-label="输入模式">
+                          <button
+                            className={composerMode === "auto" ? "active" : ""}
+                            type="button"
+                            onClick={() => setComposerMode("auto")}
+                            aria-label="智能模式"
+                            aria-pressed={composerMode === "auto"}
+                            title="根据问题选择普通问答、只读分析或受控修改；不会自动授予写入权限"
+                          >
+                            <span>智能</span>
+                          </button>
                           <button
                             className={composerMode === "chat" ? "active" : ""}
                             type="button"
@@ -4044,10 +4144,16 @@ export function App() {
                             <span>分析代码</span>
                           </button>
                         </div>
-                        {composerMode !== "chat" && <button className="icon-button" type="button" title="上传 MD 或 TXT 并直接加入当前上下文" onClick={() => void chooseDocument()} disabled={!projectId || documentBusy || attachedDocumentIds.length >= 4}>
+                        <button
+                          className="icon-button"
+                          type="button"
+                          title="上传 MD、TXT、PDF 或 DOCX 并加入当前上下文"
+                          onClick={() => void chooseDocument()}
+                          disabled={!projectId || documentBusy || attachedDocumentIds.length >= 4}
+                        >
                           <Paperclip size={19} />
-                        </button>}
-                        {composerMode !== "chat" && <label className={"permission-control mode-" + mode}>
+                        </button>
+                        {effectiveComposerMode !== "chat" && <label className={"permission-control mode-" + mode}>
                           {mode === "safe-isolated" ? <ShieldCheck size={17} /> : <WarningCircle size={17} />}
                           <select
                             value={mode}
@@ -4072,12 +4178,26 @@ export function App() {
                           </select>
                         </label>}
                       </div>
-                      <button className="send-button" type="button" title={composerMode === "chat" ? "发送消息" : "开始代码任务"} onClick={sendComposerMessage} disabled={!canSubmit}>
+                      <button className="send-button" type="button" title={effectiveComposerMode === "chat" ? "发送消息" : "开始代码任务"} onClick={sendComposerMessage} disabled={!canSubmit || routingIntent}>
                         <ArrowUp size={19} weight="bold" />
                       </button>
                     </div>
                   </div>
-                  <p className="composer-caption">{composerMode === "chat" ? "普通对话不会读取仓库、创建任务或执行命令。" : currentProject ? projectStatusLabel : "代码任务需要先选择项目。"}</p>
+                    <p className="composer-caption">
+                      {composerMode === "auto"
+                        ? effectiveComposerMode === "chat"
+                          ? "智能模式将作为普通项目问答处理；可附加研发文档，不会创建任务或执行命令。"
+                          : effectiveComposerMode === "research"
+                            ? "智能模式识别为代码分析：将读取受控项目上下文，不会写入文件或运行构建。"
+                            : "智能模式识别为代码修改：将先研究并展示计划、补丁和验证建议，写入前仍需审批。"
+                        : composerMode === "chat"
+                        ? projectId
+                          ? "可附加研发文档进行对话；不会读取仓库、创建任务或执行命令。"
+                          : "普通对话不会读取仓库、创建任务或执行命令。选择项目后可附加研发文档。"
+                        : currentProject
+                          ? projectStatusLabel
+                          : "代码任务需要先选择项目。"}
+                    </p>
                 </>
               )}
             </div>

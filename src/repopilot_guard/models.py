@@ -94,7 +94,7 @@ class VerificationContract:
     target_test_class: str | None = None
 
     def __post_init__(self) -> None:
-        if self.recipe not in {"compile", "test", "targeted_test", "gradle_compile", "gradle_test", "gradle_targeted_test", "pytest_test", "pytest_targeted_test", "npm_test", "pnpm_test"}:
+        if self.recipe not in {"none", "compile", "test", "targeted_test", "gradle_compile", "gradle_test", "gradle_targeted_test", "pytest_test", "pytest_targeted_test", "npm_test", "pnpm_test"}:
             raise ValueError("verification recipe is not allowed.")
         if self.recipe in {"targeted_test", "gradle_targeted_test", "pytest_targeted_test"} and not self.target_test_class:
             raise ValueError("targeted_test requires target_test_class.")

@@ -20,6 +20,7 @@ from tests.plugin_signing import sign_plugin, trust_test_publisher
 from repopilot_guard.api import _desktop_allowed_origins, _safe_task_interrupts, _safe_task_state, create_app
 from repopilot_guard.config import ComponentCheck, RuntimeConfigurationManager
 from repopilot_guard.context import ManagedDocumentStore
+from repopilot_guard.intent_router import IntentRouter
 from repopilot_guard.mcp import McpServerConfig, McpToolDescriptor
 from repopilot_guard.mcp_runtime import (
     McpRawToolResult,
@@ -241,6 +242,35 @@ class FakeApiMcpConnector:
 
 
 class ApiTests(unittest.TestCase):
+    def test_intent_route_api_returns_a_model_route_without_creating_a_task(self) -> None:
+        class Router:
+            def route(self, content: str, *, has_project: bool):
+                self.content = content
+                self.has_project = has_project
+                return type(
+                    "Route",
+                    (),
+                    {"to_dict": lambda _self: {"intent": "project_qa", "confidence": 0.96, "reason": "项目概览", "source": "model", "requires_confirmation": False}},
+                )()
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repository = root / "project"
+            repository.mkdir()
+            registry = ProjectRegistry(root / "state.sqlite")
+            project = registry.add(repository, "路由项目")
+            router = Router()
+            try:
+                with TestClient(create_app(FakeRunner(delay=0), registry, root / "runs", intent_router=router)) as client:
+                    response = client.post("/api/intent-route", json={"content": "介绍这个项目", "project_id": project.project_id})
+                    tasks = client.get("/api/tasks").json()["tasks"]
+
+                self.assertEqual(200, response.status_code)
+                self.assertEqual("project_qa", response.json()["route"]["intent"])
+                self.assertTrue(router.has_project)
+                self.assertEqual([], tasks)
+            finally:
+                registry.close()
     def test_retention_endpoints_preview_before_explicit_archive(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -611,6 +641,70 @@ class ApiTests(unittest.TestCase):
                         [item["kind"] for item in messages],
                     )
                     self.assertEqual("实时回复", messages[-1]["content"])
+            finally:
+                registry.close()
+
+    def test_plain_chat_uses_controlled_document_attachment_without_running_a_task(self) -> None:
+        observed_history: list[str] = []
+
+        def reply_stream(history: str, _content: str, _project: str | None):
+            observed_history.append(history)
+            yield "已读取附件摘要"
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repository = root / "non-git-project"
+            repository.mkdir()
+            source = root / "requirements.md"
+            source.write_text("# 订单需求\n必须校验租户。\n", encoding="utf-8")
+            registry = ProjectRegistry(root / "state.sqlite")
+            project = registry.add(repository, "文档对话项目")
+            document = ManagedDocumentStore(registry.database_path).import_document(
+                source,
+                project_id=project.project_id,
+            )
+            try:
+                with TestClient(
+                    create_app(
+                        FakeRunner(delay=0),
+                        registry,
+                        root / "runs",
+                        conversation_reply_stream=reply_stream,
+                    )
+                ) as client:
+                    created = client.post("/api/conversations", json={"project_id": project.project_id})
+                    conversation_id = created.json()["conversation"]["conversation_id"]
+                    with client.stream(
+                        "POST",
+                        f"/api/conversations/{conversation_id}/chat/stream",
+                        json={"content": "根据附件介绍需求", "attached_document_ids": [document.document_id]},
+                    ) as response:
+                        self.assertEqual(200, response.status_code)
+                        self.assertIn("event: done", "".join(response.iter_text()))
+
+                    self.assertIn("订单需求", observed_history[0])
+                    self.assertIn("必须校验租户", observed_history[0])
+                    self.assertNotIn(str(source), observed_history[0])
+                    self.assertEqual([], client.get("/api/tasks").json()["tasks"])
+            finally:
+                registry.close()
+
+    def test_plain_chat_attachment_requires_the_conversation_project(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "requirements.md"
+            source.write_text("# 需求\n", encoding="utf-8")
+            registry = ProjectRegistry(root / "state.sqlite")
+            try:
+                document = ManagedDocumentStore(registry.database_path).import_document(source, project_id="project-a")
+                with TestClient(create_app(FakeRunner(delay=0), registry, root / "runs")) as client:
+                    conversation_id = client.post("/api/conversations", json={}).json()["conversation"]["conversation_id"]
+                    response = client.post(
+                        f"/api/conversations/{conversation_id}/chat",
+                        json={"content": "读取附件", "attached_document_ids": [document.document_id]},
+                    )
+                    self.assertEqual(409, response.status_code)
+                    self.assertEqual("CHAT_ATTACHMENTS_REQUIRE_PROJECT", response.json()["detail"]["code"])
             finally:
                 registry.close()
 

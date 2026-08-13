@@ -50,6 +50,12 @@ class NodeRecipeName(str, Enum):
     PNPM_TEST = "pnpm_test"
 
 
+class NoVerificationRecipeName(str, Enum):
+    """未识别项目验证入口时的显式状态，绝不伪造 Maven 或测试成功。"""
+
+    NONE = "none"
+
+
 @dataclass(frozen=True, slots=True)
 class PolicyDecision:
     allowed: bool
@@ -108,7 +114,9 @@ class PolicyGuard:
             return PolicyDecision(False, "Tool is not allowlisted.", "TOOL_NOT_ALLOWLISTED")
         return PolicyDecision(True, "Path is within the workspace and passes protection rules.")
 
-    def check_recipe(self, recipe: MavenRecipeName | GradleRecipeName | PytestRecipeName | NodeRecipeName, test_class: str | None = None) -> PolicyDecision:
+    def check_recipe(self, recipe: MavenRecipeName | GradleRecipeName | PytestRecipeName | NodeRecipeName | NoVerificationRecipeName, test_class: str | None = None) -> PolicyDecision:
+        if recipe is NoVerificationRecipeName.NONE:
+            return PolicyDecision(test_class is None, "未配置自动验证；任务将如实标记为未验证。", "VERIFICATION_SKIPPED")
         if self.permission.is_full_access:
             return PolicyDecision(
                 True,

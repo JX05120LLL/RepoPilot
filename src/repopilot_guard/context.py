@@ -30,6 +30,7 @@ MAX_RETRIEVAL_CANDIDATES = 64
 # 一项任务最多绑定 4 份文档，每份先保证一个片段进入 Context Broker。
 # 其余内容仍可由受限的 retrieve_context 按需检索，不让第一份长文档挖占所有显式附件预算。
 MAX_ATTACHED_DOCUMENT_CHUNKS = 1
+MAX_CHAT_ATTACHMENT_CHARS = 12_000
 TRANSIENT_OPERATION_ATTEMPTS = 3
 TRANSIENT_RETRY_BASE_DELAY_SECONDS = 1.0
 CODE_EXTENSIONS = frozenset({".java", ".xml", ".py", ".js", ".jsx", ".ts", ".tsx", ".gradle", ".kts"})
@@ -605,6 +606,40 @@ class ManagedDocumentStore:
                 str(error),
                 "任务附件不可用、归属不匹配或完整性校验失败。",
             )
+
+    def resolve_for_chat(self, *, project_id: str, document_ids: tuple[str, ...]) -> tuple[str, tuple[dict[str, str], ...]]:
+        """返回普通对话可用的受控附件摘要，不依赖 Git、Embedding 或向量库。"""
+
+        documents = self.require_documents(project_id=project_id, document_ids=document_ids)
+        remaining = MAX_CHAT_ATTACHMENT_CHARS
+        parts: list[str] = []
+        metadata: list[dict[str, str]] = []
+        for document in documents:
+            try:
+                raw = document.managed_path.read_bytes()
+            except OSError as error:
+                raise ValueError("MANAGED_DOCUMENT_UNAVAILABLE") from error
+            if hashlib.sha256(raw).hexdigest() != document.content_sha256:
+                raise ValueError("MANAGED_DOCUMENT_INTEGRITY_FAILED")
+            try:
+                content = raw.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise ValueError("MANAGED_DOCUMENT_UNAVAILABLE") from error
+            if remaining <= 0:
+                break
+            selected = content[:remaining]
+            remaining -= len(selected)
+            parts.append(f"[附件：{document.display_name}]\n{selected}")
+            metadata.append(
+                {
+                    "document_id": document.document_id,
+                    "display_name": document.display_name,
+                    "content_sha256": document.content_sha256,
+                }
+            )
+        if documents and not parts:
+            raise ValueError("TASK_ATTACHMENTS_EMPTY")
+        return "\n\n".join(parts), tuple(metadata)
 
     def require_documents(self, *, project_id: str, document_ids: tuple[str, ...]) -> tuple[ManagedDocument, ...]:
         """将文档 ID 绑定到项目；未知、跨项目或重复 ID 均按阻断处理。"""
