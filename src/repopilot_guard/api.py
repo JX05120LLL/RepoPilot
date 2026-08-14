@@ -1772,6 +1772,9 @@ def _append_conversation_task_summary(
 def _conversation_task_summary(task: StoredTask, state: dict[str, object]) -> str:
     """生成面向用户的稳定结论，不将模型计划等同于修复成功。"""
 
+    if task.task_operation == TaskOperation.RESEARCH.value:
+        return _research_task_summary(state)
+
     outcome = {
         "PASSED": "任务已完成：已记录真实代码修改且受控验证通过。",
         "UNVERIFIED": "已完成分析，但尚未获得足够的修复与验证证据。",
@@ -1800,6 +1803,61 @@ def _conversation_task_summary(task: StoredTask, state: dict[str, object]) -> st
     elif task.verdict in {"BLOCKED", "FAILED"}:
         lines.extend(("", "下一步：查看详情中的诊断与证据后，补充条件或调整目标再继续。"))
     return "\n".join(lines)
+
+
+def _research_task_summary(state: dict[str, object]) -> str:
+    """将只读研究计划投影为直接可读的代码分析回答。"""
+
+    plan = state.get("plan")
+    if not isinstance(plan, dict):
+        return "## 代码研究未形成结论\n\n本次没有生成可展示的研究计划，因此不会把猜测当作代码结论。"
+
+    summary = plan.get("summary")
+    lines = [
+        "## 代码研究结论",
+        "",
+        str(summary).strip()
+        if isinstance(summary, str) and summary.strip()
+        else "未生成可确认的总结。",
+    ]
+    evidence = plan.get("evidence")
+    if isinstance(evidence, list) and evidence:
+        lines.extend(("", "### 关键证据"))
+        for item in evidence[:8]:
+            if not isinstance(item, dict):
+                continue
+            path = item.get("path")
+            note = item.get("note")
+            if not isinstance(path, str) or not path:
+                continue
+            line_start = item.get("line_start")
+            line_end = item.get("line_end")
+            location = f":{line_start}" if isinstance(line_start, int) else ""
+            if isinstance(line_end, int) and line_end != line_start:
+                location += f"-{line_end}"
+            detail = f"：{note}" if isinstance(note, str) and note.strip() else ""
+            lines.append(f"- `{path}{location}`{detail}")
+    _append_markdown_list(lines, "重点文件", plan.get("candidate_files"), limit=8)
+    _append_markdown_list(lines, "调用或处理路径", plan.get("steps"), limit=8)
+    _append_markdown_list(lines, "待确认项", plan.get("assumptions"), limit=5)
+    _append_markdown_list(lines, "风险或边界", plan.get("risks"), limit=5)
+    lines.extend(
+        (
+            "",
+            "### 说明",
+            "本次是只读代码研究：没有修改文件，也没有执行构建或测试；这不影响上述已引用代码证据的阅读结论。",
+        )
+    )
+    return "\n".join(lines)
+
+
+def _append_markdown_list(lines: list[str], title: str, value: object, *, limit: int) -> None:
+    if not isinstance(value, list):
+        return
+    items = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+    if not items:
+        return
+    lines.extend(("", f"### {title}", *(f"- {item}" for item in items[:limit])))
 
 
 def _chat_attachment_context(
@@ -1921,7 +1979,10 @@ def _default_conversation_reply_stream(
                     "请使用中文、简洁自然地回答。当前模式不调用仓库工具、不创建任务；"
                     "如上下文中给出用户显式附加的文档或受限项目概览，只能据此回答，"
                     "不能声称已经检查代码、执行命令或完成修复。"
-                    "当用户明确希望分析项目、定位代码或修改代码时，提示可以切换到对应代码任务模式。"
+                    "回答应先直接给出结论和依据，不要用“当前是普通对话模式”作为开头。"
+                    "只有结论确实受限时，才在结尾简短说明信息边界；不要把未读取完整仓库误写成无法帮助。"
+                    "当用户要求详细项目分析、流程、模块关系、调用链或定位实现时，说明需要发起只读代码研究；"
+                    "当用户要求修改代码时，说明需要发起受控修改任务。"
                 ),
             }
         ]

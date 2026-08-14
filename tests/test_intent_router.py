@@ -72,3 +72,11 @@ class IntentRouterTests(unittest.TestCase):
 
         self.assertEqual(IntentRouteName.CODE_RESEARCH, result.intent)
         self.assertEqual("rule_fallback", result.source)
+
+    def test_detailed_project_introduction_uses_read_only_code_research(self) -> None:
+        router = IntentRouter(FakeProvider("{}", ready=False))
+
+        result = router.route("请结合代码详细介绍这个项目的模块和流程", has_project=True)
+
+        self.assertEqual(IntentRouteName.CODE_RESEARCH, result.intent)
+        self.assertEqual("rule_fallback", result.source)

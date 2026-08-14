@@ -265,6 +265,7 @@ class PreflightResult:
     gradle_wrapper: Path | None = None
     has_pytest_project: bool = False
     has_node_project: bool = False
+    has_supported_content: bool = False
     errors: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
 
@@ -283,6 +284,7 @@ class PreflightResult:
             "gradle_wrapper": str(self.gradle_wrapper) if self.gradle_wrapper else None,
             "has_pytest_project": self.has_pytest_project,
             "has_node_project": self.has_node_project,
+            "has_supported_content": self.has_supported_content,
             "errors": list(self.errors),
             "warnings": list(self.warnings),
         }

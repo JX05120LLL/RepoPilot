@@ -137,7 +137,22 @@ class MultiTurnFakeRunner:
                 "task_operation": request.operation.value,
                 "task_description": request.description,
                 "tool_events": [{"type": "PLAN_GENERATED"}],
-                "plan": {"summary": f"已分析：{request.description}"},
+                "plan": {
+                    "summary": f"已分析：{request.description}",
+                    "evidence": [
+                        {
+                            "source_type": "tool",
+                            "path": "src/main/java/com/example/OrderService.java",
+                            "line_start": 12,
+                            "line_end": 24,
+                            "note": "订单处理入口。",
+                        }
+                    ],
+                    "candidate_files": ["src/main/java/com/example/OrderService.java"],
+                    "steps": ["请求从 Controller 进入 OrderService。"],
+                    "assumptions": ["未读取外部依赖服务。"],
+                    "risks": ["未执行自动化验证。"],
+                },
                 "verification_result": None,
                 "error_summary": None,
                 "git_diff": "",
@@ -2032,8 +2047,10 @@ class ApiTests(unittest.TestCase):
                             break
                         time.sleep(0.01)
                     self.assertEqual(["user", "assistant"], [item["role"] for item in first_messages])
-                    self.assertIn("处理总结", first_messages[-1]["content"])
+                    self.assertIn("代码研究结论", first_messages[-1]["content"])
                     self.assertIn("已分析：先梳理订单模块结构", first_messages[-1]["content"])
+                    self.assertIn("OrderService.java:12-24", first_messages[-1]["content"])
+                    self.assertIn("调用或处理路径", first_messages[-1]["content"])
 
                     second = client.post(
                         "/api/tasks",

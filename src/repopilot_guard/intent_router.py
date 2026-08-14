@@ -89,7 +89,8 @@ class IntentRouter:
                     "字段为 intent、confidence、reason。intent 只能是 chat、project_qa、"
                     "code_research、code_change。confidence 是 0 到 1 的数字。"
                     "chat：通用知识或闲聊；project_qa：介绍/概览当前项目，不要求定位具体实现；"
-                    "code_research：定位、分析、评估仓库代码且不要求改动；"
+                    "code_research：定位、分析、评估仓库代码且不要求改动；当用户要求详细介绍、项目流程、模块关系、调用链、目录结构"
+                    "或明确要求结合代码时，即使没有说“分析”，也应选择 code_research；"
                     "code_change：明确要求修复、修改、新增、删除或执行代码操作。"
                     "不确定时选 chat 且给出低置信度。"
                 ),
@@ -159,6 +160,8 @@ class IntentRouter:
             )
         if re.search(r"修复|修改|新增|删除|重构|实现|修正|优化|bug|错误|异常|失效|不生效|\bfix\b", normalized):
             return IntentRoute(IntentRouteName.CODE_CHANGE, 0.86, "请求明确包含代码改动目标。", "rule_fallback")
+        if re.search(r"详细.*项目|项目.*详细|好好分析|结合代码|调用链|流程|模块关系|目录结构|整体架构", normalized):
+            return IntentRoute(IntentRouteName.CODE_RESEARCH, 0.86, "请求需要基于仓库代码给出可定位的详细结论。", "rule_fallback")
         if re.search(r"分析|定位|查找|搜索|检索|调用链|依赖|架构|评估|排查|在哪|哪里|如何实现", normalized):
             return IntentRoute(IntentRouteName.CODE_RESEARCH, 0.8, "请求需要定位或分析项目代码。", "rule_fallback")
         if re.search(r"介绍.*项目|项目.*介绍|项目概览|技术栈|这个仓库", normalized):

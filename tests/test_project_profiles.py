@@ -83,6 +83,37 @@ class ProjectProfileDetectorTests(unittest.TestCase):
         self.assertTrue(result.has_node_project)
         self.assertNotIn("No supported Java, Python or Node build/test descriptor was found.", result.errors)
 
+    def test_aggregate_repository_with_nested_source_can_be_researched(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            (root / ".git").mkdir()
+            source = root / "services" / "orders" / "src" / "main" / "java" / "OrderService.java"
+            source.parent.mkdir(parents=True)
+            source.write_text("class OrderService {}\n", encoding="utf-8")
+
+            result = PreflightInspector().inspect(root)
+
+        self.assertTrue(result.ready)
+        self.assertTrue(result.has_supported_content)
+        self.assertFalse(result.has_pom_xml)
+        self.assertIn(
+            "No top-level build/test descriptor was found; read-only research can continue, but verification must target a detected module.",
+            result.warnings,
+        )
+
+    def test_non_git_source_directory_only_reports_git_baseline_requirement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "src" / "main" / "java" / "OrderService.java"
+            source.parent.mkdir(parents=True)
+            source.write_text("class OrderService {}\n", encoding="utf-8")
+
+            result = PreflightInspector().inspect(root)
+
+        self.assertFalse(result.ready)
+        self.assertTrue(result.has_supported_content)
+        self.assertEqual(("Repository is not a Git working tree.",), result.errors)
+
     def test_runtime_inspector_blocks_missing_pnpm_without_exposing_binary_path(self) -> None:
         inspector = ProfileRuntimeInspector(command_lookup=lambda _command: None, module_lookup=lambda _module: None)
 

@@ -704,6 +704,13 @@ function resolveTaskOutcome(item: Task, running: boolean): TaskOutcome {
     };
   }
   if (result === "UNVERIFIED") {
+    if (resolvedTaskOperation(item) === "research") {
+      return {
+        tone: "success",
+        title: "代码分析已完成",
+        detail: "已输出只读研究结论和来源；本次没有修改代码，因此不需要 Maven 验证。",
+      };
+    }
     return {
       tone: "warning",
       title: "已完成分析，但尚未修复",
@@ -2761,12 +2768,11 @@ export function App() {
         .reverse()
         .find((item) => item.task_thread_id)?.task_thread_id;
       if (latestThreadId) {
-        const latestTask = tasks.find((item) => item.thread_id === latestThreadId) ?? {
-          thread_id: latestThreadId,
-          status: "RUNNING",
-          pending_approval: false,
-        };
-        await selectTask(latestTask, "task", true);
+        const latestTask = tasks.find((item) => item.thread_id === latestThreadId);
+        // 已结束的任务保留为同一对话中的历史记录，不再自动劫持用户回到任务报告页。
+        if (latestTask && !terminalTaskStatuses.has(latestTask.status)) {
+          await selectTask(latestTask, "task", true);
+        }
       }
     } catch (error) {
       setRequestError(error instanceof Error ? error.message : "无法读取对话记录");
@@ -3299,6 +3305,8 @@ export function App() {
               const projectConversations = conversations.filter(
                 (item) => item.project_id === project.project_id,
               );
+              // 已归属对话的任务在消息流内展示，不能再作为一条“新会话”出现在侧栏。
+              const orphanProjectTasks = projectTasks.filter((item) => !item.conversation_id);
               const selected = project.project_id === projectId;
               return (
                 <section className="project-node" key={project.project_id}>
@@ -3343,7 +3351,7 @@ export function App() {
                           </button>
                         </div>
                       ))}
-                      {projectTasks.map((item) => (
+                      {orphanProjectTasks.map((item) => (
                         <div
                           className={task?.thread_id === item.thread_id ? "tree-row active" : "tree-row"}
                           key={item.thread_id}
@@ -3359,7 +3367,7 @@ export function App() {
                           </button>
                         </div>
                       ))}
-                      {projectTasks.length === 0 && projectConversations.length === 0 && <p>还没有对话</p>}
+                      {orphanProjectTasks.length === 0 && projectConversations.length === 0 && <p>还没有对话</p>}
                     </div>
                   )}
                 </section>
@@ -3606,11 +3614,14 @@ export function App() {
                           <div className="agent-response-header">
                             <strong>RepoPilot</strong>
                             <span className="conversation-summary-status">
-                              {message.task_verdict ?? message.task_status ?? "已结束"}
+                              {message.task_verdict === "UNVERIFIED" &&
+                              tasks.find((item) => item.thread_id === message.task_thread_id)?.task_operation === "research"
+                                ? "代码分析完成"
+                                : (message.task_verdict ?? message.task_status ?? "已结束")}
                             </span>
                           </div>
                         )}
-                        {message.kind === "chat_response" ? (
+                        {message.kind === "chat_response" || message.kind === "task_summary" ? (
                           <div className="conversation-chat-markdown">
                             <ReactMarkdown>{message.content}</ReactMarkdown>
                           </div>

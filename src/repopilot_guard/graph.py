@@ -507,6 +507,7 @@ class OpenAIResearchModel:
 
     def plan(self, messages: list[dict[str, str]], state: GraphState) -> PlanGenerationResult:
         trusted_contract = state.get("verification_contract")
+        research_only = TaskOperation(state.get("task_operation", TaskOperation.CHANGE.value)) is TaskOperation.RESEARCH
         contract_instruction = (
             " Trusted verification contract (must match exactly): " + json.dumps(trusted_contract, ensure_ascii=False)
             if trusted_contract is not None
@@ -519,6 +520,13 @@ class OpenAIResearchModel:
                 "每条确定结论必须对应 evidence；本阶段没有运行构建验证或修改代码。"
             ),
         }
+        outcome_instruction = (
+            " This is a read-only code research task. summary must answer the user's question directly. "
+            "Use candidate_files for key observed files, steps for the observed execution or call flow, "
+            "verification for cross-check suggestions, and assumptions/risks for gaps. Do not describe a code modification plan. "
+            if research_only
+            else " This is a code change task. steps must describe the proposed modification and verification must describe how to validate it. "
+        )
         prompt["content"] = (
             "Return JSON only. It must validate against this schema exactly. "
             "Every evidence item must contain source_type, path, and note; "
@@ -528,6 +536,7 @@ class OpenAIResearchModel:
             "Do not invent paths, line numbers, tests, or successful fixes. Schema: "
             + json.dumps(ChangePlan.model_json_schema(), ensure_ascii=False)
             + contract_instruction
+            + outcome_instruction
             + " Observed evidence catalog (you may only cite these source_type/path/line ranges): "
             + json.dumps(_plan_evidence_catalog(state), ensure_ascii=False)
         )

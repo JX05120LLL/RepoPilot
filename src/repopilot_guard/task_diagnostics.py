@@ -77,7 +77,7 @@ def _blocked_diagnostic(error: str, evidence_codes: set[str]) -> dict[str, str]:
             "danger",
             "PROJECT_PREFLIGHT_REQUIRED",
             "项目预检条件未满足",
-            "当前任务所选项目未满足 Git 基线或 Maven 工程条件。RepoPilot 未继续研究或修改代码，请先核验任务报告。",
+            "当前项目不符合本次操作所需的预检条件。只读研究可在含源码的聚合目录继续；安全隔离修复需要 Git 基线，代码修改与验证需要定位具体模块。",
             "OPEN_TASK_EVIDENCE",
         )
     if any(code.startswith(("CHAT_", "EMBEDDING_", "QDRANT_")) for code in evidence_codes):
