@@ -274,16 +274,16 @@ class PluginRegistryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             incompatible_root = root / "incompatible"
-            _write_plugin(incompatible_root, requires_repopilot=">=0.2.0,<0.3.0")
+            _write_plugin(incompatible_root, requires_repopilot=">=0.3.0,<0.4.0")
             registry = _registry(root / "state.sqlite")
             try:
                 with self.assertRaisesRegex(PluginError, "PLUGIN_REPOPILOT_VERSION_INCOMPATIBLE"):
                     registry.install(incompatible_root)
 
                 compatible_root = root / "compatible"
-                _write_plugin(compatible_root, requires_repopilot=">=0.1.0,<0.2.0")
+                _write_plugin(compatible_root, requires_repopilot=">=0.2.0,<0.3.0")
                 registry.install(compatible_root)
-                with patch("repopilot_guard.plugins.REPOPILOT_VERSION", "0.2.0"):
+                with patch("repopilot_guard.plugins.REPOPILOT_VERSION", "0.3.0"):
                     record = registry.get("spring-tools")
                     self.assertEqual("INCOMPATIBLE", record.compatibility_status)
                     self.assertFalse(record.to_dict()["active"])
