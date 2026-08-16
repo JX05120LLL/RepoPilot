@@ -1403,7 +1403,7 @@ export function App() {
 
   useEffect(() => {
     void loadCapabilityProfile(projectId).catch((error) =>
-      setNotice(error instanceof Error ? error.message : "无法读取项目能力档案"),
+      setRequestError(error instanceof Error ? error.message : "无法读取项目能力档案"),
     );
   }, [projectId, projects]);
 
@@ -2857,6 +2857,18 @@ export function App() {
       );
   }
 
+  function selectPermission(nextMode: Mode) {
+    const readiness = nextMode === "safe-isolated"
+      ? projectDiagnosis?.task_modes.safe_isolated
+      : projectDiagnosis?.task_modes.full_local;
+    const nextAllowed = readiness?.allowed_operations;
+    setMode(nextMode);
+    if (nextAllowed?.length && !nextAllowed.includes(operation)) {
+      selectOperation(nextAllowed[0]);
+    }
+    if (nextMode === "safe-isolated") setConfirmed(false);
+  }
+
   const interrupt = task?.interrupts?.[0];
   const currentProject = projects.find((item) => item.project_id === projectId);
   const activePluginMcpSources = plugins
@@ -3299,37 +3311,7 @@ export function App() {
             <span>新建对话</span>
             <small>Ctrl+N</small>
           </button>
-          <button
-            className={showTaskSearch ? "active" : ""}
-            type="button"
-            onClick={() => setShowTaskSearch((current) => !current)}
-          >
-            <ListMagnifyingGlass size={17} />
-            <span>搜索任务</span>
-          </button>
-          <button
-            className={activeView === "context" ? "active" : ""}
-            type="button"
-            onClick={() => setActiveView("context")}
-          >
-            <PuzzlePiece size={17} />
-            <span>上下文与扩展</span>
-          </button>
         </nav>
-
-        {showTaskSearch && (
-          <div className="task-search">
-            <MagnifyingGlass size={15} />
-            <input
-              ref={taskSearchRef}
-              value={taskQuery}
-              onChange={(event) => setTaskQuery(event.target.value)}
-              placeholder="搜索任务"
-              autoFocus
-              aria-label="搜索任务"
-            />
-          </div>
-        )}
 
         <section className="project-navigation">
           <div className="navigation-heading">
@@ -3456,24 +3438,10 @@ export function App() {
         </section>
 
         <div className="navigation-footer">
-          <label className="archive-filter">
-            <input type="checkbox" checked={showArchived} onChange={(event) => setShowArchived(event.target.checked)} />
-            显示归档
-          </label>
           <button className={activeView === "settings" ? "navigation-settings active" : "navigation-settings"} type="button" onClick={openRuntimeConfiguration}>
             <SlidersHorizontal size={16} />
-            <span>设置与运行配置</span>
+            <span>设置</span>
           </button>
-          <div className={"runtime-indicator runtime-" + serviceStatus}>
-            <span />
-            <div>
-              <b>{serviceStatus === "ready" ? "Agent 已就绪" : "Agent 未就绪"}</b>
-              <small>{runtimeHealth.code}</small>
-            </div>
-            <button className="icon-button" type="button" title="重新检测" onClick={() => void checkApiHealth()}>
-              <ArrowClockwise size={15} />
-            </button>
-          </div>
         </div>
       </aside>
       {sidebarMenu && (
@@ -3662,17 +3630,17 @@ export function App() {
                   ) : (
                     <article className={`conversation-turn assistant-turn ${message.kind === "task_summary" ? "conversation-summary-turn" : "conversation-chat-turn"}`} key={message.message_id}>
                       <div className="agent-response">
-                        {message.kind === "task_summary" && (
-                          <div className="agent-response-header">
-                            <strong>RepoPilot</strong>
+                        <div className="agent-response-header">
+                          <strong>RepoPilot</strong>
+                          {message.kind === "task_summary" && (
                             <span className="conversation-summary-status">
                               {message.task_verdict === "UNVERIFIED" &&
                               tasks.find((item) => item.thread_id === message.task_thread_id)?.task_operation === "research"
                                 ? "代码分析完成"
                                 : (message.task_verdict ?? message.task_status ?? "已结束")}
                             </span>
-                          </div>
-                        )}
+                          )}
+                        </div>
                         {message.kind === "chat_response" || message.kind === "task_summary" ? (
                           <div className="conversation-chat-markdown">
                             <ReactMarkdown>{message.content}</ReactMarkdown>
@@ -4093,9 +4061,9 @@ export function App() {
                 <>
                   <div className="composer">
                     {(requestError ||
-                      (effectiveComposerMode !== "chat" && apiReady && runtimeHealth.status !== "READY") ||
-                      (effectiveComposerMode !== "chat" && Boolean(currentProject) && !effectiveOperationAllowed) ||
-                      (effectiveComposerMode !== "chat" && mode === "safe-isolated" && safeModeBlockedByProject)) && (
+                      (Boolean(currentProject) && apiReady && runtimeHealth.status !== "READY") ||
+                      (Boolean(currentProject) && !effectiveOperationAllowed) ||
+                      (Boolean(currentProject) && mode === "safe-isolated" && safeModeBlockedByProject)) && (
                       <div className="composer-error">
                         <WarningCircle size={16} />
                         <span>
@@ -4114,7 +4082,7 @@ export function App() {
                         </span>
                       </div>
                     )}
-                    {effectiveComposerMode !== "chat" && mode === "full-local" && !confirmed && (
+                    {Boolean(currentProject) && mode === "full-local" && !confirmed && (
                       <label className="full-access-confirmation">
                         <input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />
                         <span><b>确认完全本机访问</b>Agent 将直接在当前项目目录中执行已实现的高风险操作。</span>
@@ -4182,52 +4150,6 @@ export function App() {
                     />
                     <div className="composer-toolbar">
                       <div className="composer-tools">
-                        <div className="operation-control" role="group" aria-label="输入模式">
-                          <button
-                            className={composerMode === "auto" ? "active" : ""}
-                            type="button"
-                            onClick={() => setComposerMode("auto")}
-                            aria-label="智能模式"
-                            aria-pressed={composerMode === "auto"}
-                            title="根据问题选择普通问答、只读分析或受控修改；不会自动授予写入权限"
-                          >
-                            <span>智能</span>
-                          </button>
-                          <button
-                            className={composerMode === "chat" ? "active" : ""}
-                            type="button"
-                            onClick={() => setComposerMode("chat")}
-                            aria-label="对话模式"
-                            aria-pressed={composerMode === "chat"}
-                            title="普通对话，不读取仓库、不创建任务"
-                          >
-                            <span>对话</span>
-                          </button>
-                          <button
-                            className={composerMode === "change" ? "active" : ""}
-                            type="button"
-                            disabled={!canSelectChange}
-                            onClick={() => selectOperation("change")}
-                            aria-label="修改代码模式"
-                            aria-pressed={composerMode === "change"}
-                            title="围绕一个代码目标完成计划、受控修改和构建验证"
-                          >
-                            <Target size={15} />
-                            <span>修改代码</span>
-                          </button>
-                          <button
-                            className={composerMode === "research" ? "active" : ""}
-                            type="button"
-                            disabled={!canSelectResearch}
-                            onClick={() => selectOperation("research")}
-                            aria-label="分析代码模式"
-                            aria-pressed={composerMode === "research"}
-                            title="只研究代码并输出证据化计划，不写入文件、不运行构建验证"
-                          >
-                            <ListMagnifyingGlass size={15} />
-                            <span>分析代码</span>
-                          </button>
-                        </div>
                         <button
                           className="icon-button"
                           type="button"
@@ -4237,30 +4159,31 @@ export function App() {
                         >
                           <Paperclip size={19} />
                         </button>
-                        {effectiveComposerMode !== "chat" && <label className={"permission-control mode-" + mode}>
-                          {mode === "safe-isolated" ? <ShieldCheck size={17} /> : <WarningCircle size={17} />}
-                          <select
-                            value={mode}
-                            aria-label="任务权限模式"
-                            onChange={(event) => {
-                              const nextMode = event.target.value as Mode;
-                              const readiness = nextMode === "safe-isolated"
-                                ? projectDiagnosis?.task_modes.safe_isolated
-                                : projectDiagnosis?.task_modes.full_local;
-                              const nextAllowed = readiness?.allowed_operations;
-                              setMode(nextMode);
-                              if (nextAllowed?.length && !nextAllowed.includes(operation)) {
-                                selectOperation(nextAllowed[0]);
-                              }
-                              if (nextMode === "safe-isolated") setConfirmed(false);
-                            }}
-                          >
-                            <option value="safe-isolated" disabled={Boolean(safeModeReadiness && safeModeReadiness.status !== "READY")}>
-                              安全隔离
-                            </option>
-                            <option value="full-local">完全本机</option>
-                          </select>
-                        </label>}
+                        {Boolean(currentProject) && (
+                          <div className="permission-toggle" role="group" aria-label="权限模式">
+                            <button
+                              className={mode === "safe-isolated" ? "active" : ""}
+                              type="button"
+                              onClick={() => selectPermission("safe-isolated")}
+                              disabled={Boolean(safeModeReadiness && safeModeReadiness.status !== "READY")}
+                              aria-pressed={mode === "safe-isolated"}
+                              title="写代码前需要你逐次审批"
+                            >
+                              <ShieldCheck size={15} />
+                              <span>需审批</span>
+                            </button>
+                            <button
+                              className={mode === "full-local" ? "active" : ""}
+                              type="button"
+                              onClick={() => selectPermission("full-local")}
+                              aria-pressed={mode === "full-local"}
+                              title="完全本机访问，Agent 可直接执行已授权操作"
+                            >
+                              <WarningCircle size={15} />
+                              <span>完全访问</span>
+                            </button>
+                          </div>
+                        )}
                       </div>
                       <button className="send-button" type="button" title={effectiveComposerMode === "chat" ? "发送消息" : "开始代码任务"} onClick={sendComposerMessage} disabled={!canSubmit || routingIntent}>
                         <ArrowUp size={19} weight="bold" />
@@ -4474,7 +4397,7 @@ export function App() {
             <header className="utility-header">
               <div>
                 <h2>{activeView === "settings" ? "设置" : "上下文与扩展"}</h2>
-                <p>{activeView === "settings" ? "模型与本机检索服务" : currentProject?.display_name ?? "尚未选择项目"}</p>
+                <p>{activeView === "settings" ? "模型、检索与扩展配置" : currentProject?.display_name ?? "尚未选择项目"}</p>
               </div>
               <span>{activeView === "settings" ? "仅本机保存" : contextSnapshot ? "已冻结任务快照" : "项目级配置"}</span>
             </header>
@@ -4486,7 +4409,7 @@ export function App() {
               </div>
             )}
 
-            <section hidden={activeView !== "context"} className="settings-section capability-directory-section">
+            <section hidden={activeView !== "context" && activeView !== "settings"} className="settings-section capability-directory-section">
               <div className="settings-title">
                 <Stack size={19} />
                 <div><h3>项目能力档案</h3><p>受限静态扫描生成；确认后的业务规则和禁改路径会随任务上下文冻结并留存哈希。</p></div>
@@ -4510,13 +4433,13 @@ export function App() {
                     </article>
                     <label>业务规则（每行一条）<textarea value={profileBusinessRules} onChange={(event) => setProfileBusinessRules(event.target.value)} maxLength={8_960} placeholder="例如：订单状态不可跳过支付成功" /></label>
                     <label>额外禁改路径（每行一条）<textarea value={profileProtectedPaths} onChange={(event) => setProfileProtectedPaths(event.target.value)} maxLength={8_960} placeholder="例如：infra/production/**" /></label>
-                    <button className="secondary-button" type="button" onClick={() => void confirmCapabilityProfile().catch((error) => setNotice(error instanceof Error ? error.message : "能力档案确认失败"))}>确认并冻结本次档案</button>
+                    <button className="secondary-button" type="button" onClick={() => void confirmCapabilityProfile().catch((error) => setRequestError(error instanceof Error ? error.message : "能力档案确认失败"))}>确认并冻结本次档案</button>
                   </div>
                 )}
               </div>
             </section>
 
-            <section hidden={activeView !== "context"} className="settings-section capability-directory-section">
+            <section hidden={activeView !== "context" && activeView !== "settings"} className="settings-section capability-directory-section">
               <div className="settings-title">
                 <ShieldCheck size={19} />
                 <div><h3>能力目录</h3><p>来源、风险和权限由本机策略统一裁决。目录不代表模型已获得执行权限。</p></div>
@@ -4787,7 +4710,7 @@ export function App() {
               </div>
             </section>
 
-            <section hidden={activeView !== "context"} className="settings-section">
+            <section hidden={activeView !== "context" && activeView !== "settings"} className="settings-section">
               <div className="settings-title">
                 <FileArrowUp size={19} />
                 <div><h3>研发文档</h3><p>MD / TXT · {documents.length} 份已索引文档</p></div>
@@ -4806,7 +4729,7 @@ export function App() {
               </div>
             </section>
 
-            <section hidden={activeView !== "context"} className="settings-section">
+            <section hidden={activeView !== "context" && activeView !== "settings"} className="settings-section">
               <div className="settings-title">
                 <PuzzlePiece size={19} />
                 <div><h3>MCP 工具</h3><p>连接状态：{mcpResult?.status ?? "未探测"}</p></div>
@@ -4856,7 +4779,7 @@ export function App() {
               </div>
             </section>
 
-            <section hidden={activeView !== "context"} className="settings-section">
+            <section hidden={activeView !== "context" && activeView !== "settings"} className="settings-section">
               <div className="settings-title">
                 <SlidersHorizontal size={19} />
                 <div><h3>Skills 与插件</h3><p>{plugins.filter((item) => item.active).length} 个活动插件</p></div>
