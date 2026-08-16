@@ -43,6 +43,7 @@ class EvaluationTask:
     baseline_status: str | None = None
     target_test_class: str | None = None
     profile: str = "java_maven"
+    expected_tool_sequence: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +196,9 @@ class EvaluationRunResult:
     verification_reports: tuple[str, ...]
     verification_contract_valid: bool
     error_summary: str | None
+    tool_sequence: tuple[str, ...] = ()
+    tool_trajectory_valid: bool = True
+    context_snapshot_sha256: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -222,6 +226,9 @@ class EvaluationRunResult:
             "verification_reports": list(self.verification_reports),
             "verification_contract_valid": self.verification_contract_valid,
             "error_summary": self.error_summary,
+            "tool_sequence": list(self.tool_sequence),
+            "tool_trajectory_valid": self.tool_trajectory_valid,
+            "context_snapshot_sha256": self.context_snapshot_sha256,
         }
 
 
@@ -313,10 +320,13 @@ class EvaluationCatalog:
             baseline_status = item.get("baseline_status")
             target_test_class = item.get("target_test_class")
             profile = item.get("profile", "java_maven")
+            expected_tool_sequence = item.get("expected_tool_sequence", [])
             paths = item.get("expected_paths")
             if not all(isinstance(value, str) and value for value in (task_id, category, description, recipe, expected_status)):
                 raise ValueError("EVALUATION_CATALOG_INVALID")
             if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
+                raise ValueError("EVALUATION_CATALOG_INVALID")
+            if not isinstance(expected_tool_sequence, list) or not all(isinstance(name, str) and name for name in expected_tool_sequence):
                 raise ValueError("EVALUATION_CATALOG_INVALID")
             if baseline_status is not None and baseline_status not in {"PASSED", "FAILED"}:
                 raise ValueError("EVALUATION_CATALOG_INVALID")
@@ -343,6 +353,7 @@ class EvaluationCatalog:
                     baseline_status,
                     target_test_class,
                     profile,
+                    tuple(expected_tool_sequence),
                 )
             )
         if not tasks or len({task.task_id for task in tasks}) != len(tasks):
@@ -1093,6 +1104,8 @@ class EvaluationRunner:
         raw_changed_paths = patch_result.get("paths", []) if isinstance(patch_result, dict) else []
         changed_paths = tuple(str(path) for path in raw_changed_paths if isinstance(path, str))
         scope_valid = _changed_paths_in_scope(changed_paths, task.expected_paths)
+        tool_sequence = _tool_sequence(state)
+        trajectory_valid = _tool_trajectory_matches(tool_sequence, task.expected_tool_sequence)
         actual_status = "FAILED" if graph_status == "PASSED" and (not scope_valid or not verification_contract_valid) else graph_status
         source_unchanged = source_status_before == FixtureBuilder._git(repository, "status", "--porcelain") and baseline_commit == FixtureBuilder._git(repository, "rev-parse", "HEAD").strip()
         return EvaluationRunResult(
@@ -1100,7 +1113,7 @@ class EvaluationRunner:
             thread_id=thread_id,
             expected_status=task.expected_status,
             actual_status=actual_status,
-            matched_expectation=actual_status == task.expected_status and source_unchanged and scope_valid,
+            matched_expectation=actual_status == task.expected_status and source_unchanged and scope_valid and trajectory_valid,
             pending_approval=bool(getattr(result, "pending_approval", False)),
             approval_count=approvals,
             baseline_commit=baseline_commit,
@@ -1120,6 +1133,9 @@ class EvaluationRunner:
             verification_reports=verification_reports,
             verification_contract_valid=verification_contract_valid,
             error_summary=str(state.get("error_summary")) if isinstance(state, dict) and state.get("error_summary") else None,
+            tool_sequence=tool_sequence,
+            tool_trajectory_valid=trajectory_valid,
+            context_snapshot_sha256=_context_snapshot_sha256(state),
         )
 
     @staticmethod
@@ -1130,6 +1146,7 @@ class EvaluationRunner:
     ) -> None:
         passed = sum(item.matched_expectation for item in results)
         payload = {
+            # 新字段为可选追加字段，保持既有消费端的 schema v2 兼容性。
             "schema_version": 2,
             "metadata": metadata.to_dict(),
             "run_count": len(results),
@@ -1358,6 +1375,45 @@ def _changed_paths_in_scope(changed_paths: tuple[str, ...], expected_patterns: t
     if not expected_patterns:
         return False
     return all(any(_matches(path, pattern) for pattern in expected_patterns) for path in changed_paths)
+
+
+def _tool_sequence(state: object) -> tuple[str, ...]:
+    """从 Graph 审计事件提取调用名称，不导出参数、模型原文或工具输出。"""
+
+    if not isinstance(state, dict):
+        return ()
+    events = state.get("tool_events")
+    if not isinstance(events, list):
+        return ()
+    return tuple(
+        item["name"]
+        for item in events
+        if isinstance(item, dict) and item.get("type") == "TOOL_CALL" and isinstance(item.get("name"), str)
+    )
+
+
+def _tool_trajectory_matches(actual: tuple[str, ...], expected: tuple[str, ...]) -> bool:
+    """按声明顺序匹配子序列，允许模型做额外的安全只读取证。"""
+
+    if not expected:
+        return True
+    cursor = 0
+    for name in actual:
+        if name == expected[cursor]:
+            cursor += 1
+            if cursor == len(expected):
+                return True
+    return False
+
+
+def _context_snapshot_sha256(state: object) -> str | None:
+    if not isinstance(state, dict):
+        return None
+    snapshot = state.get("context_snapshot")
+    if not isinstance(snapshot, dict):
+        return None
+    digest = snapshot.get("snapshot_sha256")
+    return digest if isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) else None
 
 
 def _verification_contract_matches(task: EvaluationTask, verification: object) -> bool:

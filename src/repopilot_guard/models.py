@@ -190,6 +190,7 @@ class TaskRequest:
     attached_document_ids: tuple[str, ...] = ()
     budget: TaskBudget = field(default_factory=TaskBudget)
     operation: TaskOperation = TaskOperation.CHANGE
+    capability_profile: dict[str, object] | None = None
 
     def __post_init__(self) -> None:
         if not self.description.strip():
@@ -236,6 +237,8 @@ class TaskRequest:
             raise ValueError("attached_document_ids must contain managed document IDs.")
         if len(set(self.attached_document_ids)) != len(self.attached_document_ids):
             raise ValueError("attached_document_ids must not contain duplicates.")
+        if self.capability_profile is not None and not isinstance(self.capability_profile, dict):
+            raise ValueError("capability_profile must be a structured project capability snapshot.")
 
         repository = self.repository.expanduser().resolve()
         output_root = self.output_root.expanduser().resolve()

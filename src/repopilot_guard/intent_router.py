@@ -92,6 +92,8 @@ class IntentRouter:
                     "code_research：定位、分析、评估仓库代码且不要求改动；当用户要求详细介绍、项目流程、模块关系、调用链、目录结构"
                     "或明确要求结合代码时，即使没有说“分析”，也应选择 code_research；"
                     "code_change：明确要求修复、修改、新增、删除或执行代码操作。"
+                    "询问“如何/怎么/为什么实现、原理、原因、在哪”等，即使提到“实现、优化、异常”，"
+                    "也应选 code_research 而非 code_change。"
                     "不确定时选 chat 且给出低置信度。"
                 ),
             },
@@ -151,21 +153,27 @@ class IntentRouter:
     @staticmethod
     def _rule_fallback(content: str, *, has_project: bool) -> IntentRoute:
         normalized = content.strip().lower()
-        if not has_project and re.search(r"项目|仓库|代码|bug|修复|修改|文件", normalized):
+        if not has_project and re.search(r"项目|仓库|代码|bug|修复|修改|文件|函数|类|接口|模块|实现", normalized):
             return IntentRoute(
                 IntentRouteName.CHAT,
                 0.95,
                 "该请求需要项目上下文；请先选择本地项目后再继续。",
                 "rule_fallback",
             )
-        if re.search(r"修复|修改|新增|删除|重构|实现|修正|优化|bug|错误|异常|失效|不生效|\bfix\b", normalized):
-            return IntentRoute(IntentRouteName.CODE_CHANGE, 0.86, "请求明确包含代码改动目标。", "rule_fallback")
-        if re.search(r"详细.*项目|项目.*详细|好好分析|结合代码|调用链|流程|模块关系|目录结构|整体架构", normalized):
+        # 只读研究/咨询意图优先于"实现/优化/异常"等可能被误解为修改的动词：
+        # 用户问"如何/为什么/在哪/原理"时，即使提到"实现/优化"，也是想理解而非改动。
+        if re.search(
+            r"如何|怎么|为什么|为何|原因|原理|是什么|在哪|哪里|哪些|分析|解释|讲解|梳理|排查|评估|定位|查找|搜索|检索|调用链|依赖|架构|结构|设计|流程|结合代码|详细|模块关系|目录结构",
+            normalized,
+        ):
             return IntentRoute(IntentRouteName.CODE_RESEARCH, 0.86, "请求需要基于仓库代码给出可定位的详细结论。", "rule_fallback")
-        if re.search(r"分析|定位|查找|搜索|检索|调用链|依赖|架构|评估|排查|在哪|哪里|如何实现", normalized):
-            return IntentRoute(IntentRouteName.CODE_RESEARCH, 0.8, "请求需要定位或分析项目代码。", "rule_fallback")
-        if re.search(r"介绍.*项目|项目.*介绍|项目概览|技术栈|这个仓库", normalized):
+        if re.search(r"介绍.*项目|项目.*介绍|项目概览|技术栈|这个仓库|这是什么项目", normalized):
             return IntentRoute(IntentRouteName.PROJECT_QA, 0.8, "请求是当前项目的概览问答。", "rule_fallback")
+        if re.search(
+            r"修复|修改|改正|修正|新增|添加|增加|删除|移除|重构|改写|重写|实现|补全|加上|生成|创建|写一个|改一下|优化|调整|\bfix\b|bug|错误|异常|失效|不生效",
+            normalized,
+        ):
+            return IntentRoute(IntentRouteName.CODE_CHANGE, 0.86, "请求明确包含代码改动目标。", "rule_fallback")
         return IntentRoute(IntentRouteName.CHAT, 0.6, "未能从文字中明确判断是否需要项目代码上下文。", "rule_fallback")
 
 

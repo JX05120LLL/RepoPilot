@@ -7,5 +7,50 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
 
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      - qdrant
+      - jaeger
+    ports:
+      # 容器内监听 0.0.0.0，宿主机仍只绑定回环地址，不暴露到局域网。
+      - "127.0.0.1:8765:8765"
+    environment:
+      REPOPILOT_QDRANT_URL: "http://qdrant:6333"
+      REPOPILOT_STATE_DB_PATH: "/data/state.sqlite"
+      REPOPILOT_API_ALLOW_NONLOCAL: "1"
+      # 可观测性：OTLP/HTTP 导出到本 compose 内的 Jaeger。
+      REPOPILOT_OTEL_ENABLED: "true"
+      REPOPILOT_OTEL_SERVICE_NAME: "repopilot-guard"
+      REPOPILOT_OTEL_EXPORTER_ENDPOINT: "http://jaeger:4318/v1/traces"
+      # 模型与 Embedding 配置经宿主机 .env 注入；未配置时 /readyz 如实返回 503。
+      REPOPILOT_CHAT_BASE_URL: "${REPOPILOT_CHAT_BASE_URL:-}"
+      REPOPILOT_CHAT_API_KEY: "${REPOPILOT_CHAT_API_KEY:-}"
+      REPOPILOT_CHAT_MODEL: "${REPOPILOT_CHAT_MODEL:-}"
+      REPOPILOT_EMBEDDING_BASE_URL: "${REPOPILOT_EMBEDDING_BASE_URL:-}"
+      REPOPILOT_EMBEDDING_API_KEY: "${REPOPILOT_EMBEDDING_API_KEY:-}"
+      REPOPILOT_EMBEDDING_MODEL: "${REPOPILOT_EMBEDDING_MODEL:-}"
+      REPOPILOT_EMBEDDING_DIMENSIONS: "${REPOPILOT_EMBEDDING_DIMENSIONS:-1024}"
+    volumes:
+      - repopilot_state:/data
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    ports:
+      - "127.0.0.1:16686:16686" # Jaeger UI
+      - "127.0.0.1:4318:4318" # OTLP/HTTP
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    depends_on:
+      - backend
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
 volumes:
   qdrant_data:
+  repopilot_state:

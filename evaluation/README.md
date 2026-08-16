@@ -61,3 +61,5 @@ uv run repopilot-guard evaluate matrix `
 JSON 和 Markdown 报告会自动记录 RepoPilot 版本与 Git 状态、任务目录 SHA-256、fixture 集合 SHA-256、操作系统、Python 版本及脱敏 Provider 标识。报告不会写入 Base URL、API Key 或本机 Maven 绝对安装路径；模型名称格式异常时以 `INVALID_IDENTIFIER_REDACTED` 代替。
 
 每次发布候选版本必须重新生成 fixture，不能复用旧目录。fixture 内容由当前 `evaluation.py` 生成；复用旧目录会让任务定义、失败测试和 Git 基线与当前代码不一致，导致评测结果失去可比性。
+
+端到端报告还会保存脱敏的 `tool_sequence`、`context_snapshot_sha256` 和可选的 `expected_tool_sequence` 断言。新增真实失败时，应将其缩小为单个 fixture，并只声明稳定、必要的工具调用子序列（允许额外安全只读取证），这样模型或 Prompt 调整才能以相同输入比较轨迹、结果、成本和耗时。

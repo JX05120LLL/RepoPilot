@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
+
+from repopilot_guard.capability_profiles import CapabilityProfile, CapabilityProfileScanner, normalize_confirmations
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +73,10 @@ class ProjectRegistry:
             (project_id, display_name or root.name, str(root), int(self._is_git_repository(root)), now, now),
         )
         self._connection.commit()
-        return self.get(project_id)
+        record = self.get(project_id)
+        # 用户明确添加目录后才执行一次受限静态扫描；不索引、更不执行项目命令。
+        self.capability_profile(record.project_id)
+        return record
 
     def get(self, project_id: str) -> ProjectRecord:
         row = self._connection.execute("SELECT * FROM projects WHERE project_id = ?", (project_id,)).fetchone()
@@ -170,6 +176,49 @@ class ProjectRegistry:
             raise ValueError("TASK_WORKSPACE_UNAVAILABLE")
         return workspace_path
 
+    def capability_profile(self, project_id: str) -> CapabilityProfile:
+        """刷新扫描事实；源码变化使旧确认失效，防止把过期约束注入新任务。"""
+
+        project = self.get(project_id)
+        scanned = CapabilityProfileScanner().scan(project_id, project.root_path)
+        row = self._connection.execute(
+            "SELECT profile_sha256, confirmed_at, business_rules_json, protected_paths_json FROM project_capability_profiles WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+        if row and row["profile_sha256"] == scanned.profile_sha256:
+            return CapabilityProfile(
+                project_id, scanned.facts, scanned.profile_sha256, row["confirmed_at"],
+                tuple(json.loads(row["business_rules_json"])), tuple(json.loads(row["protected_paths_json"])),
+            )
+        now = self._now()
+        self._connection.execute(
+            """
+            INSERT INTO project_capability_profiles(project_id, profile_sha256, facts_json, confirmed_at, business_rules_json, protected_paths_json, updated_at)
+            VALUES (?, ?, ?, NULL, '[]', '[]', ?)
+            ON CONFLICT(project_id) DO UPDATE SET profile_sha256 = excluded.profile_sha256, facts_json = excluded.facts_json,
+                confirmed_at = NULL, business_rules_json = '[]', protected_paths_json = '[]', updated_at = excluded.updated_at
+            """,
+            (project_id, scanned.profile_sha256, json.dumps(scanned.facts, ensure_ascii=False, sort_keys=True), now),
+        )
+        self._connection.commit()
+        return scanned
+
+    def confirm_capability_profile(
+        self, project_id: str, profile_sha256: str, business_rules: tuple[str, ...], protected_paths: tuple[str, ...]
+    ) -> CapabilityProfile:
+        current = self.capability_profile(project_id)
+        if profile_sha256 != current.profile_sha256:
+            raise ValueError("CAPABILITY_PROFILE_STALE")
+        rules = normalize_confirmations(business_rules, code="CAPABILITY_PROFILE_RULES_INVALID")
+        paths = normalize_confirmations(protected_paths, code="CAPABILITY_PROFILE_PATHS_INVALID")
+        now = self._now()
+        self._connection.execute(
+            "UPDATE project_capability_profiles SET confirmed_at = ?, business_rules_json = ?, protected_paths_json = ?, updated_at = ? WHERE project_id = ?",
+            (now, json.dumps(rules, ensure_ascii=False), json.dumps(paths, ensure_ascii=False), now, project_id),
+        )
+        self._connection.commit()
+        return CapabilityProfile(project_id, current.facts, current.profile_sha256, now, rules, paths)
+
     def _initialize(self) -> None:
         self._connection.executescript(
             """
@@ -189,6 +238,16 @@ class ProjectRegistry:
                 workspace_path TEXT NOT NULL,
                 base_commit TEXT NOT NULL,
                 created_at TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES projects(project_id)
+            );
+            CREATE TABLE IF NOT EXISTS project_capability_profiles (
+                project_id TEXT PRIMARY KEY,
+                profile_sha256 TEXT NOT NULL,
+                facts_json TEXT NOT NULL,
+                confirmed_at TEXT,
+                business_rules_json TEXT NOT NULL DEFAULT '[]',
+                protected_paths_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL,
                 FOREIGN KEY(project_id) REFERENCES projects(project_id)
             );
             """

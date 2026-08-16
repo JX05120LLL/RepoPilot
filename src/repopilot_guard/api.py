@@ -15,10 +15,10 @@ from uuid import uuid4
 
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field, SecretStr
 
-from repopilot_guard import __version__
+from repopilot_guard import __version__, observability
 from repopilot_guard.capabilities import CapabilityDescriptor, CapabilityPolicy
 from repopilot_guard.config import AppSettings, ComponentCheck, RuntimeConfigurationError, RuntimeConfigurationManager
 from repopilot_guard.conversation_store import ConversationStore
@@ -115,6 +115,12 @@ class DocumentIndexBody(BaseModel):
 
 class ProjectRenameBody(BaseModel):
     display_name: str = Field(min_length=1, max_length=80)
+
+
+class CapabilityProfileConfirmationBody(BaseModel):
+    profile_sha256: str = Field(min_length=64, max_length=64, pattern="^[0-9a-f]{64}$")
+    business_rules: list[str] = Field(default_factory=list, max_length=32)
+    protected_paths: list[str] = Field(default_factory=list, max_length=32)
 
 
 class ConversationCreateBody(BaseModel):
@@ -272,6 +278,7 @@ def create_app(
     """创建 API；调用者负责复用 SQLite graph runner 与项目注册表。"""
 
     app = FastAPI(title="RepoPilot Guard", version=__version__)
+    observability.init_observability()
     store = task_store or TaskStore(registry.database_path)
     conversations = ConversationStore(registry.database_path)
     plugins = plugin_registry or PluginRegistry(registry.database_path)
@@ -287,6 +294,7 @@ def create_app(
     app.router.on_shutdown.append(conversations.close)
     if plugin_registry is None:
         app.router.on_shutdown.append(plugins.close)
+    app.router.on_shutdown.append(observability.shutdown)
     # 开发期前端运行在 Vite 的独立本机端口，生产权限仍由 Python 后端裁决。
     app.add_middleware(
         CORSMiddleware,
@@ -325,6 +333,35 @@ def create_app(
             ],
             "dependencies": [check.to_dict() for check in checks],
         }
+
+    @app.get("/healthz")
+    def healthz() -> dict[str, object]:
+        """存活探针：进程活着即返回，不依赖外部组件。"""
+
+        return {"status": "ALIVE"}
+
+    @app.get("/readyz")
+    def readyz() -> dict[str, object]:
+        """就绪探针：检查 SQLite/Qdrant 等运行依赖，未就绪返回 503。"""
+
+        try:
+            checks = check_runtime()
+        except Exception:
+            checks = ()
+        ready = all(check.ready for check in checks)
+        body = {
+            "status": "READY" if ready else "NOT_READY",
+            "dependencies": [check.to_dict() for check in checks],
+        }
+        if not ready:
+            raise HTTPException(status_code=503, detail=body)
+        return body
+
+    @app.get("/metrics")
+    def metrics() -> Response:
+        """Prometheus 文本 exposition；禁用可观测性时返回只读说明注释。"""
+
+        return Response(content=observability.metrics_text(), media_type="text/plain; version=0.0.4")
 
     @app.get("/api/runtime/configuration")
     def runtime_configuration_snapshot() -> dict[str, object]:
@@ -656,6 +693,29 @@ def create_app(
             bundled_skill_roots=bundled_skill_roots,
         )
 
+    @app.get("/api/projects/{project_id}/capability-profile")
+    def project_capability_profile(project_id: str) -> dict[str, object]:
+        """返回首次授权后受限扫描的项目事实与用户确认状态。"""
+
+        try:
+            return registry.capability_profile(project_id).to_dict()
+        except ValueError as error:
+            raise HTTPException(404, {"code": "PROJECT_NOT_FOUND", "message": "项目不存在。"}) from error
+
+    @app.post("/api/projects/{project_id}/capability-profile/confirm")
+    def confirm_project_capability_profile(
+        project_id: str, body: CapabilityProfileConfirmationBody
+    ) -> dict[str, object]:
+        try:
+            profile = registry.confirm_capability_profile(
+                project_id, body.profile_sha256, tuple(body.business_rules), tuple(body.protected_paths)
+            )
+        except ValueError as error:
+            code = str(error)
+            status_code = 409 if code == "CAPABILITY_PROFILE_STALE" else 422
+            raise HTTPException(status_code, {"code": code, "message": "项目能力档案无法确认，请刷新后重试。"}) from error
+        return profile.to_dict()
+
     @app.post("/api/projects/{project_id}/documents")
     def index_project_document(project_id: str, body: DocumentIndexBody) -> dict[str, object]:
         """导入 MD/TXT/PDF/DOCX，解析为受控文本副本后写入项目 RAG。"""
@@ -786,7 +846,11 @@ def create_app(
         if bool(body.project_id) == bool(body.repository):
             raise HTTPException(400, "PROJECT_ID_OR_REPOSITORY_REQUIRED")
         try:
+            project_profile: dict[str, object] | None = None
             repository = registry.get(body.project_id).root_path if body.project_id else Path(str(body.repository))
+            if body.project_id:
+                profile = registry.capability_profile(body.project_id)
+                project_profile = {"profile_sha256": profile.profile_sha256, "context": profile.context_payload()}
             conversation_context = ""
             if body.conversation_id:
                 try:
@@ -838,6 +902,7 @@ def create_app(
                 approved_capabilities=approved_capabilities,
                 attached_document_ids=attached_document_ids,
                 operation=body.operation,
+                capability_profile=project_profile,
             )
             thread_id = body.thread_id or str(uuid4())
             store.create(
@@ -872,6 +937,7 @@ def create_app(
                         store.complete_cancellation(thread_id)
                         stored = store.get(thread_id)
                     _append_conversation_task_summary(conversations, stored, result)
+                    observability.record_task_terminal(stored.status)
                 except Exception as error:
                     # 不把异常细节或环境变量返回给桌面端；图自身的 BLOCKED 事件仍在 checkpoint 中。
                     try:
@@ -880,12 +946,14 @@ def create_app(
                         else:
                             store.mark_runtime_failure(thread_id, f"TASK_RUNTIME_FAILED: {type(error).__name__}")
                         _append_conversation_task_summary(conversations, store.get(thread_id), {})
+                        observability.record_task_terminal("FAILED")
                     except ValueError:
                         return
                 finally:
                     heartbeat_stop.set()
                     heartbeat.join(timeout=1)
 
+            observability.record_task_started()
             Thread(target=run_in_background, name=f"repopilot-{request.task_id}", daemon=True).start()
             snapshot = _task_snapshot(runner, store, thread_id)
             # 后台图写入首个 checkpoint 前，也要让客户端拿到稳定的任务语义。

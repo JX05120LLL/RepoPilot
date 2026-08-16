@@ -447,6 +447,20 @@ type ProjectDiagnosis = {
     warnings?: string[];
   }>;
 };
+type CapabilityProfile = {
+  status: "CONFIRMED" | "PENDING_CONFIRMATION";
+  profile_sha256: string;
+  confirmed_at: string | null;
+  facts: {
+    modules: Array<{ path: string; descriptors: string }>;
+    entrypoints: Array<{ path: string; kind: string; targets?: string }>;
+    verification: Array<{ profile_id: string; display_name: string; detected_files: string[]; execution_supported: boolean }>;
+    protected_paths: string[];
+    known_limitations: string[];
+  };
+  business_rules: string[];
+  protected_paths: string[];
+};
 type TaskOutcome = {
   tone: "neutral" | "success" | "warning" | "danger";
   title: string;
@@ -865,6 +879,9 @@ export function App() {
   const [documents, setDocuments] = useState<ManagedDocument[]>([]);
   const [attachedDocumentIds, setAttachedDocumentIds] = useState<string[]>([]);
   const [projectDiagnosis, setProjectDiagnosis] = useState<ProjectDiagnosis | null>(null);
+  const [capabilityProfile, setCapabilityProfile] = useState<CapabilityProfile | null>(null);
+  const [profileBusinessRules, setProfileBusinessRules] = useState("");
+  const [profileProtectedPaths, setProfileProtectedPaths] = useState("");
   const [sidebarMenu, setSidebarMenu] = useState<SidebarMenu | null>(null);
   const [renameTarget, setRenameTarget] = useState<RenameTarget | null>(null);
   const [renameValue, setRenameValue] = useState("");
@@ -1030,6 +1047,38 @@ export function App() {
     }
     if (!response.ok) throw new Error("无法读取项目能力目录");
     setCapabilityDirectory((await response.json()) as CapabilityDirectory);
+  }
+
+  async function loadCapabilityProfile(targetProjectId: string) {
+    if (!targetProjectId || !projects.some((project) => project.project_id === targetProjectId)) {
+      setCapabilityProfile(null);
+      return;
+    }
+    const response = await fetch(`${API}/projects/${encodeURIComponent(targetProjectId)}/capability-profile`);
+    if (response.status === 404) {
+      setCapabilityProfile(null);
+      return;
+    }
+    if (!response.ok) throw new Error("无法读取项目能力档案");
+    const profile = (await response.json()) as CapabilityProfile;
+    setCapabilityProfile(profile);
+    setProfileBusinessRules(profile.business_rules.join("\n"));
+    setProfileProtectedPaths(profile.protected_paths.join("\n"));
+  }
+
+  async function confirmCapabilityProfile() {
+    if (!projectId || !capabilityProfile) return;
+    const response = await fetch(`${API}/projects/${encodeURIComponent(projectId)}/capability-profile/confirm`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        profile_sha256: capabilityProfile.profile_sha256,
+        business_rules: profileBusinessRules.split("\n").map((item) => item.trim()).filter(Boolean),
+        protected_paths: profileProtectedPaths.split("\n").map((item) => item.trim()).filter(Boolean),
+      }),
+    });
+    if (!response.ok) throw new Error("能力档案已变化或无法确认，请刷新后重试");
+    setCapabilityProfile((await response.json()) as CapabilityProfile);
   }
 
   async function checkApiHealth() {
@@ -1353,6 +1402,12 @@ export function App() {
   }, [projectId, projects]);
 
   useEffect(() => {
+    void loadCapabilityProfile(projectId).catch((error) =>
+      setNotice(error instanceof Error ? error.message : "无法读取项目能力档案"),
+    );
+  }, [projectId, projects]);
+
+  useEffect(() => {
     void loadProjectDiagnosis(projectId).catch((error) =>
       setRequestError(error instanceof Error ? error.message : "无法读取项目诊断"),
     );
@@ -1367,10 +1422,7 @@ export function App() {
   useEffect(() => {
     if (taskBlocksNewTurn || !projectDiagnosis) return;
     const recommendedOperation =
-      projectDiagnosis.recommended_task_operation ??
-      (projectDiagnosis.task_modes.full_local.code === "FULL_LOCAL_RESEARCH_ONLY"
-        ? "research"
-        : "change");
+      projectDiagnosis.recommended_task_operation ?? "change";
     setMode(projectDiagnosis.recommended_task_mode);
     setOperation(recommendedOperation);
     setConfirmed(false);
@@ -4433,6 +4485,36 @@ export function App() {
                 <p>API Key 仅写入 RepoPilot 桌面应用的本机配置。已保存的密钥不会回显，也不会进入任务证据、日志或导出文件。</p>
               </div>
             )}
+
+            <section hidden={activeView !== "context"} className="settings-section capability-directory-section">
+              <div className="settings-title">
+                <Stack size={19} />
+                <div><h3>项目能力档案</h3><p>受限静态扫描生成；确认后的业务规则和禁改路径会随任务上下文冻结并留存哈希。</p></div>
+              </div>
+              <div className="settings-content">
+                {!projectId ? (
+                  <p className="capability-empty">选择项目后生成能力档案。</p>
+                ) : !capabilityProfile ? (
+                  <p className="capability-empty">正在读取受控扫描结果。</p>
+                ) : (
+                  <div className="capability-list">
+                    <article className="capability-row">
+                      <div className="capability-main">
+                        <div><b>{capabilityProfile.status === "CONFIRMED" ? "已确认" : "待确认"}能力档案</b><span>SHA-256：{capabilityProfile.profile_sha256.slice(0, 12)}</span></div>
+                        <p>模块：{capabilityProfile.facts.modules.map((item) => item.path).join("、") || "未识别"}</p>
+                        <p>入口：{capabilityProfile.facts.entrypoints.map((item) => item.targets ? `${item.path} → ${item.targets}` : item.path).join("、") || "未识别（可在任务中继续检索）"}</p>
+                        <p>验证：{capabilityProfile.facts.verification.map((item) => item.display_name).join("、") || "未识别受控 Recipe"}</p>
+                        <details><summary>查看扫描边界与默认禁改规则</summary><p>{capabilityProfile.facts.known_limitations.join(" ")}</p><code>{capabilityProfile.facts.protected_paths.join("\n")}</code></details>
+                      </div>
+                      <span className={`capability-state ${capabilityProfile.status === "CONFIRMED" ? "ready" : "warning"}`}>{capabilityProfile.status === "CONFIRMED" ? "已冻结" : "需确认"}</span>
+                    </article>
+                    <label>业务规则（每行一条）<textarea value={profileBusinessRules} onChange={(event) => setProfileBusinessRules(event.target.value)} maxLength={8_960} placeholder="例如：订单状态不可跳过支付成功" /></label>
+                    <label>额外禁改路径（每行一条）<textarea value={profileProtectedPaths} onChange={(event) => setProfileProtectedPaths(event.target.value)} maxLength={8_960} placeholder="例如：infra/production/**" /></label>
+                    <button className="secondary-button" type="button" onClick={() => void confirmCapabilityProfile().catch((error) => setNotice(error instanceof Error ? error.message : "能力档案确认失败"))}>确认并冻结本次档案</button>
+                  </div>
+                )}
+              </div>
+            </section>
 
             <section hidden={activeView !== "context"} className="settings-section capability-directory-section">
               <div className="settings-title">

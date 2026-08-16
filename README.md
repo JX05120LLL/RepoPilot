@@ -43,6 +43,7 @@ RepoPilot 面向已有代码仓库的真实维护工作：选择本地项目，�
 - 代码研究、计划审批、补丁预览、执行审批、验证、审阅和报告形成固定流程；
 - 结构化补丁使用“目标文件 + 预期旧文本 + 新文本”，所有修改先校验、后原子写入；
 - Java/Maven、Java/Gradle、Python/pytest、Node.js/npm/pnpm 使用固定 Recipe 执行验证；
+- 首次登记项目会生成受限静态扫描的 Agent 能力档案；用户确认业务规则和额外禁改路径后，它们会以哈希快照进入每次任务上下文；
 - 真实 Git Diff、测试摘要、Evidence 事件和任务产物可在桌面端、CLI 或 API 中审阅；
 - 支持计划重写、任务取消、断线恢复、终态归档和经哈希校验的证据导出。
 
@@ -252,7 +253,7 @@ uv run python -m unittest discover -s tests -t . -v
 uv run repopilot-guard evaluate --help
 ```
 
-当前自动化测试覆盖控制面、RAG、文档解析、工作区隔离、补丁原子性、Maven/Gradle/pytest/Node Recipe、MCP/插件、Shell/Git 审批、子 Agent 并行取证、API/SSE 和桌面端配置边界。
+当前自动化测试覆盖控制面、RAG、文档解析、项目能力档案、工作区隔离、补丁原子性、Maven/Gradle/pytest/Node Recipe、MCP/插件、Shell/Git 审批、子 Agent 并行取证、API/SSE 和桌面端配置边界。
 
 ## 安全边界
 

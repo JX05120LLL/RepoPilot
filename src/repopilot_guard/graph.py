@@ -26,6 +26,7 @@ from langgraph.types import Command, interrupt
 from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
+from repopilot_guard import observability
 from repopilot_guard.cancellation import DEFAULT_CANCELLATION_REGISTRY, TaskCancellationRegistry
 from repopilot_guard.capabilities import (
     CapabilityDescriptor,
@@ -310,6 +311,7 @@ class GraphState(TypedDict, total=False):
     project_id: str | None
     conversation_id: str | None
     conversation_context: str
+    capability_profile: dict[str, object] | None
     permission_mode: str
     permission_confirmation: str | None
     permission_snapshot: dict[str, object]
@@ -710,6 +712,7 @@ class OpenAIResearchModel:
         if self._pricing is not None:
             input_price, output_price, currency = self._pricing
             cost = round((input_tokens * input_price + output_tokens * output_price) / 1_000_000, 8)
+        observability.record_model_usage(input_tokens, output_tokens, total_tokens, cost, currency)
         return ModelUsage(input_tokens, output_tokens, total_tokens, True, cost, currency)
 
     @staticmethod
@@ -1239,11 +1242,22 @@ class CodingGraphFactory:
 
     @staticmethod
     def _instrument_node(name: str, node: Callable[[GraphState], GraphState]) -> Callable[[GraphState], GraphState]:
-        """为每个图节点追加耗时事件；仅写摘要，绝不记录输入消息或文件正文。"""
+        """为每个图节点追加耗时事件与可观测 span；仅写摘要，绝不记录输入消息或文件正文。"""
 
         def invoke(state: GraphState) -> GraphState:
             started = time.monotonic()
-            result = node(state)
+            attributes: dict[str, object] = {"node.name": name}
+            task_id = state.get("task_id")
+            if task_id:
+                attributes["task.id"] = task_id
+            with observability.span("graph.node", attributes) as active:
+                try:
+                    result = node(state)
+                except Exception as error:
+                    active.record_exception(error)
+                    active.set_status_error()
+                    raise
+                active.set_attribute("node.duration_ms", int((time.monotonic() - started) * 1000))
             existing = result.get("tool_events")
             events = list(existing) if isinstance(existing, list) else list(state.get("tool_events", []))
             return {
@@ -1554,6 +1568,7 @@ class CodingGraphFactory:
             capabilities=capabilities,
             bound_tool_ids=bound_tool_ids,
             attached_contexts=attachment_contexts,
+            capability_profile=state.get("capability_profile"),
         )
         references = [
             {
@@ -3057,6 +3072,7 @@ class GraphRunner:
                 "project_id": request.project_id,
                 "conversation_id": request.conversation_id,
                 "conversation_context": request.conversation_context,
+                "capability_profile": request.capability_profile,
                 "permission_mode": grant.mode.value,
                 "permission_confirmation": grant.confirmation,
                 "permission_snapshot": permission_snapshot.to_dict(),

@@ -188,7 +188,7 @@ class CliProductTests(unittest.TestCase):
         self.assertIn(project.project_id, payload["next_action"]["command"])
         self.assertNotIn(str(repository), json.dumps(payload, ensure_ascii=False))
 
-    def test_welcome_recommends_full_local_research_for_non_git_project(self) -> None:
+    def test_welcome_recommends_full_local_risk_review_for_non_git_project(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             state_path = root / "state.sqlite"
@@ -204,13 +204,12 @@ class CliProductTests(unittest.TestCase):
         payload = json.loads(output.getvalue())
         command = payload["next_action"]["command"]
         self.assertEqual(0, exit_code)
-        self.assertEqual("START_FULL_LOCAL_RESEARCH", payload["next_action"]["type"])
-        self.assertEqual("research", payload["selected_project"]["recommended_task_operation"])
-        self.assertEqual(["research"], payload["selected_project"]["full_local"]["allowed_operations"])
+        self.assertEqual("REVIEW_FULL_LOCAL_RISK", payload["next_action"]["type"])
+        self.assertEqual("change", payload["selected_project"]["recommended_task_operation"])
+        self.assertEqual(["change", "research"], payload["selected_project"]["full_local"]["allowed_operations"])
+        self.assertEqual("FULL_LOCAL_FILE_SNAPSHOT_READY", payload["selected_project"]["full_local"]["code"])
         self.assertIn(project.project_id, command)
-        self.assertIn("--operation research", command)
-        self.assertIn("--task-mode full-local", command)
-        self.assertIn(FULL_ACCESS_CONFIRMATION, command)
+        self.assertIn("project doctor", command)
         self.assertNotIn(str(repository), json.dumps(payload, ensure_ascii=False))
         self.assertEqual("NOT_DETECTED", payload["selected_project"]["java_maven"]["status"])
         self.assertEqual({}, payload["selected_project"]["profiles"])
@@ -525,7 +524,7 @@ class CliProductTests(unittest.TestCase):
             self.assertEqual("THREAD_ID_ALREADY_EXISTS", json.loads(output.getvalue())["code"])
             runner.run.assert_not_called()
 
-    def test_non_git_full_local_change_is_blocked_before_runtime_loading(self) -> None:
+    def test_non_git_safe_isolated_change_is_blocked_before_runtime_loading(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             repository = root / "plain-project"
@@ -547,9 +546,7 @@ class CliProductTests(unittest.TestCase):
                         "--task",
                         "直接修改代码",
                         "--task-mode",
-                        "full-local",
-                        "--confirm-full-access",
-                        FULL_ACCESS_CONFIRMATION,
+                        "safe-isolated",
                         "--state-db",
                         str(state_path),
                     ]
@@ -557,8 +554,8 @@ class CliProductTests(unittest.TestCase):
 
             payload = json.loads(output.getvalue())
             self.assertEqual(2, exit_code)
-            self.assertEqual("FULL_LOCAL_CHANGE_REQUIRES_GIT", payload["code"])
-            self.assertEqual(["research"], payload["allowed_operations"])
+            self.assertEqual("GIT_REPOSITORY_REQUIRED", payload["code"])
+            self.assertEqual([], payload["allowed_operations"])
             self.assertFalse(state_path.exists())
             settings.assert_not_called()
             checkpoint_store.assert_not_called()

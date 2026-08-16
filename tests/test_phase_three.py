@@ -221,7 +221,7 @@ class ProjectRegistryTests(unittest.TestCase):
         self.assertEqual("READY", payload["task_modes"]["full_local"]["status"])
         self.assertIsNotNone(payload["git"]["baseline_commit"])
 
-    def test_project_doctor_marks_non_git_project_as_full_local_research_only(self) -> None:
+    def test_project_doctor_marks_non_git_project_as_full_local_file_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             project_root = root / "plain-project"
@@ -237,12 +237,12 @@ class ProjectRegistryTests(unittest.TestCase):
         payload = json.loads(output.getvalue())
         self.assertEqual(0, code)
         self.assertEqual("full-local", payload["recommended_task_mode"])
-        self.assertEqual("research", payload["recommended_task_operation"])
+        self.assertEqual("change", payload["recommended_task_operation"])
         self.assertEqual("GIT_REPOSITORY_REQUIRED", payload["task_modes"]["safe_isolated"]["code"])
-        self.assertEqual("FULL_LOCAL_RESEARCH_ONLY", payload["task_modes"]["full_local"]["code"])
-        self.assertEqual(["research"], payload["task_modes"]["full_local"]["allowed_operations"])
+        self.assertEqual("FULL_LOCAL_FILE_SNAPSHOT_READY", payload["task_modes"]["full_local"]["code"])
+        self.assertEqual(["change", "research"], payload["task_modes"]["full_local"]["allowed_operations"])
 
-    def test_project_doctor_requires_commit_before_change_tasks(self) -> None:
+    def test_project_doctor_uses_file_snapshot_when_git_baseline_unavailable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             project_root = root / "empty-git-project"
@@ -259,10 +259,10 @@ class ProjectRegistryTests(unittest.TestCase):
         payload = json.loads(output.getvalue())
         self.assertEqual(0, code)
         self.assertEqual("full-local", payload["recommended_task_mode"])
-        self.assertEqual("research", payload["recommended_task_operation"])
+        self.assertEqual("change", payload["recommended_task_operation"])
         self.assertEqual("GIT_BASELINE_UNAVAILABLE", payload["task_modes"]["safe_isolated"]["code"])
-        self.assertEqual("FULL_LOCAL_RESEARCH_ONLY", payload["task_modes"]["full_local"]["code"])
-        self.assertEqual(["research"], payload["task_modes"]["full_local"]["allowed_operations"])
+        self.assertEqual("FULL_LOCAL_FILE_SNAPSHOT_READY", payload["task_modes"]["full_local"]["code"])
+        self.assertEqual(["change", "research"], payload["task_modes"]["full_local"]["allowed_operations"])
 
 
 class WorkspaceSelectionTests(unittest.TestCase):

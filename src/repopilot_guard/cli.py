@@ -559,8 +559,17 @@ def _run_evaluation(args: argparse.Namespace) -> int:
 
 
 def _run_api(args: argparse.Namespace) -> int:
-    if args.host != "127.0.0.1":
-        return _print_json_result({"status": "BLOCKED", "code": "LOCALHOST_ONLY", "message": "桌面后端只允许监听 127.0.0.1。"}, 2)
+    # 默认只监听回环地址；仅容器化部署可显式放开，且发布端口仍建议只绑定 127.0.0.1。
+    allow_nonlocal = os.environ.get("REPOPILOT_API_ALLOW_NONLOCAL", "").strip().lower() in {"1", "true", "yes", "on"}
+    if args.host != "127.0.0.1" and not allow_nonlocal:
+        return _print_json_result(
+            {
+                "status": "BLOCKED",
+                "code": "LOCALHOST_ONLY",
+                "message": "桌面后端只允许监听 127.0.0.1；容器化部署需显式设置 REPOPILOT_API_ALLOW_NONLOCAL=1。",
+            },
+            2,
+        )
     import uvicorn
     from repopilot_guard.api import create_app
 
@@ -666,21 +675,13 @@ def _welcome_project_summary(project: object) -> dict[str, object]:
     assert isinstance(full_mode, dict)
     recommended_operation = diagnosis.get("recommended_task_operation")
     if recommended_operation not in {operation.value for operation in TaskOperation}:
-        recommended_operation = (
-            TaskOperation.RESEARCH.value
-            if full_mode.get("code") == "FULL_LOCAL_RESEARCH_ONLY"
-            else TaskOperation.CHANGE.value
-        )
+        recommended_operation = TaskOperation.CHANGE.value
     safe_allowed = safe_mode.get("allowed_operations")
     if not isinstance(safe_allowed, list):
         safe_allowed = [operation.value for operation in TaskOperation] if safe_mode.get("status") == "READY" else []
     full_allowed = full_mode.get("allowed_operations")
     if not isinstance(full_allowed, list):
-        full_allowed = (
-            [TaskOperation.RESEARCH.value]
-            if full_mode.get("code") == "FULL_LOCAL_RESEARCH_ONLY"
-            else [operation.value for operation in TaskOperation]
-        )
+        full_allowed = [operation.value for operation in TaskOperation]
     return {
         "project_id": project_payload["project_id"],
         "display_name": project_payload["display_name"],

@@ -80,3 +80,35 @@ class IntentRouterTests(unittest.TestCase):
 
         self.assertEqual(IntentRouteName.CODE_RESEARCH, result.intent)
         self.assertEqual("rule_fallback", result.source)
+
+    def test_interrogative_implementation_question_is_read_only_research(self) -> None:
+        router = IntentRouter(FakeProvider("{}", ready=False))
+
+        result = router.route("这个订单查询功能是如何实现的", has_project=True)
+
+        self.assertEqual(IntentRouteName.CODE_RESEARCH, result.intent)
+        self.assertEqual("rule_fallback", result.source)
+
+    def test_why_question_is_read_only_research_not_code_change(self) -> None:
+        router = IntentRouter(FakeProvider("{}", ready=False))
+
+        result = router.route("这个接口为什么返回空列表", has_project=True)
+
+        self.assertEqual(IntentRouteName.CODE_RESEARCH, result.intent)
+        self.assertEqual("rule_fallback", result.source)
+
+    def test_imperative_implementation_request_is_code_change(self) -> None:
+        router = IntentRouter(FakeProvider("{}", ready=False))
+
+        result = router.route("帮我实现订单导出功能", has_project=True)
+
+        self.assertEqual(IntentRouteName.CODE_CHANGE, result.intent)
+        self.assertEqual("rule_fallback", result.source)
+
+    def test_explicit_fix_request_is_code_change(self) -> None:
+        router = IntentRouter(FakeProvider("{}", ready=False))
+
+        result = router.route("修复订单查询的租户隔离问题", has_project=True)
+
+        self.assertEqual(IntentRouteName.CODE_CHANGE, result.intent)
+        self.assertEqual("rule_fallback", result.source)
