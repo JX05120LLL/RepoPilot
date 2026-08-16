@@ -12,6 +12,13 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      # 必须先于 checkout 设置：避免 CI 检出时把 LF 转成 CRLF，导致 git diff --check 误报 trailing whitespace。
+      - name: Configure git
+        run: |
+          git config --global core.autocrlf false
+          git config --global user.name "RepoPilot CI"
+          git config --global user.email "ci@repopilot.invalid"
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -25,12 +32,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version-file: ".python-version"
-
-      - name: Configure git
-        run: |
-          git config --global user.name "RepoPilot CI"
-          git config --global user.email "ci@repopilot.invalid"
-          git config --global core.autocrlf false
 
       - name: Install dependencies
         run: uv sync --frozen
