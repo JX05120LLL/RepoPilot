@@ -897,3 +897,44 @@ class TaskStoreTests(unittest.TestCase):
                 self.assertIn("TASK_ARCHIVED", [event.event_type for event in store.events_after("thread-expired", 0)])
             finally:
                 store.close()
+
+    def test_outcome_summary_aggregates_terminal_status_and_verdict(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            store = TaskStore(root / "state.sqlite")
+            try:
+                entries = (
+                    ("thread-pass-1", "REPORT", "PASSED"),
+                    ("thread-pass-2", "REPORT", "PASSED"),
+                    ("thread-block", "BLOCKED", "BLOCKED"),
+                )
+                for thread_id, status, verdict in entries:
+                    store.create(
+                        thread_id=thread_id,
+                        task_id=f"task-{thread_id}",
+                        project_id="project-1",
+                        repository=root / "repo",
+                        output_root=root / "runs",
+                        task_mode="safe-isolated",
+                        permission_mode="safe",
+                        workspace_mode="worktree",
+                    )
+                    store.sync_graph_result(
+                        {
+                            "thread_id": thread_id,
+                            "status": status,
+                            "pending_approval": False,
+                            "verdict": verdict,
+                            "state": {"tool_events": []},
+                        }
+                    )
+
+                summary = store.outcome_summary()
+
+                self.assertEqual(3, summary["total"])
+                self.assertEqual(3, summary["terminal"])
+                self.assertEqual(2, summary["passed"])
+                self.assertEqual({"REPORT": 2, "BLOCKED": 1}, summary["by_status"])
+                self.assertEqual({"PASSED": 2, "BLOCKED": 1}, summary["by_verdict"])
+            finally:
+                store.close()

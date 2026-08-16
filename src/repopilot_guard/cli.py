@@ -591,6 +591,7 @@ def _run_api(args: argparse.Namespace) -> int:
             shell_runtime_enabled=settings.full_local_shell_enabled,
             user_skill_roots=settings.user_skill_roots,
             bundled_skill_roots=settings.bundled_skill_roots,
+            max_concurrent_tasks=settings.max_concurrent_tasks,
         )
         uvicorn.run(app, host=args.host, port=args.port)
     finally:

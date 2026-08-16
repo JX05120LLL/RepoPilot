@@ -480,8 +480,15 @@ class OpenAIResearchModel:
         "没有证据时必须写入 assumptions，不能编造文件、测试或修复结果。"
     )
 
-    def __init__(self, provider: OpenAICompatibleProvider | None = None, *, model: Any | None = None) -> None:
+    def __init__(
+        self,
+        provider: OpenAICompatibleProvider | None = None,
+        *,
+        model: Any | None = None,
+        fallback_model: Any | None = None,
+    ) -> None:
         """允许测试注入模型，同时保持生产环境只从 Provider 创建客户端。"""
+
         if model is not None:
             self._model = model
             self._pricing: tuple[float, float, str] | None = None
@@ -490,6 +497,7 @@ class OpenAIResearchModel:
             self._pricing = provider.chat_pricing()
         else:
             raise ValueError("必须提供 OpenAI-compatible Provider 或测试模型")
+        self._fallback_model = fallback_model
 
     @contextmanager
     def cancellation_scope(self, cancellation_requested: Callable[[], bool]):
@@ -499,10 +507,10 @@ class OpenAIResearchModel:
             yield
 
     def analyze(self, messages: list[dict[str, str]], tools: tuple[StructuredTool, ...]) -> ResearchDecision:
-        bound_model = self._model.bind_tools(list(tools))
         request_messages = [{"role": "system", "content": self._system_prompt}, *messages]
-        response = self._invoke_with_retry(
-            lambda: _invoke_model_request(bound_model, request_messages)
+        response = self._invoke_with_fallback(
+            lambda: _invoke_model_request(self._model.bind_tools(list(tools)), request_messages),
+            lambda: _invoke_model_request(self._fallback_model.bind_tools(list(tools)), request_messages),
         )
         calls = tuple(ToolCall(name=item["name"], arguments=dict(item.get("args", {}))) for item in getattr(response, "tool_calls", []))
         return ResearchDecision(content=str(getattr(response, "content", "")), tool_calls=calls, usage=self._usage(response))
@@ -688,10 +696,23 @@ class OpenAIResearchModel:
             ]
         raise ShellCommandContractError("UNKNOWN_CONTRACT_ERROR", repaired_issues, usage)
 
+    def _invoke_with_fallback(self, primary: Callable[[], Any], fallback: Callable[[], Any]) -> Any:
+        """先按主模型有界重试；瞬态故障耗尽后降级到备选模型，均失败才抛出。"""
+
+        try:
+            return self._invoke_with_retry(primary)
+        except (APIConnectionError, APITimeoutError, InternalServerError, RateLimitError):
+            if self._fallback_model is None:
+                raise
+            return self._invoke_with_retry(fallback)
+
     def _invoke_json(self, messages: list[dict[str, str]]) -> Any:
-        """仅重试短暂的传输或服务端错误；本地 JSON 校验错误绝不重试。"""
-        bound_model = self._model.bind(response_format={"type": "json_object"})
-        return self._invoke_with_retry(lambda: _invoke_model_request(bound_model, messages))
+        """仅重试短暂的传输或服务端错误；主模型耗尽后降级备选模型。"""
+
+        return self._invoke_with_fallback(
+            lambda: _invoke_model_request(self._model.bind(response_format={"type": "json_object"}), messages),
+            lambda: _invoke_model_request(self._fallback_model.bind(response_format={"type": "json_object"}), messages),
+        )
 
     def _usage(self, response: Any) -> ModelUsage:
         raw = getattr(response, "usage_metadata", None)
@@ -906,7 +927,7 @@ def create_live_graph(settings: AppSettings, checkpointer: SqliteSaver) -> Any:
                 ProjectMemoryRetriever(bootstrapper.client, embeddings),
                 ManagedDocumentStore(settings.state_db_path),
             )
-            research_model = OpenAIResearchModel(provider)
+            research_model = OpenAIResearchModel(provider, fallback_model=provider.create_fallback_chat_model())
             project_memory_writer = VerifiedProjectMemoryWriter(bootstrapper.client, embeddings)
         except (TypeError, ValueError):
             preflight = PhaseOnePreflightChecker(

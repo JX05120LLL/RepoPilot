@@ -9,7 +9,7 @@ import sqlite3
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from threading import Event, Thread
+from threading import BoundedSemaphore, Event, Thread
 from urllib.parse import urlparse
 from uuid import uuid4
 
@@ -274,11 +274,13 @@ def create_app(
     shell_runtime_enabled: bool = False,
     user_skill_roots: tuple[Path, ...] = (),
     bundled_skill_roots: tuple[Path, ...] = (),
+    max_concurrent_tasks: int = 2,
 ) -> FastAPI:
     """创建 API；调用者负责复用 SQLite graph runner 与项目注册表。"""
 
     app = FastAPI(title="RepoPilot Guard", version=__version__)
     observability.init_observability()
+    app.state.task_slots = BoundedSemaphore(max_concurrent_tasks)
     store = task_store or TaskStore(registry.database_path)
     conversations = ConversationStore(registry.database_path)
     plugins = plugin_registry or PluginRegistry(registry.database_path)
@@ -926,32 +928,39 @@ def create_app(
                 )
 
             def run_in_background() -> None:
-                if not _begin_execution(store, thread_id):
-                    return
-                heartbeat_stop = Event()
-                heartbeat = _start_lease_heartbeat(store, thread_id, heartbeat_stop)
+                slots: BoundedSemaphore = app.state.task_slots
+                if not slots.acquire(blocking=False):
+                    observability.record_task_queued()
+                    slots.acquire()
                 try:
-                    result = runner.run(request, thread_id, grant).to_dict()
-                    stored = store.sync_graph_result(result, execution_finished=True)
-                    if stored.cancellation_requested_at:
-                        store.complete_cancellation(thread_id)
-                        stored = store.get(thread_id)
-                    _append_conversation_task_summary(conversations, stored, result)
-                    observability.record_task_terminal(stored.status)
-                except Exception as error:
-                    # 不把异常细节或环境变量返回给桌面端；图自身的 BLOCKED 事件仍在 checkpoint 中。
-                    try:
-                        if store.get(thread_id).cancellation_requested_at:
-                            store.complete_cancellation(thread_id)
-                        else:
-                            store.mark_runtime_failure(thread_id, f"TASK_RUNTIME_FAILED: {type(error).__name__}")
-                        _append_conversation_task_summary(conversations, store.get(thread_id), {})
-                        observability.record_task_terminal("FAILED")
-                    except ValueError:
+                    if not _begin_execution(store, thread_id):
                         return
+                    heartbeat_stop = Event()
+                    heartbeat = _start_lease_heartbeat(store, thread_id, heartbeat_stop)
+                    try:
+                        result = runner.run(request, thread_id, grant).to_dict()
+                        stored = store.sync_graph_result(result, execution_finished=True)
+                        if stored.cancellation_requested_at:
+                            store.complete_cancellation(thread_id)
+                            stored = store.get(thread_id)
+                        _append_conversation_task_summary(conversations, stored, result)
+                        observability.record_task_terminal(stored.status)
+                    except Exception as error:
+                        # 不把异常细节或环境变量返回给桌面端；图自身的 BLOCKED 事件仍在 checkpoint 中。
+                        try:
+                            if store.get(thread_id).cancellation_requested_at:
+                                store.complete_cancellation(thread_id)
+                            else:
+                                store.mark_runtime_failure(thread_id, f"TASK_RUNTIME_FAILED: {type(error).__name__}")
+                            _append_conversation_task_summary(conversations, store.get(thread_id), {})
+                            observability.record_task_terminal("FAILED")
+                        except ValueError:
+                            return
+                    finally:
+                        heartbeat_stop.set()
+                        heartbeat.join(timeout=1)
                 finally:
-                    heartbeat_stop.set()
-                    heartbeat.join(timeout=1)
+                    slots.release()
 
             observability.record_task_started()
             Thread(target=run_in_background, name=f"repopilot-{request.task_id}", daemon=True).start()

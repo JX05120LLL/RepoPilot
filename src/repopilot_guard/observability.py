@@ -31,6 +31,7 @@ _tracer: Any = None
 _tracer_provider: Any = None
 _metrics_registry: Any = None
 _task_started_counter: Any = None
+_task_queued_counter: Any = None
 _task_terminal_counter: Any = None
 _token_counter: Any = None
 _cost_counter: Any = None
@@ -85,7 +86,7 @@ def init_observability() -> None:
 
     global _initialized, _enabled
     global _tracer, _tracer_provider, _metrics_registry
-    global _task_started_counter, _task_terminal_counter, _token_counter, _cost_counter
+    global _task_started_counter, _task_queued_counter, _task_terminal_counter, _token_counter, _cost_counter
     if _initialized:
         return
     _initialized = True
@@ -113,6 +114,7 @@ def init_observability() -> None:
 
         registry = CollectorRegistry()
         _task_started_counter = Counter("repopilot_tasks_started_total", "已提交任务总数", registry=registry)
+        _task_queued_counter = Counter("repopilot_tasks_queued_total", "因并发上限排队任务总数", registry=registry)
         _task_terminal_counter = Counter(
             "repopilot_tasks_terminal_total", "进入终态的任务总数", ["status"], registry=registry
         )
@@ -189,6 +191,17 @@ def record_task_started() -> None:
         pass
 
 
+def record_task_queued() -> None:
+    """任务因并发上限被排队时计数。"""
+
+    if not _enabled:
+        return
+    try:
+        _task_queued_counter.inc()
+    except Exception:
+        pass
+
+
 def record_task_terminal(status: str) -> None:
     if not _enabled:
         return
@@ -223,7 +236,7 @@ def _reset_for_tests() -> None:
     """仅供测试：重置模块级单例状态，让每个用例可独立初始化。"""
 
     global _initialized, _enabled, _tracer, _tracer_provider, _metrics_registry
-    global _task_started_counter, _task_terminal_counter, _token_counter, _cost_counter
+    global _task_started_counter, _task_queued_counter, _task_terminal_counter, _token_counter, _cost_counter
     if _tracer_provider is not None:
         try:
             _tracer_provider.shutdown()
@@ -235,6 +248,7 @@ def _reset_for_tests() -> None:
     _tracer_provider = None
     _metrics_registry = None
     _task_started_counter = None
+    _task_queued_counter = None
     _task_terminal_counter = None
     _token_counter = None
     _cost_counter = None

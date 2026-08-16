@@ -75,6 +75,30 @@ class OpenAICompatibleProvider(ChatModelProvider, EmbeddingProvider):
             check_embedding_ctx_length=False,
         )
 
+    def create_fallback_chat_model(self) -> ChatOpenAI | None:
+        """主模型不可用时的备选模型；未配置备选时返回 None（不降级）。"""
+
+        if not self.chat_fallback_check().ready:
+            return None
+        return ChatOpenAI(
+            model=self._settings.chat_fallback_model,
+            api_key=self._settings.chat_fallback_api_key.get_secret_value(),
+            base_url=self._settings.chat_fallback_base_url,
+            timeout=120.0,
+            max_retries=1,
+            max_tokens=4096,
+        )
+
+    def chat_fallback_check(self) -> ComponentCheck:
+        missing = self._settings._missing(
+            {
+                "REPOPILOT_CHAT_FALLBACK_BASE_URL": self._settings.chat_fallback_base_url,
+                "REPOPILOT_CHAT_FALLBACK_API_KEY": self._settings.chat_fallback_api_key,
+                "REPOPILOT_CHAT_FALLBACK_MODEL": self._settings.chat_fallback_model,
+            }
+        )
+        return self._settings._component_check("chat_fallback_provider", missing)
+
     def chat_pricing(self) -> tuple[float, float, str] | None:
         """价格只用于本机估算；两个方向未同时配置时不输出伪造费用。"""
 

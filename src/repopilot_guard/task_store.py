@@ -310,6 +310,28 @@ class TaskStore:
             rows = self._connection.execute(f"{query} ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
             return tuple(self._task_from_row(row) for row in rows)
 
+    def outcome_summary(self, *, include_archived: bool = False) -> dict[str, object]:
+        """按状态与结论聚合任务结果，供历史基线与成功率查询；不读取事件正文。"""
+
+        where_clause = "" if include_archived else " WHERE archived_at IS NULL"
+        with self._lock:
+            status_rows = self._connection.execute(
+                f"SELECT status, COUNT(*) AS total FROM tasks{where_clause} GROUP BY status"
+            ).fetchall()
+            verdict_where = where_clause + (" AND " if where_clause else " WHERE ") + "verdict IS NOT NULL"
+            verdict_rows = self._connection.execute(
+                f"SELECT verdict, COUNT(*) AS total FROM tasks{verdict_where} GROUP BY verdict"
+            ).fetchall()
+        by_status = {str(row["status"]): int(row["total"]) for row in status_rows}
+        by_verdict = {str(row["verdict"]): int(row["total"]) for row in verdict_rows}
+        return {
+            "total": sum(by_status.values()),
+            "terminal": sum(count for status, count in by_status.items() if status in _ARCHIVABLE_STATUSES),
+            "passed": by_verdict.get("PASSED", 0),
+            "by_status": by_status,
+            "by_verdict": by_verdict,
+        }
+
     def list_for_conversation(
         self, conversation_id: str, *, limit: int = 500
     ) -> tuple[StoredTask, ...]:
