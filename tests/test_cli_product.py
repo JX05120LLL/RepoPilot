@@ -803,7 +803,8 @@ class CliProductTests(unittest.TestCase):
                 exit_code = main(["desktop", "paths"])
 
             payload = json.loads(output.getvalue())
-            expected = app_data / "com.repopilot.desktop"
+            # 代码侧做了 .resolve() 规范化；CI 的 8.3 短路径需与测试侧一致地解析成长名。
+            expected = (app_data / "com.repopilot.desktop").resolve()
             self.assertEqual(0, exit_code)
             self.assertEqual(str(expected), payload["runtime_dir"])
             self.assertEqual(str(expected / "settings.env"), payload["config_file"])

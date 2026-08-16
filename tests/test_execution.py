@@ -146,7 +146,7 @@ class GradleRecipeTests(unittest.TestCase):
                 PermissionGrant.safe(),
             )
 
-        self.assertEqual("gradle", Path(test_command.argv[0]).name.lower())
+        self.assertEqual("gradle", Path(test_command.argv[0]).stem.lower())
         self.assertEqual(("--no-daemon", "--console=plain", "-q", "test"), test_command.argv[1:])
         self.assertEqual(("test", "--tests", "com.example.OrderServiceTest"), targeted_command.argv[-3:])
 

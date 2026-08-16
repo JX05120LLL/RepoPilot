@@ -86,7 +86,7 @@ class ShellRuntimeTests(unittest.TestCase):
 
         self.assertEqual("READY", result.status)
         self.assertEqual("SHELL_SUCCEEDED", result.code)
-        self.assertIn(str(self.workspace), result.stdout_summary)
+        self.assertIn(str(self.workspace.resolve()), result.stdout_summary)
         self.assertIn("None", result.stdout_summary)
         self.assertNotIn("REPOPILOT_CHAT_API_KEY", result.environment_names)
 
