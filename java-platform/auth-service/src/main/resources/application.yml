@@ -5,9 +5,10 @@ spring:
   application:
     name: auth-service
   datasource:
-    url: jdbc:postgresql://localhost:5432/repopilot
-    username: repopilot
-    password: ${REPOPILOT_DB_PASSWORD:repopilot}
+    # 本机 PostgreSQL 容器；连接参数经环境变量覆盖。
+    url: ${REPOPILOT_DB_URL:jdbc:postgresql://localhost:5432/repopilot}
+    username: ${REPOPILOT_DB_USERNAME:postgres}
+    password: ${REPOPILOT_DB_PASSWORD:postgres}
   jpa:
     hibernate:
       ddl-auto: update
@@ -22,6 +23,9 @@ repopilot:
     jwt-secret: ${REPOPILOT_JWT_SECRET:change-me-please-32-bytes-minimum-secret-key}
     access-ttl-seconds: 900
     refresh-ttl-seconds: 604800
+  platform:
+    # Python 引擎回写任务结果时使用的服务间凭证。
+    service-token: ${REPOPILOT_SERVICE_TOKEN:local-service-token}
 
 management:
   endpoints:

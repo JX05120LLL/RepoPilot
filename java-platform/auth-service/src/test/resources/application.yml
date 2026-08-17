@@ -12,3 +12,5 @@ spring:
 repopilot:
   auth:
     jwt-secret: test-secret-key-for-hmac-sha256-32-bytes-minimum
+  platform:
+    service-token: test-service-token
