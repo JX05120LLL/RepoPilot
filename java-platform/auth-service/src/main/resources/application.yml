@@ -5,11 +5,10 @@ spring:
   application:
     name: auth-service
   datasource:
-    # 本机 repopilot-postgres 容器（宿主端口 5433）；连接参数经环境变量覆盖。
-    # 密码属本地机密，通过 REPOPILOT_DB_PASSWORD 注入，切勿提交到仓库。
-    url: ${REPOPILOT_DB_URL:jdbc:postgresql://localhost:5433/repopilot}
-    username: ${REPOPILOT_DB_USERNAME:repopilot}
-    password: ${REPOPILOT_DB_PASSWORD:postgres}
+    # 本机 repopilot-postgres 容器（宿主端口 5433）。
+    url: jdbc:postgresql://localhost:5433/repopilot
+    username: root
+    password: 123456
   jpa:
     hibernate:
       ddl-auto: update

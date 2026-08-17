@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "test:permissions": "tsc --target ES2022 --module NodeNext --moduleResolution NodeNext --outDir node_modules/.cache/repopilot-tests src/lib/permissionWorkflow.ts && node --test tests/permissionWorkflow.test.mjs",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "sidecar:build": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ..\\scripts\\build-desktop-backend-sidecar.ps1",

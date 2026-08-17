@@ -10,6 +10,7 @@ import { ReviewDecisionSummary } from "./components/ReviewDecisionSummary";
 import { TaskDiagnosticPanel } from "./components/TaskDiagnosticPanel";
 import { AccountAccess } from "./components/AccountAccess";
 import { API } from "./lib/api";
+import { resolveComposerMode } from "./lib/permissionWorkflow";
 import {
   clearPlatformSession,
   fetchPlatformProfile,
@@ -2497,11 +2498,11 @@ export function App() {
   }
 
   function sendComposerMessage() {
-    if (composerMode === "auto") {
+    if (composerMode === "auto" && effectiveComposerMode === "chat") {
       void routeAndDispatch();
       return;
     }
-    const resolvedComposerMode = composerMode;
+    const resolvedComposerMode = effectiveComposerMode;
     if (resolvedComposerMode === "chat") {
       void sendChat();
       return;
@@ -2852,6 +2853,12 @@ export function App() {
     setTaskAttachments([]);
     setTelemetry(null);
     setProjectId(selected.project_id ?? "");
+    // 权限是任务级授权，切换到普通会话时不得继承历史任务的完全访问状态。
+    setMode("safe-isolated");
+    setConfirmed(false);
+    setApprovedMcpTools([]);
+    setApprovedCapabilities([]);
+    setMcpResult(null);
     setOperation(selected.mode === "plan" ? "research" : "change");
     setComposerMode("chat");
     setDescription("");
@@ -3178,8 +3185,9 @@ export function App() {
   useEffect(() => {
     setSelectedPatchPaths(executionApproval ? approvalPatchPaths : []);
   }, [patchSelectionKey, executionApproval]);
-  // 智能模式必须等待后端 Router 返回，不能由前端关键词提前决定权限或流程。
-  const effectiveComposerMode = composerMode === "auto" ? "chat" : composerMode;
+  // 智能模式通常必须等待后端 Router 返回；但用户已明确选择完全访问时，
+  // 不能再把带项目的提问错误地降级为不会读取仓库的普通聊天。
+  const effectiveComposerMode = resolveComposerMode(composerMode, mode, Boolean(projectId));
   const effectiveOperation: Operation | null = effectiveComposerMode === "chat" ? null : effectiveComposerMode;
   const effectiveOperationAllowed = effectiveOperation ? allowedOperations.includes(effectiveOperation) : true;
   const canStart =
@@ -4193,14 +4201,14 @@ export function App() {
                           sendComposerMessage();
                         }
                       }}
-                      placeholder={composerMode === "auto"
+                      placeholder={composerMode === "auto" && effectiveComposerMode === "chat"
                         ? "描述你想了解、分析或修改的内容，RepoPilot 会选择合适的流程"
-                        : composerMode === "chat"
+                        : effectiveComposerMode === "chat"
                         ? "向 RepoPilot 提问"
-                        : composerMode === "research"
+                        : effectiveComposerMode === "research"
                           ? "描述要理解、定位或评估的代码问题"
                           : "描述最终想实现的代码目标"}
-                      aria-label={composerMode === "chat" ? "对话消息" : "代码任务描述"}
+                      aria-label={effectiveComposerMode === "chat" ? "对话消息" : "代码任务描述"}
                     />
                     <div className="composer-toolbar">
                       <div className="composer-tools">
@@ -4231,7 +4239,7 @@ export function App() {
                               type="button"
                               onClick={() => selectPermission("full-local")}
                               aria-pressed={mode === "full-local"}
-                              title="完全本机访问，Agent 可直接执行已授权操作"
+                              title="完全本机访问：带项目的提问将作为代码研究读取当前仓库"
                             >
                               <WarningCircle size={15} />
                               <span>完全访问</span>
@@ -4245,16 +4253,18 @@ export function App() {
                     </div>
                   </div>
                     <p className="composer-caption">
-                      {composerMode === "auto"
+                      {composerMode === "auto" && effectiveComposerMode === "chat"
                         ? effectiveComposerMode === "chat"
                           ? "智能模式将作为普通项目问答处理；可附加研发文档，不会创建任务或执行命令。"
                           : effectiveComposerMode === "research"
                             ? "智能模式识别为代码分析：将读取受控项目上下文，不会写入文件或运行构建。"
                             : "智能模式识别为代码修改：将先研究并展示计划、补丁和验证建议，写入前仍需审批。"
-                        : composerMode === "chat"
+                        : effectiveComposerMode === "chat"
                         ? projectId
                           ? "可附加研发文档进行对话；不会读取仓库、创建任务或执行命令。"
                           : "普通对话不会读取仓库、创建任务或执行命令。选择项目后可附加研发文档。"
+                        : effectiveComposerMode === "research" && mode === "full-local"
+                          ? "完全访问将创建只读代码研究任务，直接检索当前项目代码；本次不会修改文件或执行命令。"
                         : currentProject
                           ? projectStatusLabel
                           : "代码任务需要先选择项目。"}
