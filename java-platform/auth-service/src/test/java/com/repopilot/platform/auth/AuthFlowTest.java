@@ -72,4 +72,16 @@ class AuthFlowTest {
                 .andExpect(status().isUnauthorized())
                 .andExpect(jsonPath("$.code").value("BAD_CREDENTIALS"));
     }
+
+    @Test
+    void registerRejectsInvalidRole() throws Exception {
+        String register = """
+                {"username":"carol","email":"carol@example.com","password":"secret123","tenantId":"tenant-c","role":"SUPERUSER"}
+                """;
+        mockMvc.perform(post("/api/auth/register")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(register))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("INVALID_ROLE"));
+    }
 }

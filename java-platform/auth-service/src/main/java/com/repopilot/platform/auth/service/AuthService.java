@@ -5,6 +5,7 @@ import com.repopilot.platform.auth.dto.RegisterRequest;
 import com.repopilot.platform.auth.dto.TokenResponse;
 import com.repopilot.platform.auth.security.JwtService;
 import com.repopilot.platform.auth.user.User;
+import com.repopilot.platform.auth.user.Role;
 import com.repopilot.platform.auth.user.UserRepository;
 import com.repopilot.platform.common.exception.ApiException;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -26,6 +27,7 @@ public class AuthService {
 
     @Transactional
     public TokenResponse register(RegisterRequest request) {
+        Role role = Role.fromCode(request.role());
         if (userRepository.existsByUsername(request.username())) {
             throw ApiException.conflict("USERNAME_TAKEN", "用户名已被占用。");
         }
@@ -36,7 +38,7 @@ public class AuthService {
                 request.username(),
                 request.email(),
                 passwordEncoder.encode(request.password()),
-                request.role(),
+                role.name(),
                 request.tenantId()
         );
         userRepository.save(user);
