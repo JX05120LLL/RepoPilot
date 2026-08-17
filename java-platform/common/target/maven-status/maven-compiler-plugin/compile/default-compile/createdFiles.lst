@@ -1,4 +1,0 @@
-com\repopilot\platform\common\exception\ApiException.class
-com\repopilot\platform\common\entity\BaseEntity.class
-com\repopilot\platform\common\tenant\TenantContext.class
-com\repopilot\platform\common\entity\BaseEntity$TenantContextHolder.class
