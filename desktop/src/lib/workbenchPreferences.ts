@@ -1,4 +1,4 @@
-export type RestorableView = "task" | "context" | "settings" | "review";
+export type RestorableView = "task" | "context" | "settings" | "review" | "account";
 
 export type WorkbenchPreferences = {
   projectId?: string;
@@ -27,7 +27,7 @@ export function loadWorkbenchPreferences(): WorkbenchPreferences {
       projectId: readId(value.projectId),
       threadId: readId(value.threadId),
       activeView:
-        activeView === "task" || activeView === "context" || activeView === "settings" || activeView === "review"
+        activeView === "task" || activeView === "context" || activeView === "settings" || activeView === "review" || activeView === "account"
           ? activeView
           : undefined,
       showTaskInspector:

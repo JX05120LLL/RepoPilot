@@ -8,7 +8,15 @@ import { TaskTerminalDock, type TerminalCommand, type TerminalResult } from "./c
 import { TaskProgressTrail } from "./components/TaskProgressTrail";
 import { ReviewDecisionSummary } from "./components/ReviewDecisionSummary";
 import { TaskDiagnosticPanel } from "./components/TaskDiagnosticPanel";
+import { AccountAccess } from "./components/AccountAccess";
 import { API } from "./lib/api";
+import {
+  clearPlatformSession,
+  fetchPlatformProfile,
+  loadPlatformSession,
+  savePlatformSession,
+  type PlatformSession,
+} from "./lib/platformAuth";
 import { asRecord, readString, readStringList } from "./lib/values";
 import {
   loadWorkbenchPreferences,
@@ -41,6 +49,7 @@ import {
   Stack,
   Target,
   TerminalWindow,
+  UserCircle,
   WarningCircle,
   XCircle,
 } from "@phosphor-icons/react";
@@ -73,7 +82,7 @@ type Mode = "safe-isolated" | "full-local";
 type Operation = "change" | "research";
 type ConversationMode = "goal" | "plan";
 type ComposerMode = "auto" | "chat" | "research" | "change";
-type WorkspaceView = "task" | "context" | "settings" | "review";
+type WorkspaceView = "task" | "context" | "settings" | "review" | "account";
 type EvidenceScope = "key" | "all";
 type EventStreamState = "idle" | "connecting" | "connected" | "reconnecting" | "offline" | "closed";
 type Project = {
@@ -759,6 +768,9 @@ export function App() {
   const [projectId, setProjectId] = useState(
     () => savedWorkbenchPreferences.projectId ?? "",
   );
+  const [platformSession, setPlatformSession] = useState<PlatformSession | null>(
+    loadPlatformSession,
+  );
   const [description, setDescription] = useState("");
   const [mode, setMode] = useState<Mode>("safe-isolated");
   const [operation, setOperation] = useState<Operation>("change");
@@ -892,6 +904,17 @@ export function App() {
   function activateConversation(next: Conversation | null) {
     selectedConversationIdRef.current = next?.conversation_id ?? null;
     setConversation(next);
+  }
+
+  function handlePlatformAuthenticated(nextSession: PlatformSession) {
+    savePlatformSession(nextSession);
+    setPlatformSession(nextSession);
+    setActiveView("account");
+  }
+
+  function handlePlatformSignOut() {
+    clearPlatformSession();
+    setPlatformSession(null);
   }
 
   async function loadProjects() {
@@ -1391,6 +1414,33 @@ export function App() {
     const timer = window.setInterval(() => void checkApiHealth(), 5_000);
     return () => window.clearInterval(timer);
   }, []);
+
+  useEffect(() => {
+    if (!platformSession) return;
+    let active = true;
+    void fetchPlatformProfile(platformSession.accessToken)
+      .then((profile) => {
+        if (!active) return;
+        const role = profile.authorities.find((authority) => authority.startsWith("ROLE_"))?.slice(5)
+          ?? platformSession.role;
+        const verifiedSession = {
+          ...platformSession,
+          username: profile.username,
+          tenantId: profile.tenantId,
+          role,
+        };
+        savePlatformSession(verifiedSession);
+        setPlatformSession(verifiedSession);
+      })
+      .catch(() => {
+        if (!active) return;
+        clearPlatformSession();
+        setPlatformSession(null);
+      });
+    return () => {
+      active = false;
+    };
+  }, [platformSession?.accessToken]);
 
   useEffect(() => {
     setAttachedDocumentIds([]);
@@ -3438,6 +3488,10 @@ export function App() {
         </section>
 
         <div className="navigation-footer">
+          <button className={activeView === "account" ? "navigation-settings active" : "navigation-settings"} type="button" onClick={() => setActiveView("account")}>
+            <UserCircle size={16} />
+            <span>{platformSession ? platformSession.username : "登录或注册"}</span>
+          </button>
           <button className={activeView === "settings" ? "navigation-settings active" : "navigation-settings"} type="button" onClick={openRuntimeConfiguration}>
             <SlidersHorizontal size={16} />
             <span>设置</span>
@@ -4894,6 +4948,14 @@ export function App() {
               </section>
             )}
           </section>
+        )}
+
+        {activeView === "account" && (
+          <AccountAccess
+            session={platformSession}
+            onAuthenticated={handlePlatformAuthenticated}
+            onSignOut={handlePlatformSignOut}
+          />
         )}
 
         {activeView === "review" && (
