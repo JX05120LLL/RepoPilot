@@ -1,0 +1,30 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: auth-service
+  datasource:
+    url: jdbc:postgresql://localhost:5432/repopilot
+    username: repopilot
+    password: ${REPOPILOT_DB_PASSWORD:repopilot}
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: false
+
+repopilot:
+  auth:
+    # 生产环境必须用环境变量注入，禁止提交真实密钥。
+    jwt-secret: ${REPOPILOT_JWT_SECRET:change-me-please-32-bytes-minimum-secret-key}
+    access-ttl-seconds: 900
+    refresh-ttl-seconds: 604800
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health

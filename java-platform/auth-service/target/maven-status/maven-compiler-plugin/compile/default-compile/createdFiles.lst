@@ -1,0 +1,13 @@
+com\repopilot\platform\auth\AuthApplication.class
+com\repopilot\platform\auth\dto\RegisterRequest.class
+com\repopilot\platform\auth\controller\AuthController.class
+com\repopilot\platform\auth\controller\MeController.class
+com\repopilot\platform\auth\dto\LoginRequest.class
+com\repopilot\platform\auth\security\JwtAuthenticationFilter.class
+com\repopilot\platform\auth\controller\GlobalExceptionHandler.class
+com\repopilot\platform\auth\service\AuthService.class
+com\repopilot\platform\auth\security\SecurityConfig.class
+com\repopilot\platform\auth\user\User.class
+com\repopilot\platform\auth\user\UserRepository.class
+com\repopilot\platform\auth\dto\TokenResponse.class
+com\repopilot\platform\auth\security\JwtService.class
