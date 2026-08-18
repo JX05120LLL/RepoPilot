@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 from threading import Condition, Thread
-from typing import Callable, Protocol, Sequence
+from typing import Callable, Protocol
 
 
 class AgentStatus(StrEnum):
@@ -75,6 +75,16 @@ class Inbox:
             claimed = tuple(queue)
             queue.clear()
             return claimed
+
+    def drain(self, target: InboxTarget, predicate: Callable[[AgentMessage], bool]) -> tuple[AgentMessage, ...]:
+        """按谓词选择性取出消息；不满足的消息留在原队列。"""
+        with self._lock:
+            queue = self._next_turn if target is InboxTarget.NEXT_TURN else self._next_step
+            picked = tuple(message for message in queue if predicate(message))
+            remaining = [message for message in queue if not predicate(message)]
+            queue.clear()
+            queue.extend(remaining)
+            return picked
 
     def clear(self) -> None:
         with self._lock:
