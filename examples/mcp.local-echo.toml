@@ -1,0 +1,16 @@
+version = 1
+
+# 本地开发冒烟服务。必须使用 full 权限并显式提供 workspace-root，
+# 因为 STDIO Transport 会启动一个受控子进程。
+[[servers]]
+name = "local-echo"
+transport = "stdio"
+scope = "project"
+access = "read_only"
+enabled = true
+command = "python"
+args = ["tests/fixtures/mcp_echo_server.py"]
+allowed_tools = ["echo"]
+startup_timeout_seconds = 10
+tool_timeout_seconds = 5
+max_result_chars = 4000

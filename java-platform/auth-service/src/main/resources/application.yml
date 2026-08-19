@@ -1,0 +1,34 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: auth-service
+  datasource:
+    # 本机 repopilot-postgres 容器（宿主端口 5433）。
+    url: jdbc:postgresql://localhost:5433/repopilot
+    username: root
+    password: 123456
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: false
+
+repopilot:
+  auth:
+    # 生产环境必须用环境变量注入，禁止提交真实密钥。
+    jwt-secret: ${REPOPILOT_JWT_SECRET:change-me-please-32-bytes-minimum-secret-key}
+    access-ttl-seconds: 900
+    refresh-ttl-seconds: 604800
+  platform:
+    # Python 引擎回写任务结果时使用的服务间凭证。
+    service-token: ${REPOPILOT_SERVICE_TOKEN:local-service-token}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health

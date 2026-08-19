@@ -1,0 +1,15 @@
+version = 1
+
+# 示例只用于配置校验，不会由 `mcp validate` 建立连接。
+[[servers]]
+name = "engineering-docs"
+transport = "streamable_http"
+url = "https://mcp.example.com/v1"
+scope = "project"
+access = "read_only"
+enabled = true
+bearer_token_env = "ENGINEERING_DOCS_MCP_TOKEN"
+allowed_tools = ["search", "read_document"]
+startup_timeout_seconds = 10
+tool_timeout_seconds = 30
+max_result_chars = 20000

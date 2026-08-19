@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    # 项目面向 Windows 10/11 本地桌面交付，CI 使用 Windows 运行器保持与开发环境一致。
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      # 必须先于 checkout 设置：避免 CI 检出时把 LF 转成 CRLF，导致 git diff --check 误报 trailing whitespace。
+      - name: Configure git
+        run: |
+          git config --global core.autocrlf false
+          git config --global user.name "RepoPilot CI"
+          git config --global user.email "ci@repopilot.invalid"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.3"
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: ".python-version"
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run unit tests
+        run: uv run python -m unittest discover -s tests -t . -v
+
+      - name: Check for whitespace errors
+        run: git diff --check

@@ -1,0 +1,31 @@
+{
+  "name": "repopilot-desktop",
+  "private": true,
+  "version": "0.2.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "test:permissions": "tsc --target ES2022 --module NodeNext --moduleResolution NodeNext --outDir node_modules/.cache/repopilot-tests src/lib/permissionWorkflow.ts && node --test tests/permissionWorkflow.test.mjs",
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "sidecar:build": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File ..\\scripts\\build-desktop-backend-sidecar.ps1",
+    "tauri:build": "npm run sidecar:build && tauri build"
+  },
+  "dependencies": {
+    "@phosphor-icons/react": "^2.1.10",
+    "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-dialog": "^2.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-markdown": "^10.1.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.0.0",
+    "typescript": "^5.0.0",
+    "vite": "^6.0.0"
+  }
+}

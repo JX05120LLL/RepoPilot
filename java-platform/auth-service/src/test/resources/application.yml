@@ -1,0 +1,16 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:repopilot;DB_CLOSE_DELAY=-1;MODE=PostgreSQL
+    username: sa
+    password: ""
+    driver-class-name: org.h2.Driver
+  jpa:
+    hibernate:
+      ddl-auto: create-drop
+    open-in-view: false
+
+repopilot:
+  auth:
+    jwt-secret: test-secret-key-for-hmac-sha256-32-bytes-minimum
+  platform:
+    service-token: test-service-token

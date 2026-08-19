@@ -1,0 +1,38 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.repopilot/
+.ai/
+.pytest_cache/
+.mypy_cache/
+dist/
+build/
+.build-artifacts/
+desktop/src-tauri/binaries/*.exe
+*.egg-info/
+.repopilot-runs/
+.repopilot-evaluation/
+.playwright-cli/
+output/
+docs/
+desktop/node_modules/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+*.tsbuildinfo
+*.sqlite
+
+# IDE / 编辑器配置
+.idea/
+.vscode/
+*.swp
+
+# WorkBuddy 工作记忆（本地）
+.workbuddy/
+
+# 临时文件
+tmp/
+
+# 评测任务输出（运行时产物，不进 git）
+task-*/
+
