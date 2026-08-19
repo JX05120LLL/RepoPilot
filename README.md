@@ -1,16 +1,16 @@
 # RepoPilot
 
-> Local-first、可审计、可验证的 Coding Agent。
+> Local-first、可审计、可验证的 Coding Agent —— 参考 DeepSeek Harness 工程思想重构。
 
-当前桌面版 `v0.2.1` 已将对话体验分为普通问答、只读代码研究和受控代码修改：要求详细项目分析、流程、调用链或“结合代码”时会自动进入只读研究，并在会话中输出带文件证据的结论；只有修改任务才进入审批、补丁与验证流程。
+当前桌面版 `v0.3.0` 已实现常驻管家模式与编排外壳接线：每个会话一位常驻 Agent Handle，同会话连续提问走 `handle.followup` 追问路径，复用会话上下文不冷启动；编排职责（槽位/租约/心跳/持久化/取消/失败标记/指标）从临时闭包收进正式组件 `OrchestratedGraphRunner`。
 
 RepoPilot 面向已有代码仓库的真实维护工作：选择本地项目，描述 Bug、需求或研发问题，Agent 在明确的工作区、权限和预算边界内完成代码理解、方案制定、补丁修改、构建验证与交付审阅。
 
-它参考 Codex 和 grok-build 的项目工作区、工具调用和任务流设计思路，但并非基于任何现有 Coding Agent 源码二次开发。RepoPilot 从零实现，重点关注 Java/Spring Boot 仓库维护场景中的安全边界、证据闭环、RAG、Skills、MCP 和本地桌面体验。
+它参考 DeepSeek Harness、Codex 和 Grok Build 的项目工作区、工具调用和任务流设计思路，但并非基于任何现有 Coding Agent 源码二次开发。RepoPilot 从零实现，重点关注 Java/Spring Boot 仓库维护场景中的安全边界、证据闭环、RAG、Skills、MCP 和本地桌面体验。
 
 ## 为什么使用 RepoPilot
 
-普通 AI 编程对话往往只给出“看起来合理”的代码。RepoPilot 将一次代码任务做成可复查的工程流程：
+普通 AI 编程对话往往只给出"看起来合理"的代码。RepoPilot 将一次代码任务做成可复查的工程流程：
 
 ```text
 选择项目
@@ -25,6 +25,36 @@ RepoPilot 面向已有代码仓库的真实维护工作：选择本地项目，�
 ```
 
 `PASSED` 不来自模型的自我判断，而必须同时具备真实 Diff 和真实验证证据。无法验证时，任务会如实标记为 `UNVERIFIED`、`FAILED` 或 `BLOCKED`。
+
+## v0.3.0 新特性
+
+### 常驻管家模式（接线片 ③b-2）
+
+每个会话现在有一位常驻"管家"（Agent Handle），会话活着管家就在——同会话连续提问不再从头研究，管家带着上轮结论直接处理后续问题。
+
+**启用方式**：设置环境变量 `REPOPILOT_AGENT_HANDLE_MODE=1` 后启动后端。默认关闭（走原路径，可回滚）。
+
+**新增端点**：
+- `POST /api/conversations/{id}/followup` — 追问，走常驻管家 handle.followup 路径
+- `GET /api/conversations/{id}/handle-status` — 查询管家状态（IDLE/RUNNING/AWAITING_APPROVAL）
+
+**前端改动**：同会话有终态任务 + change 操作时，自动走追问路径（先 try followup，失败回退原路径）。
+
+### 编排外壳接线（接线片 ①②③a+③b-1，DR-027）
+
+把 api.py 临时闭包里的 6 项编排职责（槽位/租约心跳/持久化/取消完成/失败标记/指标）收进正式组件：
+
+- **OrchestratedGraphRunner** — 编排外壳，实现 BridgeRunner 协议
+- **ConversationStoreBridge** — 会话桥接生产实现
+- **HandleRegistry** — 会话级常驻管家注册表（线程安全、惰性创建、同会话复用）
+
+### DeepSeek Harness 思想对标
+
+参考 DeepSeek Harness 源码精读，落地以下机制：
+- 工具流水线双层管线（策略可换 + 底线锁死）— DR-021
+- AgentHandle 契约 + Inbox 三语义（followup/steer/inject）— DR-023/024
+- 编排职责转正 — DR-027
+- 常驻管家模式 — v0.3.0
 
 ## 核心能力
 
@@ -41,7 +71,7 @@ RepoPilot 面向已有代码仓库的真实维护工作：选择本地项目，�
 
 - LangGraph 可恢复任务图，SQLite checkpoint 按 `thread_id` 保存审批点和执行状态；
 - 代码研究、计划审批、补丁预览、执行审批、验证、审阅和报告形成固定流程；
-- 结构化补丁使用“目标文件 + 预期旧文本 + 新文本”，所有修改先校验、后原子写入；
+- 结构化补丁使用"目标文件 + 预期旧文本 + 新文本"，所有修改先校验、后原子写入；
 - Java/Maven、Java/Gradle、Python/pytest、Node.js/npm/pnpm 使用固定 Recipe 执行验证；
 - 首次登记项目会生成受限静态扫描的 Agent 能力档案；用户确认业务规则和额外禁改路径后，它们会以哈希快照进入每次任务上下文；
 - 真实 Git Diff、测试摘要、Evidence 事件和任务产物可在桌面端、CLI 或 API 中审阅；
@@ -85,6 +115,17 @@ RepoPilot 面向已有代码仓库的真实维护工作：选择本地项目，�
 
 这不是无提示的后台执行。每条命令都使用结构化 `argv` 保存，先生成脱敏预览、工作目录、超时、风险标签和冻结哈希；Shell 解释器、网络、Git 提交/推送等操作需要独立风险审批，随后仍需通过执行审批。命令输出会脱敏并截断，任务支持取消、超时和子进程树清理。
 
+### Java Spring Boot 平台（阶段三）
+
+多用户控制面，承载认证、RBAC、多租户与任务编排：
+
+- Spring Boot 3.2 + Spring Security 6 + jjwt 0.12；
+- JWT（Access 900s / Refresh 7d）+ BCrypt + RBAC 三角色（ADMIN/DEVELOPER/VIEWER）；
+- 行级 `tenant_id` 显式过滤多租户隔离；
+- PostgreSQL（本机容器 `repopilot-postgres:5433`）；
+- Java↔Python 集成：`Task` 实体 + `/api/tasks` 创建/列表 + `/api/tasks/{id}/result` 结果回写（`X-Service-Token` 服务间鉴权）+ Python 客户端 `platform_client.py`；
+- `spring-boot-starter-actuator` 健康检查（`/actuator/health` 返回 UP）。
+
 ## 架构
 
 ```mermaid
@@ -103,6 +144,10 @@ flowchart TB
     CONTEXT --> SQLITE["SQLite\nFTS5 / Registry / Checkpoint"]
     EXEC --> WORKSPACE["Local / Git Worktree"]
     TRUST --> EVIDENCE["JSONL Evidence / Task Artifacts"]
+
+    API --> HANDLE["HandleRegistry\n常驻管家（v0.3.0）"]
+    HANDLE --> ORCH["OrchestratedGraphRunner\n编排外壳（v0.3.0）"]
+    ORCH --> GRAPH
 ```
 
 | 层 | 职责 |
@@ -110,11 +155,14 @@ flowchart TB
 | Tauri / React / CLI | 项目选择、对话、审批、实时事件、Diff 和报告展示。 |
 | FastAPI / SSE | 仅监听本机回环地址，提供本地 API 与事件流。 |
 | LangGraph | 编排可暂停、可恢复、不可越权的 Coding Workflow。 |
+| HandleRegistry | 会话级常驻管家注册表——同会话复用 handle，追问走 followup（v0.3.0）。 |
+| OrchestratedGraphRunner | 编排外壳——槽位/租约/心跳/持久化/取消/失败/指标（v0.3.0）。 |
 | Context Broker | 统一装配 RAG、项目规则、Skills、会话摘要和上下文预算。 |
 | Capability Plane | 管理内置工具、Skills、MCP 和插件能力的来源、风险和授权。 |
-| PolicyGuard / ToolRuntime | 在模型外执行路径、敏感文件、参数、权限和超时校验。 |
+| PolicyGuard / ToolRuntime | 在模型外执行路径、敏感文件、参数、权限和超时校验；双层管线（策略可换 + 底线锁死）。 |
 | Workspace Runtime | 管理 Git 基线、Worktree、Diff、补丁、构建和 Shell 进程。 |
-| Qdrant / SQLite / JSONL | 分别承担语义检索、状态持久化和审计证据。 |
+| Java Platform | 多用户认证/RBAC/多租户/任务编排与回写（阶段三）。 |
+| Qdrant / SQLite / JSONL / PostgreSQL | 分别承担语义检索、本地状态持久化、审计证据和平台关系数据。 |
 
 ## 技术栈
 
@@ -123,7 +171,8 @@ flowchart TB
 - Qdrant、SQLite、FTS5；
 - Git Worktree、Maven、Gradle、pytest、npm/pnpm Recipe；
 - MCP、Ed25519、JSON Schema、JSONL Evidence；
-- React、TypeScript、Vite、Tauri 2、Rust。
+- React、TypeScript、Vite、Tauri 2、Rust；
+- Java 17、Spring Boot 3.2、Spring Security 6、jjwt、PostgreSQL（平台控制面）。
 
 ## 快速开始
 
@@ -141,8 +190,8 @@ flowchart TB
 ### 1. 安装依赖
 
 ```powershell
-git clone git@github.com:JX05120LLL/RepoPilot.git
-cd RepoPilot
+git clone https://github.com/JX05120LLL/RepoPilot-Harness.git
+cd RepoPilot-Harness
 uv sync
 Copy-Item .env.example .env
 ```
@@ -181,7 +230,17 @@ uv run repopilot-guard desktop preview
 
 浏览器会打开本机预览。Tauri 桌面端会自动启动同一套本地 FastAPI sidecar，不需要单独部署后端。
 
-### 4. 使用 CLI
+### 4. 启用常驻管家模式（v0.3.0 新增）
+
+在 `.env` 或启动前设置环境变量：
+
+```dotenv
+REPOPILOT_AGENT_HANDLE_MODE=1
+```
+
+启用后，同会话的 change 操作连续提问会走 `handle.followup` 追问路径，复用会话上下文。默认关闭（走原路径，与 v0.2.1 行为一致）。
+
+### 5. 使用 CLI
 
 ```powershell
 # 注册并诊断项目
@@ -205,7 +264,7 @@ uv run repopilot-guard task --help
 uv run repopilot-guard desktop --help
 ```
 
-### 5. 启用完全本机 Shell
+### 6. 启用完全本机 Shell
 
 在 `.env` 或桌面端设置中启用：
 
@@ -213,7 +272,7 @@ uv run repopilot-guard desktop --help
 REPOPILOT_FULL_LOCAL_SHELL_ENABLED=true
 ```
 
-重启本地服务后，创建“完全本机控制”任务，完成确认并勾选 `shell` 能力。Shell、网络、Git 提交和推送始终以单条命令预览和独立高风险审批为准。
+重启本地服务后，创建"完全本机控制"任务，完成确认并勾选 `shell` 能力。Shell、网络、Git 提交和推送始终以单条命令预览和独立高风险审批为准。
 
 ## 桌面端
 
@@ -222,6 +281,7 @@ REPOPILOT_FULL_LOCAL_SHELL_ENABLED=true
 - 本地文件夹选择与自动项目注册；
 - 对话、分析代码、修改代码共享会话上下文；
 - 智能模式使用 DeepSeek 结构化意图路由，并以本地规则兜底；低置信度路由必须由用户确认；
+- 常驻管家模式：同会话连续 change 追问走 followup 路径（v0.3.0，需 `REPOPILOT_AGENT_HANDLE_MODE=1`）；
 - Markdown/TXT/PDF/DOCX 研发文档导入与任务附件；
 - 安全隔离修复、完全本机控制两种模式；
 - 流式回答、可折叠工具时间线、来源卡片、计划与双重审批；
@@ -232,13 +292,13 @@ REPOPILOT_FULL_LOCAL_SHELL_ENABLED=true
 
 ```powershell
 cd desktop
-& "D:\Node-JS\node.exe" ".\node_modules\@tauri-apps\cli\tauri.js" build
+npm run tauri:build
 ```
 
 生成的安装包位于：
 
 ```text
-desktop/src-tauri/target/release/bundle/nsis/
+desktop/src-tauri/target/release/bundle/nsis/RepoPilot_0.3.0_x64-setup.exe
 ```
 
 ## 评测与质量
@@ -246,19 +306,26 @@ desktop/src-tauri/target/release/bundle/nsis/
 仓库包含可重放的维护任务与安全断言，覆盖 Java/Maven 修复、参数校验、权限隔离、测试补充、敏感路径、路径逃逸、审批拒绝、Maven 失败和恢复任务等场景。
 
 ```powershell
-# Python 自动化测试
+# Python 自动化测试（482 个）
 uv run python -m unittest discover -s tests -t . -v
+
+# feature flag 开时验证常驻管家模式
+REPOPILOT_AGENT_HANDLE_MODE=1 uv run python -m unittest tests.test_api -v
+
+# Java 平台集成测试
+cd java-platform && mvn -B test
 
 # 评测 fixture 校验与执行
 uv run repopilot-guard evaluate --help
 ```
 
-当前自动化测试覆盖控制面、RAG、文档解析、项目能力档案、工作区隔离、补丁原子性、Maven/Gradle/pytest/Node Recipe、MCP/插件、Shell/Git 审批、子 Agent 并行取证、API/SSE 和桌面端配置边界。
+当前自动化测试覆盖控制面、RAG、文档解析、项目能力档案、工作区隔离、补丁原子性、Maven/Gradle/pytest/Node Recipe、MCP/插件、Shell/Git 审批、子 Agent 并行取证、API/SSE、编排外壳和常驻管家模式。
 
 ## 安全边界
 
 - 默认使用安全隔离修复，源仓库 dirty 时不会自动 stash、commit、reset 或 clean；
 - `PolicyGuard` 始终在模型和 LangGraph 之外执行，模型无法自行增权、跳过审批或改变节点流转；
+- 工具流水线双层管线：策略可换（瀑布钩子），底线锁死（单调守卫），任何插件无法放开被守卫拒绝的调用；
 - `.env`、`.git`、证书、私钥、生产配置和敏感路径默认拒绝；
 - API Key 不进入 Git、Qdrant、SQLite 审计字段、SSE 或任务报告；
 - 文档、代码注释、MCP 输出和 Skill 正文都按提示注入不可信数据处理；
@@ -272,19 +339,22 @@ uv run repopilot-guard evaluate --help
 - PDF 仅支持可提取文本的文件，不包含 OCR；不支持旧版 `.doc`；
 - 第一版子 Agent 是固定角色的并行只读研究员，不是多个独立 LLM 互相对话、自动谈判的协作系统；
 - 完全本机 Shell 功能强大但不提供操作系统级隔离，不应对不可信项目或生产机器轻率启用；
+- 常驻管家模式（`REPOPILOT_AGENT_HANDLE_MODE=1`）目前仅对 change 操作生效；research/chat 走原路径；
 - Qdrant 需要作为独立本地服务运行；
 - Windows 安装包尚未配置代码签名、自动更新和企业级部署通道；
-- 本地 API 仅面向回环地址，不提供多用户身份认证或远程部署。
+- 本地 API 仅面向回环地址；多用户认证由 Java 平台承载，不在 Python 引擎内。
 
 ## 仓库结构
 
 ```text
-src/repopilot_guard/    Python Agent、策略、RAG、MCP、执行与 API
-desktop/                React + Tauri 桌面端
-tests/                  unittest 自动化测试
-evaluation/             可重放任务、fixture 和评测报告
-examples/               插件、Skill 与 MCP 示例
-scripts/                桌面 sidecar 与发布辅助脚本
+src/repopilot_guard/           Python Agent、策略、RAG、MCP、执行与 API
+src/repopilot_guard/graph_impl/  Harness 工程化组件（编排外壳/桥接器/注册表/AgentHandle）
+desktop/                       React + Tauri 桌面端
+java-platform/                 Spring Boot 多用户平台（认证/RBAC/多租户/任务）
+tests/                         unittest 自动化测试（482 个）
+evaluation/                    可重放任务、fixture 和评测报告
+examples/                      插件、Skill 与 MCP 示例
+scripts/                       桌面 sidecar 与发布辅助脚本
 ```
 
 ## 文档
@@ -292,6 +362,7 @@ scripts/                桌面 sidecar 与发布辅助脚本
 - [产品需求说明](RepoPilot-PRD.md)
 - [开发设计记录](开发计划.md)
 - [评测说明](evaluation/README.md)
+- [v0.3.0 发布说明](https://github.com/JX05120LLL/RepoPilot-Harness/releases/tag/v0.3.0)
 
 ## License
 
