@@ -2293,6 +2293,53 @@ export function App() {
     if (!requestedOperationAllowed) {
       setRequestError(taskAdmissionMessage);
       return;
+    // 接线片 ③b-2：同会话追问——有会话 + 有终态任务 + change 操作时，先 try followup 端点。
+    // 成功则不走 POST /api/tasks，直接刷新会话消息和任务列表等管家跑完。
+    }
+    if (
+      conversation &&
+      task &&
+      terminalTaskStatuses.has(task.status) &&
+      requestedOperation === "change"
+    ) {
+      try {
+        const followupResponse = await fetch(
+          `${API}/conversations/${encodeURIComponent(conversation.conversation_id)}/followup`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              content: description.trim(),
+              task_mode: mode,
+              operation: requestedOperation,
+              confirmation: confirmed ? "我已了解完全权限风险" : null,
+              approved_mcp_tools: approvedMcpTools,
+              approved_mcp_sources:
+                approvedMcpTools.length > 0 && mcpResult?.config_source
+                  ? [mcpResult.config_source]
+                  : [],
+              approved_capabilities:
+                mode === "full-local" && confirmed ? approvedCapabilities : [],
+              attached_document_ids: attachedDocumentIds,
+            }),
+          },
+        );
+        if (followupResponse.ok) {
+          // 追问成功——清空输入，刷新会话消息和任务列表
+          setDescription("");
+          setApprovedCapabilities([]);
+          setAttachedDocumentIds([]);
+          await Promise.all([
+            loadTasks(),
+            loadConversations(showArchived),
+            loadConversationMessages(conversation.conversation_id),
+          ]);
+          return;
+        }
+        // followup 失败（如 AGENT_HANDLE_MODE_DISABLED 或 NO_ACTIVE_HANDLE）→ 回退到原路径
+      } catch {
+        // 网络错误 → 回退到原路径
+      }
     }
     setEvents([]);
     setArtifacts([]);

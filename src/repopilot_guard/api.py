@@ -143,6 +143,19 @@ class ConversationChatBody(BaseModel):
     include_project_overview: bool = True
 
 
+class ConversationFollowupBody(BaseModel):
+    """追问请求——走常驻管家 handle.followup 路径，不创建独立 task。"""
+
+    content: str = Field(min_length=1, max_length=12_000)
+    task_mode: TaskModeSpec
+    operation: TaskOperation
+    confirmation: str | None = None
+    approved_mcp_tools: list[str] = Field(default_factory=list)
+    approved_mcp_sources: list[str] = Field(default_factory=list)
+    approved_capabilities: list[str] = Field(default_factory=list)
+    attached_document_ids: list[str] = Field(default_factory=list, max_length=4)
+
+
 class IntentRouteBody(BaseModel):
     """路由只接受文本与当前项目是否已绑定的事实。"""
 
@@ -604,6 +617,64 @@ def create_app(
             "context": conversations.context_for_next_task(conversation_id).to_dict(),
         }
 
+    @app.post("/api/conversations/{conversation_id}/followup")
+    def followup_in_conversation(
+        conversation_id: str, body: ConversationFollowupBody
+    ) -> dict[str, object]:
+        """追问——走常驻管家 handle.followup 路径（接线片 ③b-2）。
+
+        与 POST /api/tasks 的区别：
+        - 不预创建 TaskStore 记录（由 RequestFactory 在 handle 驱动循环里创建）
+        - 走 handle.followup 唤醒常驻管家，复用会话级上下文
+        - 返回会话级状态，前端通过 SSE 或轮询拿真实 task
+
+        前置条件：
+        - 会话存在且未归档
+        - 会话已绑定 project_id
+        - feature flag REPOPILOT_AGENT_HANDLE_MODE=1 开启
+        - 会话已有 handle（首任务已通过 POST /api/tasks 跑过）
+        """
+        nonlocal agent_handle_registry
+        if not agent_handle_mode:
+            raise HTTPException(409, "AGENT_HANDLE_MODE_DISABLED")
+        try:
+            conversation = conversations.get(conversation_id)
+        except ValueError as error:
+            raise HTTPException(404, "CONVERSATION_NOT_FOUND") from error
+        if conversation.archived_at:
+            raise HTTPException(409, "CONVERSATION_ARCHIVED")
+        if not conversation.project_id:
+            raise HTTPException(409, "CONVERSATION_NO_PROJECT")
+        if agent_handle_registry is None or conversation_id not in agent_handle_registry:
+            raise HTTPException(409, "NO_ACTIVE_HANDLE")
+
+        handle = agent_handle_registry.get_or_create(conversation_id)
+        from repopilot_guard.graph_impl.handle_registry import user_message as _user_message
+
+        handle.followup(_user_message(body.content))
+        return {
+            "status": "FOLLOWUP_ACCEPTED",
+            "conversation_id": conversation_id,
+            "message": "追问已提交给常驻管家，通过 SSE 或任务列表查看进度。",
+        }
+
+    @app.get("/api/conversations/{conversation_id}/handle-status")
+    def handle_status(conversation_id: str) -> dict[str, object]:
+        """查询常驻管家状态（接线片 ③b-2）——供前端轮询。"""
+        if not agent_handle_mode or agent_handle_registry is None:
+            return {"enabled": False, "active": False}
+        handle = agent_handle_registry.get(conversation_id)
+        if handle is None:
+            return {"enabled": True, "active": False, "status": "IDLE"}
+        from repopilot_guard.graph_impl.agent_handle import AgentStatus
+
+        return {
+            "enabled": True,
+            "active": True,
+            "status": handle.status.name,
+            "active_thread_id": handle.active_thread_id,
+        }
+
     @app.post("/api/conversations/{conversation_id}/chat/stream")
     def stream_chat_in_conversation(
         conversation_id: str,
@@ -863,6 +934,7 @@ def create_app(
 
     @app.post("/api/tasks")
     def create_task(body: CreateTaskBody) -> dict[str, object]:
+        nonlocal agent_handle_registry
         if bool(body.project_id) == bool(body.repository):
             raise HTTPException(400, "PROJECT_ID_OR_REPOSITORY_REQUIRED")
         try:
@@ -944,6 +1016,69 @@ def create_app(
                     content=body.description,
                     task_thread_id=thread_id,
                 )
+
+            # 接线片 ③b-2：首任务时注册 handle（不走 followup，首任务仍走 orchestrated.run）。
+            # 后续追问走 POST /api/conversations/{id}/followup 端点调 handle.followup。
+            if agent_handle_mode and body.conversation_id and body.operation.value == "change":
+                if agent_handle_registry is None:
+                    agent_handle_registry = _HandleRegistry(
+                        orchestrated=orchestrated,
+                        conversations=conversations,
+                        permission=grant,
+                    )
+                # 首任务时创建 handle（如果还没创建）；handle 进 idle 等后续追问
+                if body.conversation_id not in agent_handle_registry:
+                    _session_repository = repository
+                    _session_project_id = body.project_id
+                    _session_conversation_id = body.conversation_id
+                    _session_output_root = request.output_root
+                    _session_workspace_selection = request.workspace_selection
+                    _session_approved_mcp_tools = request.approved_mcp_tools
+                    _session_approved_mcp_sources = request.approved_mcp_sources
+                    _session_approved_capabilities = request.approved_capabilities
+                    _session_capability_profile = request.capability_profile
+                    _session_operation = body.operation
+                    _session_attached_document_ids = request.attached_document_ids
+                    _session_grant = grant
+
+                    def session_request_factory(description: str, context: str):
+                        """会话级 RequestFactory——后续追问时由 handle 驱动循环调用。"""
+                        req = TaskRequest(
+                            repository=_session_repository,
+                            description=description,
+                            output_root=_session_output_root,
+                            project_id=_session_project_id,
+                            conversation_id=_session_conversation_id,
+                            conversation_context=context,
+                            workspace_selection=_session_workspace_selection,
+                            approved_mcp_tools=_session_approved_mcp_tools,
+                            approved_mcp_sources=_session_approved_mcp_sources,
+                            approved_capabilities=_session_approved_capabilities,
+                            attached_document_ids=_session_attached_document_ids,
+                            operation=_session_operation,
+                            capability_profile=_session_capability_profile,
+                        )
+                        _tid = str(uuid4())
+                        store.create(
+                            thread_id=_tid,
+                            task_id=req.task_id,
+                            project_id=_session_project_id,
+                            conversation_id=_session_conversation_id,
+                            repository=_session_repository,
+                            output_root=req.output_root,
+                            task_mode=_session_grant.mode.value,
+                            task_operation=_session_operation.value,
+                            permission_mode=_session_grant.mode.value,
+                            workspace_mode=_session_workspace_selection.mode.value,
+                            display_title=description,
+                        )
+                        return req, _tid
+
+                    agent_handle_registry.get_or_create(
+                        body.conversation_id,
+                        request_factory=session_request_factory,
+                        permission=grant,
+                    )
 
             def run_in_background() -> None:
                 if agent_handle_mode:
