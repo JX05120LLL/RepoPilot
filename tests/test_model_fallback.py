@@ -60,7 +60,7 @@ class ModelFallbackTests(unittest.TestCase):
         model = OpenAIResearchModel(model=primary, fallback_model=fallback)
 
         with patch("repopilot_guard.graph.time.sleep"):
-            response = model._invoke_json([{"role": "user", "content": "生成 JSON"}])
+            response = model._invoke_json("test", [{"role": "user", "content": "生成 JSON"}])
 
         self.assertEqual("降级成功", response.content)
         self.assertEqual(3, primary.calls)

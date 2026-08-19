@@ -38,6 +38,31 @@ MODEL_OPERATION_ATTEMPTS = 3
 MODEL_RETRY_BASE_DELAY_SECONDS = 1.0
 SHELL_CONTRACT_ATTEMPTS = 2
 PLAN_CONTRACT_ATTEMPTS = 2
+
+
+@dataclass(frozen=True, slots=True)
+class ModelRequestTrace:
+    """一次模型操作的请求轨迹（阶段四 Step 3「请求头/重试计数入日志」）。
+
+    对齐 dsh `request/header` 事件语义：回放会话时能知道"这条回答是
+    哪个模型、走了什么降级路径、重试了几次"。只记录事实，不含密钥。
+    """
+
+    operation: str
+    model_label: str
+    used_fallback: bool
+    primary_attempts: int
+    fallback_attempts: int
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "type": "MODEL_REQUEST_TRACE",
+            "operation": self.operation,
+            "model": self.model_label,
+            "used_fallback": self.used_fallback,
+            "primary_attempts": self.primary_attempts,
+            "fallback_attempts": self.fallback_attempts,
+        }
 PATCH_CONTRACT_ATTEMPTS = 2
 
 class ResearchModel(Protocol):
@@ -127,6 +152,9 @@ class OpenAIResearchModel:
         *,
         model: Any | None = None,
         fallback_model: Any | None = None,
+        model_label: str | None = None,
+        fallback_label: str | None = None,
+        request_trace_sink: Callable[[ModelRequestTrace], None] | None = None,
     ) -> None:
         """允许测试注入模型，同时保持生产环境只从 Provider 创建客户端。"""
 
@@ -139,6 +167,9 @@ class OpenAIResearchModel:
         else:
             raise ValueError("必须提供 OpenAI-compatible Provider 或测试模型")
         self._fallback_model = fallback_model
+        self._model_label = model_label or "primary"
+        self._fallback_label = fallback_label or "fallback"
+        self._request_trace_sink = request_trace_sink
 
     @contextmanager
     def cancellation_scope(self, cancellation_requested: Callable[[], bool]):
@@ -150,6 +181,7 @@ class OpenAIResearchModel:
     def analyze(self, messages: list[dict[str, str]], tools: tuple[StructuredTool, ...]) -> ResearchDecision:
         request_messages = [{"role": "system", "content": self._system_prompt}, *messages]
         response = self._invoke_with_fallback(
+            "analyze",
             lambda: _invoke_model_request(self._model.bind_tools(list(tools)), request_messages),
             lambda: _invoke_model_request(self._fallback_model.bind_tools(list(tools)), request_messages),
         )
@@ -196,7 +228,7 @@ class OpenAIResearchModel:
         repaired_issues: tuple[dict[str, str], ...] = ()
         usage = ModelUsage()
         for attempt in range(1, PLAN_CONTRACT_ATTEMPTS + 1):
-            response = self._invoke_json(request_messages)
+            response = self._invoke_json("plan", request_messages)
             usage = usage.add(self._usage(response))
             try:
                 plan = ChangePlan.model_validate(json.loads(str(getattr(response, "content", ""))))
@@ -260,7 +292,7 @@ class OpenAIResearchModel:
         repaired_issues: tuple[dict[str, str], ...] = ()
         usage = ModelUsage()
         for attempt in range(1, PATCH_CONTRACT_ATTEMPTS + 1):
-            response = self._invoke_json(request_messages)
+            response = self._invoke_json("patch", request_messages)
             usage = usage.add(self._usage(response))
             try:
                 proposal = PatchProposal.model_validate(json.loads(str(getattr(response, "content", ""))))
@@ -314,7 +346,7 @@ class OpenAIResearchModel:
         repaired_issues: tuple[dict[str, str], ...] = ()
         usage = ModelUsage()
         for attempt in range(1, SHELL_CONTRACT_ATTEMPTS + 1):
-            response = self._invoke_json(request_messages)
+            response = self._invoke_json("shell_proposal", request_messages)
             usage = usage.add(self._usage(response))
             try:
                 proposal = ShellCommandProposal.model_validate(json.loads(str(getattr(response, "content", ""))))
@@ -337,20 +369,34 @@ class OpenAIResearchModel:
             ]
         raise ShellCommandContractError("UNKNOWN_CONTRACT_ERROR", repaired_issues, usage)
 
-    def _invoke_with_fallback(self, primary: Callable[[], Any], fallback: Callable[[], Any]) -> Any:
-        """先按主模型有界重试；瞬态故障耗尽后降级到备选模型，均失败才抛出。"""
+    def _invoke_with_fallback(self, operation: str, primary: Callable[[], Any], fallback: Callable[[], Any]) -> Any:
+        """先按主模型有界重试；瞬态故障耗尽后降级到备选模型，均失败才抛出。
+
+        每次操作产出一条 {@link ModelRequestTrace}：成功记录主模型重试
+        次数；降级记录备选模型重试次数；无备选且耗尽时记录后原样抛出。
+        """
 
         try:
-            return self._invoke_with_retry(primary)
+            result, primary_attempts = self._invoke_with_retry(primary)
         except (APIConnectionError, APITimeoutError, InternalServerError, RateLimitError):
             if self._fallback_model is None:
+                self._emit_trace(ModelRequestTrace(operation, self._model_label, False, MODEL_OPERATION_ATTEMPTS, 0))
                 raise
-            return self._invoke_with_retry(fallback)
+            result, fallback_attempts = self._invoke_with_retry(fallback)
+            self._emit_trace(ModelRequestTrace(operation, self._fallback_label, True, MODEL_OPERATION_ATTEMPTS, fallback_attempts))
+            return result
+        self._emit_trace(ModelRequestTrace(operation, self._model_label, False, primary_attempts, 0))
+        return result
 
-    def _invoke_json(self, messages: list[dict[str, str]]) -> Any:
+    def _emit_trace(self, trace: ModelRequestTrace) -> None:
+        if self._request_trace_sink is not None:
+            self._request_trace_sink(trace)
+
+    def _invoke_json(self, operation: str, messages: list[dict[str, str]]) -> Any:
         """仅重试短暂的传输或服务端错误；主模型耗尽后降级备选模型。"""
 
         return self._invoke_with_fallback(
+            operation,
             lambda: _invoke_model_request(self._model.bind(response_format={"type": "json_object"}), messages),
             lambda: _invoke_model_request(self._fallback_model.bind(response_format={"type": "json_object"}), messages),
         )
@@ -377,13 +423,12 @@ class OpenAIResearchModel:
         observability.record_model_usage(input_tokens, output_tokens, total_tokens, cost, currency)
         return ModelUsage(input_tokens, output_tokens, total_tokens, True, cost, currency)
 
-    @staticmethod
-    def _invoke_with_retry(operation: Callable[[], Any]) -> Any:
+    def _invoke_with_retry(self, operation: Callable[[], Any]) -> tuple[Any, int]:
         """为普通 tool-calling 与 JSON 调用提供一致的有界瞬时错误重试。"""
         for attempt in range(MODEL_OPERATION_ATTEMPTS):
             _raise_if_model_cancelled()
             try:
-                return operation()
+                return operation(), attempt + 1
             except ModelInvocationCancelled:
                 raise
             except (APIConnectionError, APITimeoutError, InternalServerError, RateLimitError):
